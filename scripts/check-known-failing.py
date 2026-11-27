@@ -121,6 +121,9 @@ LEGACY_CELL_INTERMITTENT = frozenset({
 })
 PUBLIC_CLI_RUNNER = "cell:scripts/qualify-public-cli.sh"
 RUN_TREE_RUNNER = "cell:scripts/ci/run-run-tree.sh"
+# Typed records nest at most this deep. Deeper inputs are refused as
+# too deep instead of crashing recursive validation or comparison.
+MAX_TYPED_DEPTH = 32
 
 
 class DuplicateKeyError(ValueError):
@@ -199,22 +202,28 @@ def signature_problems(value, where="signature"):
     if not isinstance(value, dict) or not value:
         return [f"{where} must be a nonempty object of typed fields"]
     problems = []
-
-    def walk(node, path):
+    stack = [(value, where, 0)]
+    while stack:
+        node, path, depth = stack.pop()
+        if depth > MAX_TYPED_DEPTH:
+            problems.append(f"{path} exceeds the maximum typed nesting depth of {MAX_TYPED_DEPTH}")
+            continue
         if isinstance(node, dict):
             if not node:
                 problems.append(f"{path} must not be an empty object")
-                return
+                continue
+            children = []
             for key, child in node.items():
                 if not isinstance(key, str) or not SIGNATURE_KEY_RE.fullmatch(key):
                     problems.append(f"{path}.{key!r} is not a typed snake-case field name")
                     continue
                 if textual_signature_key(key):
                     problems.append(f"{path}.{key} is free-text/log matching; use a typed verdict branch or record field")
-                walk(child, f"{path}.{key}")
+                children.append((child, f"{path}.{key}", depth + 1))
+            stack.extend(reversed(children))
         elif isinstance(node, list):
-            for index, child in enumerate(node):
-                walk(child, f"{path}[{index}]")
+            for index, child in reversed(list(enumerate(node))):
+                stack.append((child, f"{path}[{index}]", depth + 1))
         elif isinstance(node, str):
             if not typed_string(node):
                 problems.append(f"{path} must be a stable typed token, not prose, log text or raw output")
@@ -222,11 +231,9 @@ def signature_problems(value, where="signature"):
             if not math.isfinite(node):
                 problems.append(f"{path} must be a finite JSON number")
         elif node is None or isinstance(node, (int, bool)):
-            return
+            continue
         else:
             problems.append(f"{path} has a non-JSON value of type {type(node).__name__}")
-
-    walk(value, where)
     return problems
 
 
@@ -1080,18 +1087,28 @@ def validate_result_document(path):
 
 
 def json_exact_equal(left, right):
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, dict):
-        return set(left) == set(right) and all(json_exact_equal(left[key], right[key]) for key in left)
-    if isinstance(left, list):
-        return len(left) == len(right) and all(
-            json_exact_equal(left_item, right_item)
-            for left_item, right_item in zip(left, right)
-        )
-    if isinstance(left, float):
-        return left == right and math.copysign(1.0, left) == math.copysign(1.0, right)
-    return left == right
+    stack = [(left, right, 0)]
+    while stack:
+        left, right, depth = stack.pop()
+        if depth > MAX_TYPED_DEPTH:
+            return False
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            if set(left) != set(right):
+                return False
+            stack.extend((left[key], right[key], depth + 1) for key in left)
+        elif isinstance(left, list):
+            if len(left) != len(right):
+                return False
+            stack.extend((left_item, right_item, depth + 1)
+                         for left_item, right_item in zip(left, right))
+        elif isinstance(left, float):
+            if not (left == right and math.copysign(1.0, left) == math.copysign(1.0, right)):
+                return False
+        elif left != right:
+            return False
+    return True
 
 
 def host_applies(row, host):
@@ -1187,5 +1204,15 @@ def main(argv):
     return 0
 
 
+def entry(argv):
+    """CLI entry point: every operational failure is a typed refusal, never a traceback."""
+    try:
+        return main(argv)
+    except (OSError, RecursionError, TypeError, ValueError, KeyError, UnicodeError) as exc:
+        print(f"check-known-failing: internal refusal: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(entry(sys.argv[1:]))

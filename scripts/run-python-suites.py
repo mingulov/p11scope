@@ -29,6 +29,7 @@ Usage:
   python3 -I scripts/run-python-suites.py SUITE...   # check, run only these
 """
 
+import fnmatch
 import importlib.util
 import json
 import os
@@ -426,7 +427,18 @@ def registry_problems(present, run, driven, excluded, read):
 
 
 def present_suites(root):
-    return {path.name for path in (root / SUITE_DIR).glob("test_*.py")}
+    """(names, problems): test_*.py entries in tests/python.
+
+    Uses os.scandir, which raises on listing failure: pathlib glob
+    swallows it and would report an unreadable directory as an
+    empty, check-passing suite set.
+    """
+    try:
+        with os.scandir(root / SUITE_DIR) as entries:
+            return ({entry.name for entry in entries
+                     if fnmatch.fnmatchcase(entry.name, "test_*.py")}, [])
+    except OSError as exc:
+        return set(), [f"{root / SUITE_DIR}: cannot list suite directory: {exc.strerror or exc}"]
 
 
 def read_driver(root):
@@ -440,7 +452,9 @@ def read_driver(root):
 
 
 def check(root=ROOT):
-    return registry_problems(present_suites(root), RUN, DRIVEN, EXCLUDED, read_driver(root))
+    present, scan_problems = present_suites(root)
+    return scan_problems + registry_problems(
+        present, RUN, DRIVEN, EXCLUDED, read_driver(root))
 
 
 def print_registry():
@@ -673,8 +687,9 @@ def main(argv):
         print(f"run-python-suites: {problem}", file=sys.stderr)
     if problems:
         return 1
+    present, _scan_problems = present_suites(ROOT)
     print(
-        f"run-python-suites: registry covers all {len(present_suites(ROOT))} suites "
+        f"run-python-suites: registry covers all {len(present)} suites "
         f"({len(RUN)} runs here, {len(DRIVEN)} driven, {len(EXCLUDED)} excluded)"
     )
     if argv[:1] == ["--check"]:
@@ -692,5 +707,15 @@ def main(argv):
     return 0
 
 
+def entry(argv):
+    """CLI entry point: every operational failure is a typed refusal, never a traceback."""
+    try:
+        return main(argv)
+    except (OSError, RecursionError, TypeError, ValueError, KeyError, UnicodeError) as exc:
+        print(f"run-python-suites: internal refusal: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(entry(sys.argv[1:]))

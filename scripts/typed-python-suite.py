@@ -347,5 +347,15 @@ def main(argv):
     return code
 
 
+def entry(argv):
+    """CLI entry point: every operational failure is a typed refusal, never a traceback."""
+    try:
+        return main(argv)
+    except (OSError, RecursionError, TypeError, ValueError, KeyError, UnicodeError) as exc:
+        print(f"typed-python-suite: internal refusal: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(entry(sys.argv[1:]))

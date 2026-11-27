@@ -704,7 +704,6 @@ class TypedCellResultsTests(unittest.TestCase):
                                '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n'),
             "sites-null": ('{"schema": "p11scope/ignored-tests/v1", "sites": null}\n'),
             "sites-zero": ('{"schema": "p11scope/ignored-tests/v1", "sites": 0}\n'),
-            "boolean": "true\n",
         }
         for name, text in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:

@@ -430,7 +430,8 @@ class ManifestTests(unittest.TestCase):
         # file stays on disk but leaves every registry list, so --check
         # must fail instead of silently passing without it.
         self.assertEqual(RUNNER["check"](ROOT), [])
-        present = RUNNER["present_suites"](ROOT)
+        present, scan_problems = RUNNER["present_suites"](ROOT)
+        self.assertEqual(scan_problems, [])
         run = [entry for entry in RUNNER["RUN"]
                if entry[0] != "test_system_test_manifest.py"]
         problems = RUNNER["registry_problems"](

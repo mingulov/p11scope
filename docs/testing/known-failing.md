@@ -103,6 +103,9 @@ are refused). The suite registry is parsed as data, so `RUN` in
 of `(nonempty name, string args)` pairs, and one malformed entry
 refuses the whole registry. A malformed or ambiguous ignored-test
 site likewise refuses the registry instead of mapping around it.
+Typed records nest at most 32 levels; deeper inputs are refused.
+Every gate entry point turns any operational exception into a
+typed refusal with a nonzero exit, never a traceback.
 
 ## Known-issue registry block (exact format)
 

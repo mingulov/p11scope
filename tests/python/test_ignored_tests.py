@@ -2796,7 +2796,7 @@ class InventoryDecodeSweepTests(unittest.TestCase):
                 "        return set(), [], [f\"{inventory_path}: cannot read inventory: {exc}\"]"),
             "inventory-dup-keys": (
                 "    data, parse_problems = checker.strict_json(raw, str(inventory_path))",
-                "    data, parse_problems = json.loads(raw), []"),
+                "    data, parse_problems = checker.json.loads(raw), []"),
         }
         killed = 0
         failures = []
@@ -2938,6 +2938,43 @@ class ScanErrorTests(unittest.TestCase):
                                             runner=temp / "none.sh")
             self.assertTrue(any("not an object" in failure for failure in failures))
 
+    def test_nonstring_inventory_fields_are_typed_refusals(self):
+        good = {"file": "src/a.rs", "path": "X", "reason": "r", "cell": "helper"}
+        cases = (
+            ("file", []), ("file", {}), ("file", 0),
+            ("path", []), ("path", {}), ("path", 0),
+            ("reason", []), ("cell", []),
+        )
+        for field, bad in cases:
+            with self.subTest(field=field, bad=repr(bad)):
+                with tempfile.TemporaryDirectory() as tmp:
+                    temp, inventory = self.inventory_tree(tmp)
+                    broken = dict(good, **{field: bad})
+                    inventory.write_text(json.dumps({
+                        "sites": [good, broken],
+                        "cells": {"helper": "test cell"}}), encoding="utf-8")
+                    failures = CHECKER_MOD["check"](
+                        root=temp, inventory=inventory, runner=temp / "none.sh")
+                    self.assertTrue(any("must be strings" in failure for failure in failures),
+                                    failures)
+
+    def test_unreadable_runner_is_a_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            blocked = temp / "runner-dir"
+            blocked.mkdir()
+            failures = CHECKER_MOD["check"](root=temp, inventory=inventory,
+                                            runner=blocked)
+            self.assertTrue(any("FAIL runner" in failure for failure in failures))
+
+    def test_undecodable_runner_is_a_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            runner = temp / "runner.sh"
+            runner.write_bytes(b"EXPECTED_FAILURE_TESTS=(\xff\n")
+            failures = CHECKER_MOD["check"](root=temp, inventory=inventory, runner=runner)
+            self.assertTrue(any("FAIL runner" in failure for failure in failures))
+
     def test_hidden_ignore_in_blocked_directory_is_refused(self):
         real_scandir = os.scandir
 
@@ -3049,6 +3086,19 @@ class InventoryScanSweepTests(unittest.TestCase):
                 "        return [], f\"cannot read macro source {path}: {exc}\"",
                 "    except OSError as exc:\n"
                 "        return [], f\"cannot read macro source {path}: {exc}\""),
+            "runner-read-oserror": (
+                "    except (OSError, ValueError) as exc:\n"
+                "        failures.append(f\"FAIL runner: {exc}\")\n"
+                "        lists = {}",
+                "    except ValueError as exc:\n"
+                "        failures.append(f\"FAIL runner: {exc}\")\n"
+                "        lists = {}"),
+            "inventory-primitive-guard": (
+                "        mistyped = sorted(key for key in primitive if not isinstance(entry[key], str))\n"
+                "        if mistyped:\n"
+                "            failures.append(f\"FAIL {where}: {', '.join(mistyped)} must be strings\")\n"
+                "            continue",
+                "        pass"),
         }
         killed = 0
         failures = []
@@ -3121,6 +3171,36 @@ class InventoryScanSweepTests(unittest.TestCase):
                 _expansions, mutant = module["macro_expansions"](bad, "m")
             except UnicodeDecodeError:
                 return original is not None
+            return False
+        if name == "runner-read-oserror":
+            (temp / "root/tests").mkdir(parents=True)
+            (temp / "root/tests/ignored-tests.json").write_text(json.dumps({
+                "sites": [], "cells": {"privileged": "test cell"}}), encoding="utf-8")
+            (temp / "root/runner-dir").mkdir()
+            original = CHECKER_MOD["check"](
+                root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                runner=temp / "root/runner-dir")
+            try:
+                module["check"](
+                    root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                    runner=temp / "root/runner-dir")
+            except IsADirectoryError:
+                return any("FAIL runner" in failure for failure in original)
+            return False
+        if name == "inventory-primitive-guard":
+            (temp / "root/tests").mkdir(parents=True)
+            (temp / "root/tests/ignored-tests.json").write_text(json.dumps({
+                "sites": [{"file": [], "path": "X", "reason": "r", "cell": "helper"}],
+                "cells": {"helper": "test cell"}}), encoding="utf-8")
+            original = CHECKER_MOD["check"](
+                root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                runner=temp / "root/nonexistent.sh")
+            try:
+                module["check"](
+                    root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                    runner=temp / "root/nonexistent.sh")
+            except TypeError:
+                return any("must be strings" in failure for failure in original)
             return False
         raise AssertionError(f"unknown scan mutant {name}")
 

@@ -53,7 +53,6 @@ Usage:
 """
 
 import importlib.util
-import json
 import os
 import re
 import sys
@@ -739,7 +738,7 @@ def check(root=ROOT, inventory=None, runner=None):
     failures.extend(f"FAIL inventory: {e}" for e in load_errors)
     try:
         lists = runner_lists(runner)
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         failures.append(f"FAIL runner: {exc}")
         lists = {}
     registered = set()
@@ -797,6 +796,13 @@ def check(root=ROOT, inventory=None, runner=None):
                 detail.append("unexpected: " + ",".join(extra))
             failures.append(f"FAIL {where}: keys must be exactly "
                             f"{'/'.join(want)} ({'; '.join(detail)})")
+            continue
+        primitive = {"file": str, "path": str, "reason": str, "cell": str}
+        if "owner" in entry:
+            primitive["owner"] = str
+        mistyped = sorted(key for key in primitive if not isinstance(entry[key], str))
+        if mistyped:
+            failures.append(f"FAIL {where}: {', '.join(mistyped)} must be strings")
             continue
         if "until" in entry and current is not None:
             problem = until_problem(entry["until"], current)
@@ -975,7 +981,7 @@ def main(argv):
         lists = runner_lists(runner)
         print("ignored-tests counts: " + " ".join(
             f"{name}={len(lists[name])}" for name in COUNT_LISTS))
-    except (FileNotFoundError, ValueError):
+    except (OSError, ValueError):
         pass
     for failure in failures:
         print(failure)
@@ -988,5 +994,15 @@ def main(argv):
     return 0
 
 
+def entry(argv):
+    """CLI entry point: every operational failure is a typed refusal, never a traceback."""
+    try:
+        return main(argv)
+    except (OSError, RecursionError, TypeError, ValueError, KeyError, UnicodeError) as exc:
+        print(f"ignored-tests: internal refusal: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(entry(sys.argv[1:]))

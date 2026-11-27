@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 """Contract tests for the typed known-failing ledger gate."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -806,6 +808,48 @@ class RowActivationTests(unittest.TestCase):
         f.rows([python_row, cell_row])
         result = f.run_checker()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class DepthLimitTests(unittest.TestCase):
+    def nested(self, depth):
+        node = "A"
+        for index in range(depth):
+            node = {"branch": "B", f"n{index}": node}
+        return node
+
+    def test_deep_signature_is_a_typed_refusal(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_signature")
+        problems = checker.signature_problems(self.nested(1000))
+        self.assertTrue(any("maximum typed nesting depth" in problem for problem in problems))
+
+    def test_depth_boundary_is_exact(self):
+        checker = load_script(CHECKER, "known_failing_checker_depth_boundary")
+        self.assertEqual(checker.signature_problems(self.nested(32)), [])
+        boundary = checker.signature_problems(self.nested(33))
+        self.assertTrue(any("maximum typed nesting depth" in problem for problem in boundary))
+
+    def test_deep_signature_row_is_a_typed_refusal(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_row")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "results.json"
+            doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x",
+                               "state": "failed", "signature": self.nested(1000)}])
+            write_json(path, doc)
+            data, problems = checker.validate_result_document(path)
+            self.assertIsNone(data)
+            self.assertTrue(any("maximum typed nesting depth" in problem for problem in problems))
+
+    def test_deep_equality_is_false_not_a_crash(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_equal")
+        value = self.nested(500)
+        self.assertFalse(checker.json_exact_equal(value, value))
+
+    def test_shallow_nested_values_still_compare(self):
+        checker = load_script(CHECKER, "known_failing_checker_shallow_equal")
+        value = self.nested(5)
+        self.assertEqual(checker.signature_problems(value), [])
+        self.assertTrue(checker.json_exact_equal(value, value))
+        self.assertFalse(checker.json_exact_equal(value, self.nested(6)))
 
 
 class ResultDocumentTests(unittest.TestCase):
@@ -2050,6 +2094,47 @@ class CliUsageTests(unittest.TestCase):
         self.assertIn("usage: privileged-lib-results.py", result.stderr)
 
 
+class EntryGuardTests(unittest.TestCase):
+    TOOLS = (
+        ("known_failing", "scripts/check-known-failing.py"),
+        ("run_suites", "scripts/run-python-suites.py"),
+        ("typed_wrapper", "scripts/typed-python-suite.py"),
+        ("cell_results", "scripts/ci/check-cell-results.py"),
+        ("privileged_results", "scripts/ci/privileged-lib-results.py"),
+        ("ignored_tests", "scripts/check-ignored-tests.py"),
+    )
+
+    def assert_guarded(self, label, exc):
+        for tool, relative in self.TOOLS:
+            with self.subTest(tool=tool, exc=type(exc).__name__):
+                module = load_script(ROOT / relative, f"entry_guard_{tool}_{label}")
+                with mock.patch.object(module, "main", side_effect=exc):
+                    stream = io.StringIO()
+                    with contextlib.redirect_stderr(stream):
+                        code = module.entry([])
+                self.assertEqual(code, 1)
+                self.assertIn("internal refusal", stream.getvalue())
+                self.assertIn(type(exc).__name__, stream.getvalue())
+
+    def test_oserror_is_a_typed_refusal(self):
+        self.assert_guarded("oserror", OSError("boom"))
+
+    def test_recursion_error_is_a_typed_refusal(self):
+        self.assert_guarded("recursion", RecursionError())
+
+    def test_type_error_is_a_typed_refusal(self):
+        self.assert_guarded("type", TypeError("boom"))
+
+    def test_value_error_is_a_typed_refusal(self):
+        self.assert_guarded("value", ValueError("boom"))
+
+    def test_key_error_is_a_typed_refusal(self):
+        self.assert_guarded("key", KeyError("boom"))
+
+    def test_unicode_error_is_a_typed_refusal(self):
+        self.assert_guarded("unicode", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"))
+
+
 class WrapperFileTests(unittest.TestCase):
     def run_wrapper(self, temp, suite_arg):
         fragment = temp / "fragment.json"
@@ -2114,9 +2199,10 @@ class DriverReadTests(unittest.TestCase):
             (temp / "tests/python").mkdir(parents=True)
             (temp / "tests/python/test_a.py").write_text("x = 1\n", encoding="utf-8")
             (temp / "tests/python/test_zzz_ghost.py").write_text("x = 1\n", encoding="utf-8")
+            present, scan_problems = runner.present_suites(temp)
+            self.assertEqual(scan_problems, [])
             problems = runner.registry_problems(
-                runner.present_suites(temp), [("test_a.py", [])], {}, {},
-                runner.read_driver(temp))
+                present, [("test_a.py", [])], {}, {}, runner.read_driver(temp))
             self.assertEqual(problems, ["tests/python/test_zzz_ghost.py is not registered: add it to RUN, "
                                         "DRIVEN or EXCLUDED in scripts/run-python-suites.py"])
 
@@ -2128,10 +2214,36 @@ class DriverReadTests(unittest.TestCase):
             bad = os.path.join(bytes(temp / "tests/python"), b"test_\xff6.py")
             with open(bad, "wb") as handle:
                 handle.write(b"x = 1\n")
+            present, scan_problems = runner.present_suites(temp)
+            self.assertEqual(scan_problems, [])
             problems = runner.registry_problems(
-                runner.present_suites(temp), [], {}, {}, runner.read_driver(temp))
+                present, [], {}, {}, runner.read_driver(temp))
             self.assertEqual(len(problems), 1)
             self.assertIn("is not registered", problems[0])
+
+    def test_unreadable_suite_directory_refuses_empty_registry(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_empty_scan")
+        runner.RUN = []
+        runner.DRIVEN = {}
+        runner.EXCLUDED = {}
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if str(path).rstrip("/").endswith("tests/python"):
+                raise PermissionError(13, "Permission denied", str(path).rstrip("/"))
+            return real_scandir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "tests/python").mkdir(parents=True)
+            (temp / "tests/python/test_hidden.py").write_text("x = 1\n", encoding="utf-8")
+            with mock.patch("os.scandir", side_effect=guarded):
+                blocked = runner.check(temp)
+            self.assertEqual(len(blocked), 1)
+            self.assertIn("cannot list suite directory", blocked[0])
+            (temp / "tests/python/test_hidden.py").unlink()
+            self.assertEqual(runner.check(temp), [])
 
     def test_unlistable_suite_directory_refuses_members(self):
         runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_unlistable")
@@ -2147,8 +2259,10 @@ class DriverReadTests(unittest.TestCase):
             (temp / "tests/python").mkdir(parents=True)
             (temp / "tests/python/test_a.py").write_text("x = 1\n", encoding="utf-8")
             with mock.patch("os.scandir", side_effect=guarded):
-                present = runner.present_suites(temp)
+                present, scan_problems = runner.present_suites(temp)
             self.assertEqual(present, set())
+            self.assertEqual(len(scan_problems), 1)
+            self.assertIn("cannot list suite directory", scan_problems[0])
             problems = runner.registry_problems(
                 present, [("test_a.py", [])], {}, {}, runner.read_driver(temp))
             self.assertTrue(any("test_a.py" in problem and "does not exist" in problem
@@ -4564,7 +4678,115 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode != 0
         self.record(results, "privileged-scan-propagate", outcomes["original"], outcomes["mutant"])
 
-        total = 75
+        # An unlistable suite directory is itself a typed scan
+        # problem: dropping it reopens the empty-registry false green.
+        suite_listing_mutant = self.mutate_source(
+            ROOT / "scripts/run-python-suites.py",
+            "    present, scan_problems = present_suites(root)\n"
+            "    return scan_problems + registry_problems(",
+            "    present, _scan_problems = present_suites(root)\n"
+            "    return registry_problems(")
+        scan_text = (ROOT / "scripts/run-python-suites.py").read_text(encoding="utf-8")
+        outcomes = {}
+        for label, source in (("original", scan_text), ("mutant", suite_listing_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"suite_listing_{label}")
+                module.RUN = []
+                module.DRIVEN = {}
+                module.EXCLUDED = {}
+                (temp / "tests/python").mkdir(parents=True)
+                (temp / "tests/python/test_hidden.py").write_text("x = 1\n", encoding="utf-8")
+                real_scandir = os.scandir
+
+                def guarded(path, *args, **kwargs):
+                    if str(path).rstrip("/").endswith("tests/python"):
+                        raise PermissionError(13, "Permission denied", str(path).rstrip("/"))
+                    return real_scandir(path, *args, **kwargs)
+
+                with mock.patch("os.scandir", side_effect=guarded):
+                    problems = module.check(temp)
+                outcomes[label] = problems != []
+        self.record(results, "suite-dir-listing", outcomes["original"], outcomes["mutant"])
+
+        # Every gate entry point turns operational exceptions into
+        # typed refusals: dropping one family reopens tracebacks.
+        entry_tools = (
+            ("checker", "scripts/check-known-failing.py"),
+            ("runner", "scripts/run-python-suites.py"),
+            ("wrapper", "scripts/typed-python-suite.py"),
+            ("cell", "scripts/ci/check-cell-results.py"),
+            ("privileged", "scripts/ci/privileged-lib-results.py"),
+            ("inventory", "scripts/check-ignored-tests.py"),
+        )
+        for tool, relative in entry_tools:
+            tool_source = (ROOT / relative).read_text(encoding="utf-8")
+            guard_mutant = self.mutate_source(
+                ROOT / relative,
+                "    except (OSError, RecursionError, TypeError, ValueError, KeyError, UnicodeError) as exc:",
+                "    except (OSError, RecursionError, TypeError, ValueError, UnicodeError) as exc:")
+            outcomes = {}
+            for label, source in (("original", tool_source), ("mutant", guard_mutant)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    script = temp / "tool.py"
+                    script.write_text(source, encoding="utf-8")
+                    module = load_script(script, f"entry_guard_{tool}_{label}")
+                    with mock.patch.object(module, "main", side_effect=KeyError("boom")):
+                        stream = io.StringIO()
+                        with contextlib.redirect_stderr(stream):
+                            try:
+                                code = module.entry([])
+                            except KeyError:
+                                outcomes[label] = False
+                            else:
+                                outcomes[label] = code == 1
+            self.record(results, f"entry-guard-{tool}", outcomes["original"], outcomes["mutant"])
+
+        # The typed nesting depth is a refused policy, not an
+        # accident: dropping it unbounds validation and comparison.
+        depth_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        if depth > MAX_TYPED_DEPTH:\n"
+            "            problems.append(f\"{path} exceeds the maximum typed nesting depth of {MAX_TYPED_DEPTH}\")\n"
+            "            continue",
+            "        pass")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", depth_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"signature_depth_{label}")
+                node = "A"
+                for index in range(1000):
+                    node = {"branch": "B", f"n{index}": node}
+                problems = module.signature_problems(node)
+                outcomes[label] = any("maximum typed nesting depth" in problem
+                                      for problem in problems)
+        self.record(results, "signature-depth-limit", outcomes["original"], outcomes["mutant"])
+
+        equality_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        if depth > MAX_TYPED_DEPTH:\n"
+            "            return False",
+            "        pass")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", equality_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"equality_depth_{label}")
+                node = "A"
+                for index in range(500):
+                    node = {"branch": "B", f"n{index}": node}
+                outcomes[label] = module.json_exact_equal(node, node) is False
+        self.record(results, "equality-depth-limit", outcomes["original"], outcomes["mutant"])
+
+        total = 84
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

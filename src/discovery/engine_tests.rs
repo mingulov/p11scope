@@ -7797,11 +7797,9 @@ fn tick_does_not_remark_unreadable_pid_with_pending_view() {
 /// only skips dead or dying-tracked pids.
 #[test]
 fn tick_still_marks_running_newcomer_without_view() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
     let procdir = tempfile::tempdir().expect("fixture proc root");
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("live stat");
@@ -7821,8 +7819,6 @@ fn tick_still_marks_running_newcomer_without_view() {
         marked || admitted,
         "running newcomer without a view must still be processed (mark/admit)"
     );
-    child.kill().ok();
-    child.wait().ok();
 }
 
 /// An unreadable pid with NO tracked view still marks (fail-closed): it may
@@ -9519,14 +9515,11 @@ fn outer_batch_coalesces_pre_admission_exit_into_the_admission_gap() {
 
 #[test]
 fn outer_batch_counts_deferred_exit_once_when_no_view_is_admitted() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
+    child.close();
+
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exit.kind = DISCOVERY_KIND_LEADER_EXIT;
@@ -9747,13 +9740,11 @@ fn leader_exit_mappings_late_watch_downgrades_negative_to_unknown() {
 /// before and after the kind-7 work.
 #[test]
 fn leader_exit_mappings_kind6_inventory_build_still_counts_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
+    child.close();
+
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exit.kind = DISCOVERY_KIND_LEADER_EXIT;
@@ -10044,13 +10035,11 @@ fn exit_mappings_counts_gap_and_split_exactly_once() {
 /// unknown-kind skip.
 #[test]
 fn exit_mappings_routed_record_is_gap_not_live_loss() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
+    child.close();
+
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     let mut exit = exit_mappings_record(pid, 1);
@@ -10088,13 +10077,11 @@ fn exit_mappings_routed_record_is_gap_not_live_loss() {
 /// unchanged, before and after the kind-7 work.
 #[test]
 fn exit_mappings_kind6_inventory_build_still_counts_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
+    child.close();
+
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exit.kind = DISCOVERY_KIND_LEADER_EXIT;
@@ -15111,14 +15098,10 @@ fn selected_user_process_still_admits() {
 /// five public `discovery unavailable` records, one per vanished pid.
 #[test]
 fn a_scope_member_that_ended_before_discovery_reached_it_is_not_a_loss() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
+    child.close();
 
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     refresh_inventory_once(&mut engine);
@@ -15803,14 +15786,11 @@ fn the_identity_branch_still_requires_a_queued_exec_refresh() {
 fn capture_start_members_that_ended_are_not_losses() {
     let pids: Vec<_> = (0..3)
         .map(|_| {
-            let mut child = std::process::Command::new("sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            child.kill().unwrap();
-            child.wait().unwrap();
+            let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+            let pid = child.pid();
+            child.close();
+
             pid
         })
         .collect();
@@ -17997,20 +17977,16 @@ fn discover_plan_has_no_fatal_allocation() {
 /// the attached probes already counted exactly.
 #[test]
 fn a_record_from_a_proven_exited_generation_is_not_a_discovery_loss() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, context) = Engine::retiring_loader_context(pid);
     // A cgroup capture continues when one member exits; the record its
     // exited member already queued is what this is about.
     let scope_dir = tempfile::tempdir().expect("a scope directory");
     engine.scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     engine.retirement_intents.clear();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     // A loader record whose context is fine but whose address space is
     // gone: resolution reads `/proc/<pid>/maps` behind the retained pin.
@@ -20838,22 +20814,21 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
     // the launcher's own pre-exec acknowledgement, a separate channel).
     let ready = fixture._dir.path().join("launcher.ready");
     let _ = std::fs::remove_file(&ready);
-    let child = Command::new("sh")
-        .args([
-            "-c",
-            "printf 'ready\\n'; read -r ignored; exec \"$@\"",
-            "seed-pre-exec",
-        ])
-        .arg(&runner)
-        .arg(&library)
-        .arg(&ready)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
-        child,
+        Command::new("sh")
+            .args([
+                "-c",
+                "printf 'ready\\n'; read -r ignored; exec \"$@\"",
+                "seed-pre-exec",
+            ])
+            .arg(&runner)
+            .arg(&library)
+            .arg(&ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
         std::time::Duration::from_secs(10),
     )
     .unwrap();
@@ -23486,14 +23461,10 @@ impl Drop for ShWrappedSleep {
 /// the order needle below.
 #[test]
 fn sh_wrapped_sleep_grandchildren_list_fails_closed() {
-    let mut plain = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn childless sleeper");
-    let listed = sh_wrapped_sleep_grandchildren(plain.id());
+    let plain = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let listed = sh_wrapped_sleep_grandchildren(plain.pid());
     assert_eq!(listed, Ok(Vec::new()), "a childless sleeper lists empty");
-    plain.kill().expect("kill childless sleeper");
-    plain.wait().expect("reap childless sleeper");
+    plain.close();
     // `u32::MAX` exceeds every pid_max: deterministically unreadable,
     // with no pid-reuse window at all.
     let missing = sh_wrapped_sleep_grandchildren(u32::MAX);
@@ -23536,11 +23507,12 @@ fn sh_wrapped_sleep_spawn_records_a_live_grandchild() {
 /// deterministically unreadable with no pid-reuse window.
 #[test]
 fn sh_wrapped_sleep_close_fails_closed_on_unreadable_children() {
-    let sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn shell stand-in");
-    let mut guard = ShWrappedSleep::from_child_for_test(sleeper);
+    let mut guard = ShWrappedSleep::from_child_for_test(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn shell stand-in"),
+    );
     let pid = guard.pid;
     guard.pid = u32::MAX;
     let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.close()));
@@ -23561,11 +23533,8 @@ fn sh_wrapped_sleep_close_fails_closed_on_unreadable_children() {
 /// never reach a signal.
 #[test]
 fn sh_wrapped_sleep_recorded_filter_verifies_identity() {
-    let mut live = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn identity probe");
-    let pid = live.id() as i32;
+    let live = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let pid = live.pid() as i32;
     let start = crate::process::process_start_time(pid as u32).expect("probe has a start time");
     assert_eq!(
         verified_recorded_sh_sleep_grandchildren(&[(pid, start)]),
@@ -23582,8 +23551,7 @@ fn sh_wrapped_sleep_recorded_filter_verifies_identity() {
         Vec::<i32>::new(),
         "an unborn pid is skipped"
     );
-    live.kill().expect("kill identity probe");
-    live.wait().expect("reap identity probe");
+    live.close();
 }
 
 /// `Drop` on an unlistable shell neither panics nor strands: it runs
@@ -23592,12 +23560,13 @@ fn sh_wrapped_sleep_recorded_filter_verifies_identity() {
 /// observable side effect.
 #[test]
 fn sh_wrapped_sleep_drop_covers_an_unlistable_shell() {
-    let sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn shell stand-in");
-    let pid = sleeper.id();
-    let mut guard = ShWrappedSleep::from_child_for_test(sleeper);
+    let mut guard = ShWrappedSleep::from_child_for_test(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn shell stand-in"),
+    );
+    let pid = guard.pid;
     guard.pid = u32::MAX;
     guard.grandchildren = vec![(i32::MAX, 0)];
     drop(guard);
@@ -23680,12 +23649,13 @@ fn sh_wrapped_sleep_close_kills_recorded_sleep_of_zombie_shell() {
 /// forks, so the 500-try bound trips deterministically (5 s nominal).
 #[test]
 fn sh_wrapped_sleep_failed_proof_leaves_no_process() {
-    let shell = std::process::Command::new("sh")
-        .args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn non-forking shell");
-    let mut guard = ShWrappedSleep::from_child_for_test(shell);
+    let mut guard = ShWrappedSleep::from_child_for_test(
+        std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn non-forking shell"),
+    );
     let pid = guard.pid;
     let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.prove_tree()));
     assert!(loud.is_err(), "a never-forking shell must fail the proof");
@@ -23819,12 +23789,14 @@ fn parked_sleep_drop_kills_without_a_close() {
         crate::process::process_proven_exited(first_pid),
         "drop kills an unparked sleeper"
     );
-    let raw = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn adoptee");
-    let second_pid = raw.id();
-    drop(ParkedSleep::adopt_proven(raw));
+    let adoptee = ParkedSleep::adopt_proven(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn adoptee"),
+    );
+    let second_pid = adoptee.pid();
+    drop(adoptee);
     assert!(
         crate::process::process_proven_exited(second_pid),
         "drop kills an adopted sleeper"
@@ -23836,10 +23808,11 @@ fn parked_sleep_drop_kills_without_a_close() {
 /// so the spin bound trips deterministically (10 s nominal).
 #[test]
 fn parked_sleep_failed_proof_leaves_no_process() {
-    let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", "read line"])
-        .stdin(std::process::Stdio::piped());
-    let guard = ParkedSleep::spawn_unparked(&mut cmd);
+    let guard = ParkedSleep::spawn_unparked(
+        std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped()),
+    );
     let pid = guard.pid();
     let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.prove_parked()));
     assert!(loud.is_err(), "a never-parking child must fail the proof");
@@ -24944,10 +24917,8 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
     let key = pin.key;
     let object = pin.id;
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -25072,8 +25043,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
         !candidate.plan.slots.is_empty(),
         "the live plan attaches the harvested table functions"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Fix-round-1 twin helper: an owned-run engine whose E1 watch scan
@@ -25087,13 +25057,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
 /// caller), the engine, the proof's key and the provider path.
 fn learned_tables_engine_with(
     decoder_abi: Option<p11scope_manifest::elf::ElfAbi>,
-) -> (
-    tempfile::TempDir,
-    ParkedSleep,
-    Engine,
-    ObjectKey,
-    String,
-) {
+) -> (tempfile::TempDir, ParkedSleep, Engine, ObjectKey, String) {
     use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
     let dir = tempfile::tempdir().expect("learned backing dir");
     let backing = dir.path().join("libgetteronly.so");
@@ -25105,8 +25069,7 @@ fn learned_tables_engine_with(
     let path = backing.to_string_lossy().into_owned();
     record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
     let me = std::process::id();
-    let sleeper =
-        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -25220,7 +25183,6 @@ fn learned_tables_survive_proving_view_retirement() {
         "the learned module re-binds after its proving view retires"
     );
     sleeper.close();
-
 }
 
 /// A candidate commit must not drop run-persistent learned-table pins
@@ -25281,7 +25243,6 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
         "the harvested aliases survive the commit and still bind with no live owner"
     );
     sleeper.close();
-
 }
 
 /// The recycled-id shape: the released proving view id is reused by
@@ -25317,7 +25278,6 @@ fn learned_tables_survive_proving_view_reuse_and_retirement() {
         "the learned module re-binds after its proving view id is reused and retired"
     );
     sleeper.close();
-
 }
 
 /// The refresh shape: the proving view id is reused and its pins
@@ -25344,7 +25304,6 @@ fn learned_tables_survive_proving_view_refresh() {
         "the learned module re-binds after its proving view refreshes without it"
     );
     sleeper.close();
-
 }
 
 /// A learned module that cannot bind files the dedicated finite
@@ -25401,7 +25360,6 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
         "a learned provider's tables lost their pinned identity; its calls were not observed"
     );
     sleeper.close();
-
 }
 
 /// A learned module whose scan-time decoder ABI disagrees with its
@@ -25464,7 +25422,6 @@ fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
         "a learned provider's tables lost their pinned identity; its calls were not observed"
     );
     sleeper.close();
-
 }
 
 /// The table-harvest cap refuses loudly: past 32 learned table
@@ -25558,7 +25515,6 @@ fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
         engine.counters.object_skips,
     );
     sleeper.close();
-
 }
 
 /// Outside `--pid` a learned-entry misfire is host-wide: only
@@ -25580,10 +25536,8 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
     let key = pin.key;
     let object = pin.id;
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -25704,8 +25658,7 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
             candidate.plan.slots
         );
     }
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// A learned table is evidence about one generation of its file:
@@ -25820,7 +25773,6 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
         "the old generation still binds against its own pins"
     );
     sleeper.close();
-
 }
 
 /// A harvested proof past the per-module table cap truncates on entry
@@ -25872,7 +25824,6 @@ fn run_learned_table_merge_cap_overflow_is_counted() {
     assert_eq!(stored.tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     assert_eq!(engine.merge_tables_dropped(), 6);
     sleeper.close();
-
 }
 
 /// A harvest that changes only union flags (here: the decoder ABI
@@ -25913,7 +25864,6 @@ fn run_learned_harvest_dirties_flag_only_union_changes() {
     );
     let _ = key;
     sleeper.close();
-
 }
 
 /// Fresh learned staging owes prompt table-proving scans: every
@@ -33931,15 +33881,14 @@ fn owned_mapper_cleanup_oracle_rejects_an_exited_unreaped_child() {
 fn owned_mapper_rejects_bad_readiness_and_reaps_the_child() {
     use std::process::{Command, Stdio};
 
-    let child = Command::new("sh")
-        .args(["-c", "printf 'wrong\\n'; read -r ignored"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
-    let error = OwnedMapper::from_child(child, std::time::Duration::from_secs(5))
+    let owned = ParkedSleep::spawn_unparked(
+        Command::new("sh")
+            .args(["-c", "printf 'wrong\\n'; read -r ignored"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    );
+    let view = ProcessView::open(ProcessViewId(0), owned.pid()).unwrap();
+    let error = OwnedMapper::from_child(owned.into_inner(), std::time::Duration::from_secs(5))
         .err()
         .expect("a foreign acknowledgement must be rejected");
     assert!(error.contains("unexpected fixture readiness"), "{error}");
@@ -33950,15 +33899,14 @@ fn owned_mapper_rejects_bad_readiness_and_reaps_the_child() {
 fn owned_mapper_bounds_partial_readiness_and_reaps_the_child() {
     use std::process::{Command, Stdio};
 
-    let child = Command::new("sh")
-        .args(["-c", "printf 'rea'; read -r ignored"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
-    let error = OwnedMapper::from_child(child, std::time::Duration::from_millis(50))
+    let owned = ParkedSleep::spawn_unparked(
+        Command::new("sh")
+            .args(["-c", "printf 'rea'; read -r ignored"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    );
+    let view = ProcessView::open(ProcessViewId(0), owned.pid()).unwrap();
+    let error = OwnedMapper::from_child(owned.into_inner(), std::time::Duration::from_millis(50))
         .err()
         .expect("an incomplete acknowledgement must reach its deadline");
     assert!(error.contains("readiness deadline"), "{error}");
@@ -34671,14 +34619,15 @@ fn conservative_replays_under_churn_never_burn_capacity() {
     // Sized so the reserve-free ceiling still holds busy + its 30 retries +
     // the later 50-endpoint provider: PC-1's positive must stay visible.
     let ceiling = capacity - plan::shared_scope_reserve(capacity as usize) as u32;
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    // Custody before readiness: the guard owns kill/reap before the
-    // fallible settle wait runs.
-    let _reap = ChildReaper(child);
+    // Custody before readiness: the spawn is constructed inside the
+    // guard, so custody precedes the fallible settle wait below.
+    let _reap = ChildReaper(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(_reap.0.id());
     let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
     let modules = child_provider_modules(&view);
@@ -34797,14 +34746,15 @@ fn conservative_replays_under_churn_never_burn_capacity() {
 #[test]
 fn named_reserve_ignores_failed_attaches_across_conservative_replays() {
     let capacity = p11scope_ebpf_common::MAX_SLOTS;
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    // Custody before readiness: the guard owns kill/reap before the
-    // fallible settle wait runs.
-    let _reap = ChildReaper(child);
+    // Custody before readiness: the spawn is constructed inside the
+    // guard, so custody precedes the fallible settle wait below.
+    let _reap = ChildReaper(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(_reap.0.id());
     let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
     let modules = child_provider_modules(&view);
@@ -44789,14 +44739,11 @@ fn released_view_ids_are_reused_end_to_end() {
 fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
     let pids: Vec<_> = (0..3)
         .map(|_| {
-            let mut child = std::process::Command::new("sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            child.kill().unwrap();
-            child.wait().unwrap();
+            let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+            let pid = child.pid();
+            child.close();
+
             pid
         })
         .collect();
@@ -44874,14 +44821,11 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
 fn refresh_releases_view_ids_for_members_that_ended_before_scan() {
     let pids: Vec<_> = (0..3)
         .map(|_| {
-            let mut child = std::process::Command::new("sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            child.kill().unwrap();
-            child.wait().unwrap();
+            let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+            let pid = child.pid();
+            child.close();
+
             pid
         })
         .collect();
@@ -48825,14 +48769,15 @@ fn counter_start_readmits_retained_plan_under_its_budget_after_stale_removal() {
 /// proves it, never recorded as loss without positive evidence of change.
 #[test]
 fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    // Custody before readiness: the guard owns kill/reap before the
-    // fallible settle wait runs.
-    let exiting = std::cell::RefCell::new(ChildReaper(child));
+    // Custody before readiness: the spawn is constructed inside the
+    // guard, so custody precedes the fallible settle wait below.
+    let exiting = std::cell::RefCell::new(ChildReaper(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    ));
     let exiting_pid = exiting.borrow().0.id();
     wait_sleep_child_settled(exiting_pid);
     let views = vec![
@@ -66153,13 +66098,11 @@ fn peer_census_alignment_respawns_a_mismatched_peer() {
     let good = fixture.spawn_peer();
     let expected = peer_maps_census(good);
     // A foreign owned child is a peer with a proven different census.
-    let alien = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn the mismatched peer");
-    let alien_pid = alien.id();
-    fixture.peers.push(alien);
+    let alien = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let alien_pid = alien.pid();
+    // Explicit custody transfer into the peer table the census respawn
+    // manages; the fixture `Drop` owns kill/reap from here.
+    fixture.peers.push(alien.into_inner());
     // Park before the census: image-plus-loader rows land before the
     // loader finishes mapping the rest, so only a parked peer has the
     // proven-different stable census this test needs.
@@ -77868,14 +77811,15 @@ fn engine_with_accepted_providers(count: usize) -> (Vec<SystemScopeChildGuard>, 
     let mut guards = Vec::new();
     let mut engine = Engine::empty();
     for index in 0..count {
-        let child = std::process::Command::new("sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        // Custody before readiness: wrap first, then settle/open on the
-        // owned pid, so a fallible step never precedes the guard.
-        let guard = SystemScopeChildGuard::new(child);
+        // Custody before readiness: the spawn is constructed inside
+        // the guard, so a fallible step never precedes custody.
+        let guard = SystemScopeChildGuard::new(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        );
         wait_sleep_child_settled(guard.pid());
         engine.scope = Scope::Pid(guard.pid());
         let view = ProcessView::open(ProcessViewId(3 + index as u32), guard.pid()).unwrap();
@@ -77950,21 +77894,23 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     assert_eq!(engine.collected_graphs_created, 1);
     // Two unnamed views: W's exit is already a pending assessment, U's exit
     // arrives as a record while the graph lives.
-    let w_child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    // Custody before readiness: each guard owns kill/reap before the
-    // fallible settle wait runs; readiness uses the owned pid.
-    let mut w_guard = SystemScopeChildGuard::new(w_child);
+    // Custody before readiness: each spawn is constructed inside its
+    // guard, so custody precedes the fallible settle wait below.
+    let mut w_guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(w_guard.pid());
-    let u_child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let mut u_guard = SystemScopeChildGuard::new(u_child);
+    let mut u_guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(u_guard.pid());
     let w = ProcessView::open(ProcessViewId(4), w_guard.pid()).unwrap();
     let u = ProcessView::open(ProcessViewId(5), u_guard.pid()).unwrap();
@@ -78037,21 +77983,23 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     // Second half: a requested-but-uncreated graph lets a queued record
     // dispatch first and is created on the first credit with an empty queue,
     // no pending assessment and no open journal/batch.
-    let w_child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    // Custody before readiness: each guard owns kill/reap before the
-    // fallible settle wait runs; readiness uses the owned pid.
-    let w_guard = SystemScopeChildGuard::new(w_child);
+    // Custody before readiness: each spawn is constructed inside its
+    // guard, so custody precedes the fallible settle wait below.
+    let w_guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(w_guard.pid());
-    let u_child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let u_guard = SystemScopeChildGuard::new(u_child);
+    let u_guard = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
     wait_sleep_child_settled(u_guard.pid());
     let w_pid = w_guard.pid();
     let u_pid = u_guard.pid();
@@ -81000,14 +80948,15 @@ fn collected_graph_reclaim_refusal_retains_and_finishes() {
     // Twin: a second refused graph in the same capture counts 2 with
     // still one disclosure. The bare view names itself through scan
     // inputs so the refusal site requests the graph.
-    let spare = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("a spare child");
-    // Custody before readiness: the guard owns kill/reap before the
-    // fallible settle wait runs.
-    let _spare = SystemScopeChildGuard::new(spare);
+    // Custody before readiness: the spawn is constructed inside the
+    // guard, so custody precedes the fallible settle wait below.
+    let _spare = SystemScopeChildGuard::new(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .die_with_parent()
+            .spawn()
+            .expect("a spare child"),
+    );
     wait_sleep_child_settled(_spare.pid());
     let bare = ProcessViewId(engine.next_view_id);
     engine
@@ -90181,11 +90130,9 @@ fn capacity_exhaustion_without_evictable_view_gaps_waiting_live_newcomer() {
 /// counts one short-lived gap — it never sits pending.
 #[test]
 fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let live = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let live = child.pid();
     let (mut engine, dir) = engine_over_cgroup_naming(&[live]);
     engine.frame_work_budget_ns = u64::MAX;
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
@@ -90219,8 +90166,7 @@ fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
         gaps_before + 1,
         "the departed birth counts one short-lived gap"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Healthy twin: with an evictable view in the full cap, the next reconcile
@@ -98055,7 +98001,6 @@ fn mid_scan_exit_race_with_reused_pid_stays_loud() {
         "loud races keep their class count"
     );
     child.close();
-
 }
 
 /// A proven exit excuses only exit-shaped refusals: a proven reuse
@@ -98981,6 +98926,457 @@ fn needle_stmt_line(body: &str, stmt: &str) -> Option<usize> {
         .position(|line| line.split_once("//").map_or(line, |(code, _)| code).trim() == stmt)
 }
 
+/// Code text of one source line: double-quoted strings (with `\"`
+/// escapes) and `//` comments removed, so a needle or a statement
+/// boundary can never match inside a literal or a comment. Single
+/// quotes are left alone (lifetimes); no spawn statement in the
+/// audited files ends a line inside a char literal.
+fn custody_code_text(line: &str) -> String {
+    custody_code_impl(line, true)
+}
+
+/// Comment-stripped text with string literals kept: for matching the
+/// `"sleep"`/`"sh"` program names, which live inside literals.
+fn custody_code_keep_strings(line: &str) -> String {
+    custody_code_impl(line, false)
+}
+
+fn custody_code_impl(line: &str, strip_strings: bool) -> String {
+    // Mini-lexer: the statement window spans lines and may hold
+    // comments, char literals, and raw strings. Every skipped region
+    // is consumed exactly (a `"` inside a comment or a char literal
+    // must never toggle string mode, or later code is eaten and the
+    // site silently skips as non-sleep — a false pass).
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut idx = 0;
+    let mut in_string = false;
+    let mut prev: char = '\n';
+    while idx < chars.len() {
+        let char = chars[idx];
+        if in_string {
+            if strip_strings {
+                if char == '\\' {
+                    idx += 1;
+                } else if char == '"' {
+                    in_string = false;
+                }
+            } else {
+                out.push(char);
+                if char == '\\' && idx + 1 < chars.len() {
+                    idx += 1;
+                    out.push(chars[idx]);
+                } else if char == '"' {
+                    in_string = false;
+                }
+            }
+            idx += 1;
+            prev = char;
+            continue;
+        }
+        // Byte/C raw strings (`br"..."`, `cr#"..."#`): pass the
+        // prefix through so the `r` below still opens raw mode.
+        if (char == 'b' || char == 'c')
+            && !prev.is_alphanumeric()
+            && prev != '_'
+            && idx + 2 < chars.len()
+            && chars[idx + 1] == 'r'
+            && (chars[idx + 2] == '"' || chars[idx + 2] == '#')
+        {
+            out.push(char);
+            idx += 1;
+            prev = ' ';
+            continue;
+        }
+        // Raw strings `r"..."` / `r#"..."#`: `r` outside an
+        // identifier, then hashes, then the quote.
+        if char == 'r'
+            && !prev.is_alphanumeric()
+            && prev != '_'
+            && idx + 1 < chars.len()
+            && (chars[idx + 1] == '"' || chars[idx + 1] == '#')
+        {
+            let mut hashes = 0;
+            while idx + 1 + hashes < chars.len() && chars[idx + 1 + hashes] == '#' {
+                hashes += 1;
+            }
+            if idx + 1 + hashes < chars.len() && chars[idx + 1 + hashes] == '"' {
+                let mut end = idx + 2 + hashes;
+                let mut raw = String::new();
+                while end < chars.len() {
+                    if chars[end] == '"' && chars[end + 1..].iter().take(hashes).all(|c| *c == '#')
+                    {
+                        break;
+                    }
+                    raw.push(chars[end]);
+                    end += 1;
+                }
+                if !strip_strings {
+                    out.push('r');
+                    for _ in 0..hashes {
+                        out.push('#');
+                    }
+                    out.push('"');
+                    out.push_str(&raw);
+                    out.push('"');
+                }
+                idx = (end + 1 + hashes).min(chars.len());
+                prev = '"';
+                continue;
+            }
+        }
+        // Line comments first (a `"` inside one is not a string);
+        // skip to end of LINE, never end of input.
+        if char == '/' && idx + 1 < chars.len() && chars[idx + 1] == '/' {
+            while idx < chars.len() && chars[idx] != '\n' {
+                idx += 1;
+            }
+            prev = '\n';
+            continue;
+        }
+        // Block comments (nesting, like rustc).
+        if char == '/' && idx + 1 < chars.len() && chars[idx + 1] == '*' {
+            let mut depth = 1;
+            idx += 2;
+            while idx < chars.len() && depth > 0 {
+                if chars[idx] == '\n' {
+                    out.push('\n');
+                } else if chars[idx] == '/' && idx + 1 < chars.len() && chars[idx + 1] == '*' {
+                    depth += 1;
+                    idx += 1;
+                } else if chars[idx] == '*' && idx + 1 < chars.len() && chars[idx + 1] == '/' {
+                    depth -= 1;
+                    idx += 1;
+                }
+                idx += 1;
+            }
+            prev = ' ';
+            continue;
+        }
+        // Char literals `'x'` / `'\n'` (lifetimes have no closing
+        // quote, so they never match).
+        if char == '\'' && custody_is_char_literal(&chars, idx) {
+            idx += 1;
+            if chars[idx] == '\\' {
+                idx += 1;
+            }
+            idx += 2;
+            prev = '\'';
+            continue;
+        }
+        if char == '"' {
+            in_string = true;
+            if !strip_strings {
+                out.push(char);
+            }
+            idx += 1;
+            prev = char;
+            continue;
+        }
+        out.push(char);
+        idx += 1;
+        prev = char;
+    }
+    out
+}
+
+/// `'` opens a char literal when a closing quote follows one plain
+/// char or one backslash escape: `'x'`, `'\n'`, `'\\'`. Lifetimes
+/// (`'a`, `'static`) never match (no closing quote there).
+fn custody_is_char_literal(chars: &[char], idx: usize) -> bool {
+    if chars.get(idx) != Some(&'\'') {
+        return false;
+    }
+    match chars.get(idx + 1) {
+        Some('\\') => chars.get(idx + 2).is_some() && chars.get(idx + 3) == Some(&'\''),
+        Some(_) => chars.get(idx + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+#[test]
+fn custody_lexer_skips_comments_literals_and_raw_strings() {
+    // `//` eats to end of LINE, never end of input.
+    assert_eq!(custody_code_text("a(); // \"sleep\"\nb();"), "a(); \nb();");
+    // A `"` inside a comment never opens a string.
+    assert_eq!(custody_code_text("// \"\n.spawn("), "\n.spawn(");
+    // Char literals vanish; lifetimes pass through.
+    assert_eq!(custody_code_text("x('a', 'b');"), "x(, );");
+    assert_eq!(
+        custody_code_text("fn f<'a>(x: &'a u8)"),
+        "fn f<'a>(x: &'a u8)"
+    );
+    // Raw strings (inner quotes included) vanish whole.
+    assert_eq!(custody_code_text("x(r#\"a\"b\"#);"), "x();");
+    assert_eq!(custody_code_text("x(br\"a\");"), "x(b);");
+    // Block comments nest and span lines (newlines preserved).
+    assert_eq!(
+        custody_code_text("a(); /* x /* y */ z */\nb();"),
+        "a(); \nb();"
+    );
+    // Keep-strings mode preserves the program-name literals.
+    assert!(custody_code_keep_strings("Command::new(\"sleep\")").contains("\"sleep\""));
+    assert!(custody_code_keep_strings("Command::new(\"sh\")").contains("\"sh\""));
+}
+
+/// The whole statement holding the spawn at `lines[idx]`: up to 25
+/// lines down to the `;` terminator, up to 15 lines up while brackets
+/// stay open (a `;` at depth zero is a previous statement, excluded).
+/// Markers outside this window cannot bless the spawn; markers inside
+/// it are inline custody by construction.
+fn custody_statement(lines: &[&str], idx: usize) -> String {
+    let mut end = idx;
+    while end + 1 < lines.len() && end - idx < 25 {
+        if custody_code_text(lines[end]).trim_end().ends_with(';') {
+            break;
+        }
+        end += 1;
+    }
+    let mut start = idx;
+    let mut depth: i32 = 0;
+    while start > 0 && idx - start < 15 {
+        let prev = custody_code_text(lines[start - 1]);
+        let trimmed = prev.trim();
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("#[")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("enum ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("mod ")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("pub(")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("static ")
+        {
+            break;
+        }
+        let opens = prev
+            .chars()
+            .filter(|c| *c == '(' || *c == '[' || *c == '{')
+            .count() as i32;
+        let closes = prev
+            .chars()
+            .filter(|c| *c == ')' || *c == ']' || *c == '}')
+            .count() as i32;
+        depth += closes - opens;
+        // A `;` at depth zero-or-less is a sibling statement (or the
+        // start of one): stopping here can only miss a marker above
+        // (loud false-bare), never bless from a neighbor (silent
+        // false-pass). A `;` inside our own statement (a closure-body
+        // `let`) therefore fails loudly by design.
+        if depth > 0 || (depth <= 0 && trimmed.ends_with(';')) {
+            break;
+        }
+        start -= 1;
+    }
+    lines[start..=end].join("\n")
+}
+
+/// Mechanical custody audit (fix8 ruling): every long-lived
+/// sleep/`sh` spawn in the lane-touched test files is constructed
+/// inside a `Drop`-verified guard — its whole statement names a
+/// custody marker — or is on the explicit exemption list with a
+/// checkable reason. A bare spawn fails here naming file:line.
+/// Wrap it, or exempt it; there is no third state.
+///
+/// Lane files (`git diff 9e8f9be40~1..HEAD --name-only`, plus this
+/// round's pending conversions): the three committed files plus the
+/// three this round converts. Marker types and their `Drop` proof:
+/// `ParkedSleep` (:23376), `ShWrappedSleep` (close+`Drop` kill the
+/// verified-recorded union), `ChildReaper` (engine :34416, workload
+/// :534), `ChildrenGuard` (9 local Drops, all kill+reap),
+/// `ChildGuard` (10 local Drops, all kill+reap),
+/// `ExitMappingChildGuard` (:9959), `ExitMappingChildrenGuard`
+/// (:9968), `SystemScopeChildGuard` (:51891, `live` cleared only
+/// after a reap), `OwnedMapper` (`test_subject.rs`:103). Each
+/// exemption pins file, line, enclosing fn, and reason; a drifted
+/// line or a stale row fails loudly.
+#[test]
+fn sleep_spawns_hold_a_guard_or_exemption() {
+    const MARKERS: [&str; 9] = [
+        "ParkedSleep::",
+        "ShWrappedSleep::",
+        "ChildReaper",
+        "ChildrenGuard",
+        "ChildGuard",
+        "ExitMappingChildGuard",
+        "ExitMappingChildrenGuard",
+        "SystemScopeChildGuard",
+        "OwnedMapper",
+    ];
+    // (file, line, enclosing fn, reason). Line and fn are both
+    // verified: a shift or a retarget fails, it never blesses a
+    // neighboring spawn.
+    const EXEMPT: [(&str, usize, &str, &str); 5] = [
+        (
+            "src/discovery/engine_tests.rs",
+            12921,
+            "spawn",
+            "SettledChild::spawn: stdin/stdout are taken and readiness is proven before Self exists; Drop kills+reaps (:12975)",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            43627,
+            "parked_sleep_has_a_stable_full_census",
+            "proven-then-adopted by design: the park wait proves, adopt_proven takes custody; the pre-adoption window is die_with_parent-bounded",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            99748,
+            "owned_tree_watch_exec_restarts_the_backoff_streak",
+            "READY-proven then adopt_proven takes custody (:99791), close() at :99823; the pre-adoption window is die_with_parent-bounded",
+        ),
+        (
+            "src/discovery/inventory_workload_tests.rs",
+            347,
+            "workload_fd_deadline_guard_terminates_an_acknowledged_descendant",
+            "moved into WorkloadWorker; Drop kills the process group and reaps (:33)",
+        ),
+        (
+            "src/discovery/inventory_workload_tests.rs",
+            910,
+            "grow_native_owners_to_257",
+            "moved into the local Reaper; Drop kills+waits every child (:921)",
+        ),
+    ];
+    let new_cmd = format!("{}::{}(", "Command", "new");
+    let files: [(&str, &str); 6] = [
+        (
+            "src/discovery/engine_tests.rs",
+            include_str!("engine_tests.rs"),
+        ),
+        (
+            "src/discovery/async_global_tests.rs",
+            include_str!("async_global_tests.rs"),
+        ),
+        (
+            "src/inventory/cgroup_runtime_tests.rs",
+            include_str!("../inventory/cgroup_runtime_tests.rs"),
+        ),
+        (
+            "src/discovery/test_subject.rs",
+            include_str!("test_subject.rs"),
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            include_str!("trace_system_seed_tests.rs"),
+        ),
+        (
+            "src/discovery/inventory_workload_tests.rs",
+            include_str!("inventory_workload_tests.rs"),
+        ),
+    ];
+    assert_eq!(files.len(), 6, "the lane touches 6 test files");
+    let mut bare: Vec<(String, usize)> = Vec::new();
+    let mut builders: Vec<(String, usize)> = Vec::new();
+    for (name, source) in files {
+        let lines: Vec<&str> = source.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            if !custody_code_text(line).contains(&new_cmd) {
+                continue;
+            }
+            let stmt = custody_statement(&lines, idx);
+            let code = custody_code_text(&stmt);
+            if MARKERS.iter().any(|marker| code.contains(marker)) {
+                continue;
+            }
+            let with_strings = custody_code_keep_strings(&stmt);
+            if !with_strings.contains("\"sleep\"") && !with_strings.contains("\"sh\"") {
+                continue;
+            }
+            if !code.contains(".spawn(") {
+                builders.push((name.to_string(), idx + 1));
+                continue;
+            }
+            bare.push((name.to_string(), idx + 1));
+        }
+    }
+    for (name, lineno) in &bare {
+        assert!(
+            EXEMPT
+                .iter()
+                .any(|(file, line, _, _)| file == name && line == lineno),
+            "{name}:{lineno}: bare long-lived sleep/sh spawn with no guard — wrap it in a custody marker or add an exemption row"
+        );
+    }
+    // Builder-only sleep/sh configurations (no `.spawn(` in the
+    // statement): the lone case is `ShWrappedSleep::spawn_inner`,
+    // whose constructor-internal custody the guard twins cover. A
+    // second split would hide a spawn from this scan, so the set is
+    // pinned exactly.
+    assert_eq!(
+        builders,
+        [("src/discovery/engine_tests.rs".to_string(), 22962)],
+        "unexpected builder-split sleep/sh configuration: {builders:?}"
+    );
+    // Spot pins: commented guarded spawns must resolve as guarded.
+    // A `//`-handling regression in the lexer turns these silent
+    // (the site vanishes from every class, green-to-green) instead
+    // of failing here.
+    for name in [
+        "conservative_replays_under_churn_never_burn_capacity",
+        "named_reserve_ignores_failed_attaches_across_conservative_replays",
+        "collected_graph_barrier_fences_records_and_assessments",
+    ] {
+        let key = format!("fn {name}(");
+        let (file, source) = files
+            .iter()
+            .find(|(n, s)| s.contains(&key) && *n == "src/discovery/engine_tests.rs")
+            .expect("spot fn lives in engine_tests.rs");
+        let rows: Vec<&str> = source.lines().collect();
+        let start = rows
+            .iter()
+            .position(|line| line.contains(&key))
+            .expect("spot fn");
+        let mut found = 0;
+        for (idx, line) in rows.iter().enumerate().skip(start) {
+            if idx > start + 5 && (line.starts_with("fn ") || line.starts_with("#[test]")) {
+                break;
+            }
+            if !custody_code_text(line).contains(&new_cmd) {
+                continue;
+            }
+            found += 1;
+            let code = custody_code_text(&custody_statement(&rows, idx));
+            assert!(
+                MARKERS.iter().any(|marker| code.contains(marker)),
+                "{file}:{name}: spot spawn lost its guard"
+            );
+        }
+        assert!(found > 0, "{file}:{name}: spot fn lost its spawn");
+    }
+    for (file, line, enclosing, why) in EXEMPT {
+        let source = files
+            .iter()
+            .find(|(name, _)| *name == file)
+            .unwrap_or_else(|| panic!("exemption names an unscanned file: {file}"))
+            .1;
+        let lines: Vec<&str> = source.lines().collect();
+        let text = lines
+            .get(line - 1)
+            .unwrap_or_else(|| panic!("exemption {file}:{line} drifted past end of file ({why})"));
+        assert!(
+            custody_code_text(text).contains(&new_cmd),
+            "exemption {file}:{line} drifted: no spawn there anymore ({why})"
+        );
+        let key = format!("fn {enclosing}(");
+        assert!(
+            lines[..line.min(lines.len())]
+                .iter()
+                .rev()
+                .take(80)
+                .any(|above| above.contains(&key)),
+            "exemption {file}:{line} retargeted: not inside {enclosing}() anymore ({why})"
+        );
+        assert!(
+            bare.iter()
+                .any(|(name, lineno)| name == file && lineno == &line),
+            "exemption {file}:{line} is stale: no bare sleep/sh spawn there anymore — drop or fix the row ({why})"
+        );
+    }
+}
+
 /// Needle: every stop-then-read site settles its child before SIGSTOP, and
 /// every census/shape consumer parks its children before the scan — in
 /// source order, matched as whole statements. Reverting any site to an
@@ -99539,12 +99935,14 @@ fn stop_then_read_sites_settle_before_sigstop() {
         needle_stmt_line(parked_prove, "wait_sleep_child_parked(self.pid);").is_some(),
         "direct guard: no park in the proof"
     );
-    // The sh guard records its grandchild set in the proof and the
-    // `Drop` fallback kills the recorded set: deleting either line
-    // strands on the unlistable branch with every test still green.
+    // The sh guard records its grandchild set in the proof and both
+    // `close` and the `Drop` fallback kill the verified-recorded
+    // union: deleting the record or the union strands a zombie shell's
+    // reparented sleep with every other test still green.
     for stmt in [
         ".expect(\"ShWrappedSleep prove records its grandchild\");",
-        "kill_sh_sleep_grandchildren(&self.grandchildren);",
+        "let recorded = verified_recorded_sh_sleep_grandchildren(&self.grandchildren);",
+        "kill_sh_sleep_grandchildren(&recorded);",
     ] {
         assert!(
             needle_stmt_line(source, stmt).is_some(),

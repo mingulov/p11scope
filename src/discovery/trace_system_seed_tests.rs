@@ -583,26 +583,25 @@ fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let provider = ProviderFixture::new();
-    let child = Command::new("sh")
-        .args([
-            "-c",
-            "printf 'ready\\n'; read -r ignored; exec \"$@\"",
-            "trace-pre-exec",
-        ])
-        .arg(&provider.driver)
-        .arg("dlopen")
-        .arg(&provider.library)
-        .env_clear()
-        .env("P11SCOPE_FIXTURE_INTERFACES", "0")
-        .env("P11SCOPE_FIXTURE_POST_GATE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
-        child,
+        Command::new("sh")
+            .args([
+                "-c",
+                "printf 'ready\\n'; read -r ignored; exec \"$@\"",
+                "trace-pre-exec",
+            ])
+            .arg(&provider.driver)
+            .arg("dlopen")
+            .arg(&provider.library)
+            .env_clear()
+            .env("P11SCOPE_FIXTURE_INTERFACES", "0")
+            .env("P11SCOPE_FIXTURE_POST_GATE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
         std::time::Duration::from_secs(10),
     )
     .unwrap();

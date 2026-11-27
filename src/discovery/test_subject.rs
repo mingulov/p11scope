@@ -14,14 +14,17 @@ impl OwnedMapper {
 
         // The shell's read builtin creates no descendant. Stop it only after
         // its userspace acknowledgement, then observe the actual stopped state.
-        let child = Command::new("sh")
-            .args(["-c", "printf 'ready\\n'; read -r ignored"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        Self::from_child(child, std::time::Duration::from_secs(5)).unwrap()
+        OwnedMapper::from_child(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\\n'; read -r ignored"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap()
     }
 
     pub(super) fn from_child(

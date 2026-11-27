@@ -1824,16 +1824,17 @@ fn inject_native_owner_growth_failure() {
     // One owned sleeper behind a real scan pass: BPF-style image
     // identity exists for it, but the guard refuses exact authority,
     // so `open_inventory_owner` fails through the production path.
-    let child = std::process::Command::new("sleep")
-        .arg("30")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let _reaper = ChildReaper(child);
+    let _reaper = ChildReaper(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let pid = _reaper.0.id();
     let owned: BTreeSet<u32> = [pid].into_iter().collect();
     // Pin shape, measured never assumed: on pidfd kernels the admitted
     // caller retains one pidfd; on fallback kernels it retains none.

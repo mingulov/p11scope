@@ -111,25 +111,10 @@ def main(argv):
     if len(verdict_names) != len(set(verdict_names)) or set(verdict_names) != set(selected):
         print("privileged-lib-results: verdict rows are not exactly one-to-one with the selection", file=sys.stderr)
         return 1
-    try:
-        text = (ROOT / "tests/ignored-tests.json").read_text(encoding="utf-8")
-    except OSError as error:
-        print(f"privileged-lib-results: cannot read ignored-test registry: {error}", file=sys.stderr)
+    files, registry_problems = checker_module().load_ignored_registry(ROOT / "tests/ignored-tests.json")
+    if registry_problems:
+        print(f"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}", file=sys.stderr)
         return 1
-    registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")
-    if registry_problems or type(registry) is not dict:
-        detail = registry_problems[0] if registry_problems else "registry must be a JSON object"
-        print(f"privileged-lib-results: cannot read ignored-test registry: {detail}", file=sys.stderr)
-        return 1
-    files = {}
-    ambiguous = set()
-    for site in registry.get("sites", []):
-        if isinstance(site, dict) and isinstance(site.get("path"), str) and isinstance(site.get("file"), str):
-            if site["path"] in files and files[site["path"]] != site["file"]:
-                ambiguous.add(site["path"])
-            files.setdefault(site["path"], site["file"])
-    for name in ambiguous:
-        files.pop(name, None)
     missing = [name for _path, name in
                ((files.get(name), name) for name in verdict_names) if _path is None]
     if missing:

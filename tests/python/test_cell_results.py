@@ -666,34 +666,73 @@ class TypedCellResultsTests(unittest.TestCase):
                 self.assertIn("not a typed signature", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
-    def test_duplicate_registry_keys_map_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            temp = Path(tmp)
-            (temp / "scripts/ci").mkdir(parents=True)
-            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
-            shutil.copy2(ROOT / "scripts/check-known-failing.py",
-                         temp / "scripts/check-known-failing.py")
-            (temp / "tests").mkdir()
-            (temp / "tests/ignored-tests.json").write_text(
-                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
-                '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n',
-                encoding="utf-8")
-            module = load_script(temp / "scripts/ci/check-cell-results.py",
-                                 "cell_checker_registry_dup")
-            self.assertEqual(module.ignored_test_files(), {})
+    def load_registry_case(self, temp, registry_text):
+        (temp / "scripts/ci").mkdir(parents=True)
+        shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     temp / "scripts/check-known-failing.py")
+        (temp / "tests").mkdir()
+        registry = temp / "tests/ignored-tests.json"
+        registry.write_text(registry_text, encoding="utf-8")
+        module = load_script(temp / "scripts/ci/check-cell-results.py",
+                             "cell_checker_registry_case")
+        return module.ignored_test_files()
 
-    def test_null_registry_maps_nothing(self):
+    def test_invalid_registries_are_rejected_typed(self):
+        cases = {
+            "null": "null\n",
+            "number": "0\n",
+            "array": "[]\n",
+            "string": '"s"\n',
+            "boolean": "true\n",
+            "duplicate-keys": ('{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                               '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n'),
+            "sites-null": ('{"schema": "p11scope/ignored-tests/v1", "sites": null}\n'),
+            "sites-zero": ('{"schema": "p11scope/ignored-tests/v1", "sites": 0}\n'),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                files, problems = self.load_registry_case(Path(tmp), text)
+                self.assertEqual(files, {})
+                self.assertTrue(problems)
+                self.assertIn("must be an object with a sites list", problems[0])
+
+    def test_healthy_registry_maps_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
-            temp = Path(tmp)
-            (temp / "scripts/ci").mkdir(parents=True)
-            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
-            shutil.copy2(ROOT / "scripts/check-known-failing.py",
-                         temp / "scripts/check-known-failing.py")
-            (temp / "tests").mkdir()
-            (temp / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
-            module = load_script(temp / "scripts/ci/check-cell-results.py",
-                                 "cell_checker_registry_null")
-            self.assertEqual(module.ignored_test_files(), {})
+            files, problems = self.load_registry_case(
+                Path(tmp),
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "b.rs", "path": "X"}]}\n')
+            self.assertEqual(problems, [])
+            self.assertEqual(files, {"X": "b.rs"})
+
+    def test_invalid_registry_fails_typed_emit_without_traceback(self):
+        for name, text in (("null", "null\n"),
+                           ("sites-null", '{"schema": "p11scope/ignored-tests/v1", '
+                            '"sites": null}\n')):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                temp = Path(tmp)
+                (temp / "scripts/ci").mkdir(parents=True)
+                shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                             temp / "scripts/check-known-failing.py")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "tests").mkdir()
+                (temp / "tests/ignored-tests.json").write_text(text, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                                 "qualification": "qualified"}) + "\n", encoding="utf-8")
+                output = temp / "typed.json"
+                script = temp / "scripts/ci/check-cell-results.py"
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "a",
+                                      "--known-failing-results", str(output),
+                                      "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                      "--known-failing-host", "github"],
+                                     capture_output=True, text=True)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("must be an object with a sites list", run.stderr)
+                self.assertNotIn("Traceback", run.stderr)
+                self.assertFalse(output.exists())
 
     def test_passing_cell_with_failure_sidecar_is_a_protocol_violation(self):
         result, _document = run_typed_checker(

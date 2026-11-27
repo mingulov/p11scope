@@ -806,6 +806,36 @@ def validate_cell_runner_declarations(root, rows):
     return problems
 
 
+def load_ignored_registry(path):
+    """Strictly load an ignored-test registry file for test->file mapping.
+
+    Returns (files, problems). A missing file yields ({}, []) so
+    registry-less trees keep their fallback path; a present file must
+    parse strictly and be an object with a sites list, else problems
+    holds a typed rejection the caller must surface. Entries that are
+    not {file, path} string pairs are skipped; paths claimed by more
+    than one file are dropped as ambiguous.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return {}, []
+    registry, load_problems = strict_json(text, str(path))
+    if load_problems or type(registry) is not dict or type(registry.get("sites")) is not list:
+        return {}, [f"{path}: ignored-test registry must be an object with a sites list"]
+    files = {}
+    ambiguous = set()
+    for site in registry["sites"]:
+        if not isinstance(site, dict) or not isinstance(site.get("file"), str) or not isinstance(site.get("path"), str):
+            continue
+        if site["path"] in files and files[site["path"]] != site["file"]:
+            ambiguous.add(site["path"])
+        files[site["path"]] = site["file"]
+    for claimed in ambiguous:
+        del files[claimed]
+    return files, []
+
+
 def validate_ignored_known_failing(root, rows):
     path = root / "tests/ignored-tests.json"
     try:

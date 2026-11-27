@@ -293,32 +293,8 @@ def main(argv):
 
 def ignored_test_files():
     registry_path = Path(__file__).resolve().parents[2] / "tests" / "ignored-tests.json"
-    try:
-        text = registry_path.read_text(encoding="utf-8")
-    except OSError:
-        return {}
     checker = known_failing_checker_module()
-    registry, _problems = checker.strict_json(text, str(registry_path))
-    if registry is checker.PARSE_FAILED or registry is None:
-        # Unparseable and null registries both map nothing; a null tracked
-        # registry is still rejected loudly by the checker's own
-        # static validation of the same file.
-        return {}
-    files = {}
-    ambiguous = set()
-    for site in registry.get("sites", []):
-        if not isinstance(site, dict):
-            continue
-        test = site.get("path")
-        file_name = site.get("file")
-        if not isinstance(test, str) or not isinstance(file_name, str):
-            continue
-        if test in files and files[test] != file_name:
-            ambiguous.add(test)
-        files.setdefault(test, file_name)
-    for test in ambiguous:
-        files.pop(test, None)
-    return files
+    return checker.load_ignored_registry(registry_path)
 
 
 def known_failing_checker_module():
@@ -362,7 +338,9 @@ def emit_known_failing_results(rows, output, runner, host, selected_cells, resul
     if len(set(selected_cells)) != len(selected_cells):
         return "typed selection is duplicated"
     root = Path(__file__).resolve().parents[2]
-    test_files = ignored_test_files()
+    test_files, registry_problems = ignored_test_files()
+    if registry_problems:
+        return "; ".join(registry_problems)
     runner_path = runner[len("cell:"):]
     runner_file_ok = bool(runner_path) and not runner_path.startswith("/") and (root / runner_path).is_file()
 

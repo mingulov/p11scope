@@ -1693,7 +1693,7 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
 
     def test_converter_rejects_null_and_scalar_registry_typed(self):
-        for content in ("null\n", "[]\n"):
+        for content in ("null\n", "0\n", "[]\n", '"s"\n', "true\n"):
             with self.subTest(content=content):
                 with tempfile.TemporaryDirectory() as temporary:
                     temp = Path(temporary)
@@ -1715,6 +1715,56 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("cannot read ignored-test registry", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_rejects_nonlist_sites_typed(self):
+        for content in ('{"schema": "p11scope/ignored-tests/v1", "sites": null}\n',
+                        '{"schema": "p11scope/ignored-tests/v1", "sites": 0}\n'):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    (temp / "scripts/ci").mkdir(parents=True)
+                    (temp / "tests").mkdir()
+                    shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                                 temp / "scripts/ci/privileged-lib-results.py")
+                    shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                                 temp / "scripts/check-known-failing.py")
+                    (temp / "tests/ignored-tests.json").write_text(content, encoding="utf-8")
+                    selection = temp / "selection.txt"
+                    verdicts = temp / "verdicts.tsv"
+                    output = temp / "out.json"
+                    selection.write_text("X\n")
+                    verdicts.write_text("X\tPASS\n")
+                    converter = temp / "scripts/ci/privileged-lib-results.py"
+                    result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("must be an object with a sites list", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_maps_healthy_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "scripts/ci").mkdir(parents=True)
+            (temp / "tests").mkdir()
+            shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                         temp / "scripts/ci/privileged-lib-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "tests/ignored-tests.json").write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "src/b.rs", "path": "X"}]}\n',
+                encoding="utf-8")
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text("X\n")
+            verdicts.write_text("X\tPASS\n")
+            converter = temp / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            document = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(document["results"][0]["path"], "src/b.rs")
 
     def test_converter_refuses_duplicate_key_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2169,26 +2219,85 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode != 0 and not output.exists()
         self.record(results, "cell-sidecar-dup-keys", outcomes["original"], outcomes["mutant"])
 
-        # The cell registry read is strict: a duplicate-key registry maps
-        # nothing instead of collapsing to one mapping.
-        cell_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
-                                         "registry, _problems = checker.strict_json(text, str(registry_path))",
-                                         "registry = json.loads(text)")
+        # The shared registry loader rejects duplicate keys: restoring
+        # plain loads collapses them back into one mapping.
+        helper_source = (ROOT / "scripts/check-known-failing.py").read_text(encoding="utf-8")
+        helper_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    registry, load_problems = strict_json(text, str(path))",
+            "    registry, load_problems = json.loads(text), []")
         outcomes = {}
-        for label, source in (("original", cell_source), ("mutant", cell_mutant)):
+        for label, source in (("original", helper_source), ("mutant", helper_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                registry = temp / "ignored-tests.json"
+                registry.write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n', encoding="utf-8")
+                module = load_script(script, f"registry_helper_{label}")
+                _files, problems = module.load_ignored_registry(registry)
+                outcomes[label] = problems != []
+        self.record(results, "ignored-registry-dup-keys", outcomes["original"], outcomes["mutant"])
+
+        # The shared registry loader requires an object with a sites list:
+        # dropping the shape guard crashes on null or non-list sites.
+        shape_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    if load_problems or type(registry) is not dict or type(registry.get(\"sites\")) is not list:",
+            "    if load_problems:")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", shape_mutant)):
+            label_ok = True
+            for index, content in enumerate(("null\n",
+                                            '{"schema": "p11scope/ignored-tests/v1", "sites": null}\n',
+                                            '{"schema": "p11scope/ignored-tests/v1", "sites": 0}\n')):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    script = temp / "check-known-failing.py"
+                    script.write_text(source, encoding="utf-8")
+                    registry = temp / "ignored-tests.json"
+                    registry.write_text(content, encoding="utf-8")
+                    module = load_script(script, f"registry_shape_{index}_{label}")
+                    try:
+                        _files, problems = module.load_ignored_registry(registry)
+                    except (AttributeError, TypeError):
+                        label_ok = False
+                        break
+                    label_ok = label_ok and problems != []
+            outcomes[label] = label_ok
+        self.record(results, "ignored-registry-shape", outcomes["original"], outcomes["mutant"])
+
+        # The cell emitter surfaces registry problems instead of mapping
+        # on: dropping the propagation silently falls back to runner paths.
+        propagate_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
+                                              "    test_files, registry_problems = ignored_test_files()\n"
+                                              "    if registry_problems:\n"
+                                              "        return \"; \".join(registry_problems)",
+                                              "    test_files, registry_problems = ignored_test_files()")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", propagate_mutant)):
             with tempfile.TemporaryDirectory() as temporary:
                 temp = Path(temporary)
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
                 (temp / "tests").mkdir()
-                (temp / "tests/ignored-tests.json").write_text(
-                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
-                    '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n', encoding="utf-8")
+                (temp / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
-                module = load_script(script, f"cell_registry_{label}")
-                outcomes[label] = module.ignored_test_files() == {}
-        self.record(results, "cell-registry-dup-keys", outcomes["original"], outcomes["mutant"])
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                                 "qualification": "qualified"}) + "\n", encoding="utf-8")
+                output = temp / "typed.json"
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "a",
+                                      "--known-failing-results", str(output),
+                                      "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                      "--known-failing-host", "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0 and not output.exists()
+        self.record(results, "cell-emit-registry-propagate", outcomes["original"], outcomes["mutant"])
 
         # A null cell row must be a typed row-shape refusal: restoring the
         # None-sentinel check silently skips it and greens the run.
@@ -2271,32 +2380,33 @@ class ProducerMutationSweepTests(unittest.TestCase):
 
         # The privileged registry read is strict: a duplicate-key registry
         # fails instead of collapsing to one mapping.
-        registry_mutant = self.mutate_source(
+        propagate_mutant = self.mutate_source(
             ROOT / "scripts/ci/privileged-lib-results.py",
-            'registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")\n'
-            "    if registry_problems or type(registry) is not dict:",
-            "registry = json.loads(text)\n"
-            "    registry_problems = []\n"
-            "    if type(registry) is not dict:")
+            "    files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")\n"
+            "    if registry_problems:\n"
+            "        print(f\"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}\", file=sys.stderr)\n"
+            "        return 1",
+            "    files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")")
         outcomes = {}
-        for label, source in (("original", privileged_source), ("mutant", registry_mutant)):
+        for label, source in (("original", privileged_source), ("mutant", propagate_mutant)):
             with tempfile.TemporaryDirectory() as temporary:
                 temp = Path(temporary)
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "tests").mkdir()
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
-                (temp / "tests/ignored-tests.json").write_text(
-                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
-                    '{"file": "src/a.rs", "path": "X", "file": "src/b.rs"}]}\n', encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-ignored-tests.py", temp / "scripts/check-ignored-tests.py")
+                (temp / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
+                os.symlink(ROOT / "src", temp / "src")
                 script = temp / "scripts/ci/privileged-lib-results.py"
                 script.write_text(source, encoding="utf-8")
+                name = "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64"
                 selection = temp / "selection.txt"; verdicts = temp / "verdicts.tsv"; output = temp / "out.json"
-                selection.write_text("X\n", encoding="utf-8")
-                verdicts.write_text("X\tPASS\n", encoding="utf-8")
+                selection.write_text(name + "\n", encoding="utf-8")
+                verdicts.write_text(name + "\tPASS\n", encoding="utf-8")
                 run = subprocess.run([sys.executable, "-I", str(script), str(selection), str(verdicts), str(output), "github"],
                                      capture_output=True, text=True)
                 outcomes[label] = run.returncode != 0
-        self.record(results, "privileged-registry-dup-keys", outcomes["original"], outcomes["mutant"])
+        self.record(results, "privileged-registry-propagate", outcomes["original"], outcomes["mutant"])
 
         # Promoted curated tests outside the ignored registry are mapped by
         # the Rust-source fallback; disabling it recreates the shard failure.
@@ -2640,7 +2750,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 41
+        total = 43
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

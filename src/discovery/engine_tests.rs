@@ -99153,7 +99153,7 @@ fn custody_occurrence_audit_fails_closed() {
         custody_classify_file(text)
             .bare
             .iter()
-            .map(|(line, _)| *line)
+            .map(|(line, _, _)| *line)
             .collect::<Vec<_>>()
     };
     let split_lines = |text: &str| {
@@ -99347,6 +99347,132 @@ fn custody_occurrence_audit_fails_closed() {
     assert_eq!(bare_lines("let v = Foo::new(a, b).spawn();"), [1]);
     // Malformed input fails closed, never skips.
     assert_eq!(split_lines("let c = Command::new(\"sleep\""), [1]);
+    // F2: occurrence keys carry column and constructor token. Two
+    // bare constructors on one line share the line but never the
+    // column; the token names the constructor path, so an alias at
+    // an exempted column still mismatches.
+    let bare_full = |text: &str| {
+        custody_classify_file(text)
+            .bare
+            .iter()
+            .map(|(line, col, token)| (*line, *col, token.clone()))
+            .collect::<Vec<_>>()
+    };
+    let both =
+        bare_full("let a = Command::new(\"s\").spawn(); let b = Command::new(\"t\").spawn();");
+    assert_eq!(both.len(), 2);
+    assert_eq!((both[0].0, both[1].0), (1, 1));
+    assert_eq!(both[0].1, 9);
+    assert!(both[1].1 > both[0].1);
+    assert_eq!(both[0].2, "Command::new(s)");
+    assert_eq!(both[1].2, "Command::new(t)");
+    let one = bare_full("let c = std::process::Command::new(\"sleep\").spawn();");
+    assert_eq!(
+        one,
+        [(1, 9, String::from("std::process::Command::new(sleep)"))]
+    );
+    let aliased = bare_full("let c = P11ReviewCommand::new(\"sleep\").spawn();");
+    assert_eq!(
+        aliased,
+        [(1, 9, String::from("P11ReviewCommand::new(sleep)"))]
+    );
+}
+
+#[test]
+fn custody_transfer_audit_fails_closed() {
+    let tx = |text: &str| custody_classify_transfers(text);
+    // into_inner immediately consumed by a guard constructor is
+    // received: the strict receiver rule admits `::new`,
+    // `::from_child`, and bare guard tuples only.
+    for code in [
+        "let g = SystemScopeChildGuard::new(child.into_inner());",
+        "let g = OwnedMapper::from_child(owned.into_inner(), dur);",
+        "let g = Children(vec![guard.into_inner()]);",
+        "let g = Children(vec![\n    ParkedSleep::spawn_unparked(cmd).into_inner(),\n]);",
+        "let g = SystemScopeChildGuard::new(ParkedSleep::into_inner(g));",
+    ] {
+        let found = tx(code);
+        assert_eq!(found.received.len(), 1, "received: {code}");
+        assert!(found.bare.is_empty(), "nothing bare: {code}");
+    }
+    // A bare transfer — Devin's removed-receiving-guard shape — is
+    // bare with the receiver in the token, never silent.
+    let found = tx("let _accepted = child.into_inner();");
+    assert_eq!(found.bare, [(1, 23, String::from("into_inner:child"))]);
+    assert!(found.received.is_empty());
+    // into_inner through a non-guard call, a guard non-constructor,
+    // or a qualified std tuple is bare: fail closed.
+    for code in [
+        "let x = foo(guard.into_inner());",
+        "let g = ParkedSleep::adopt_proven(guard.into_inner());",
+        "let c = process::Child(guard.into_inner());",
+        "children.0.push(guard.into_inner());",
+        "let child = Self { child: guard.into_inner() };",
+    ] {
+        let found = tx(code);
+        assert_eq!(found.bare.len(), 1, "bare: {code}");
+        assert!(found.received.is_empty(), "not received: {code}");
+    }
+    // The release definition itself is an audited occurrence (it
+    // carries the mechanism row, never auto-passes).
+    let found = tx("fn into_inner(mut self) -> Child {");
+    assert_eq!(found.bare.len(), 1);
+    assert_eq!(found.bare[0].2, "into_inner:fn");
+    // forget/replace/swap/ManuallyDrop never auto-pass, in any
+    // spelling — even enclosed in a guard call, even turbofished.
+    for (code, token) in [
+        ("std::mem::forget(child);", "forget:child"),
+        ("mem::forget(self);", "forget:self"),
+        (
+            "mem::replace(&mut pinned, PinnedObjects::empty());",
+            "replace:&mut pinned",
+        ),
+        (
+            "mem::replace::<PinnedObjects>(&mut p, q());",
+            "replace:&mut p",
+        ),
+        ("std::mem::swap(&mut a, &mut b);", "swap:&mut a"),
+        ("replace(a, b);", "replace:a"),
+        ("let x = Guard::new(mem::forget(y));", "forget:y"),
+        ("std::mem::ManuallyDrop::new(first);", "manuallydrop:first"),
+        ("ManuallyDrop::new(x);", "manuallydrop:x"),
+    ] {
+        let found = tx(code);
+        assert_eq!(found.bare.len(), 1, "bare: {code}");
+        assert_eq!(found.bare[0].2, token, "token: {code}");
+        assert!(found.received.is_empty(), "never received: {code}");
+    }
+    // Value methods named replace/swap are not custody releases.
+    for code in [
+        "let s = text.replace(\"a\", \"b\");",
+        "v.swap(0, 1);",
+        "map.swap_remove(&k);",
+    ] {
+        let found = tx(code);
+        assert!(found.bare.is_empty(), "ignored: {code}");
+        assert!(found.received.is_empty(), "ignored: {code}");
+    }
+    // Longer identifiers, definitions, and quoted text never match.
+    for code in [
+        "let my_forget = 1; let reinto_inner = 2;",
+        "fn forgettable() {} fn swap_views() {}",
+        "let s = \"child.into_inner()\"; // mem::forget(x)",
+    ] {
+        let found = tx(code);
+        assert!(found.bare.is_empty(), "ignored: {code}");
+        assert!(found.received.is_empty(), "ignored: {code}");
+    }
+    // Receiver strictness, directly.
+    assert!(custody_caller_is_receiver("SystemScopeChildGuard::new"));
+    assert!(custody_caller_is_receiver("OwnedMapper::from_child"));
+    assert!(custody_caller_is_receiver("Children"));
+    assert!(custody_caller_is_receiver("Child"));
+    assert!(!custody_caller_is_receiver("ParkedSleep::spawn_unparked"));
+    assert!(!custody_caller_is_receiver("ParkedSleep::adopt_proven"));
+    assert!(!custody_caller_is_receiver("push"));
+    assert!(!custody_caller_is_receiver("process::Child"));
+    assert!(!custody_caller_is_receiver("mycrate::Children"));
+    assert!(!custody_caller_is_receiver("MyChildGuard::new"));
 }
 
 /// One `Xxx::new` argument: a plain string literal (decoded) or the
@@ -99780,31 +99906,47 @@ fn custody_spawn_dots(text: &str) -> Vec<usize> {
     out
 }
 
-/// Display token for an occurrence: literal value, alias head, or raw
-/// expression text (truncated). Used only in messages.
+/// Display token for an occurrence: constructor path plus program
+/// head — literal value or raw expression text (truncated). The
+/// constructor prefix is load-bearing: an alias at an exempted
+/// column still mismatches. Used in messages and as the occurrence
+/// half of an exemption-row key.
 fn custody_occurrence_token(occ: &CustodyNewOccurrence) -> String {
     let head = match &occ.arg {
         CustodyNewArg::Literal(lit) => lit.clone(),
-        CustodyNewArg::Expr(expr) => {
-            if custody_is_command_new(&occ.name) {
-                expr.clone()
-            } else {
-                format!("{}({expr})", occ.name)
-            }
-        }
+        CustodyNewArg::Expr(expr) => expr.clone(),
     };
-    if head.chars().count() > 60 {
+    let head = if head.chars().count() > 60 {
         format!("{}...", head.chars().take(60).collect::<String>())
     } else {
         head
-    }
+    };
+    format!("{}({head})", occ.name)
 }
 
-/// Per-occurrence classification of one file: bare spawns and split
-/// halves as (1-based line, token), guarded `Command` lines, and the
-/// Other/waited counts.
+/// 1-based (line, column) of a char offset from char-based line
+/// starts. Shared by the spawn and transfer classifiers so a row
+/// key means the same in both.
+fn custody_line_col(line_starts: &[usize], off: usize) -> (usize, usize) {
+    let line = line_starts.partition_point(|&start| start <= off);
+    (line, off - line_starts[line - 1] + 1)
+}
+
+/// A bare spawn occurrence keyed by occurrence: 1-based line,
+/// 1-based column of the constructor start, and token.
+fn custody_bare_occurrence(
+    line_starts: &[usize],
+    occ: &CustodyNewOccurrence,
+) -> (usize, usize, String) {
+    let (line, col) = custody_line_col(line_starts, occ.at);
+    (line, col, custody_occurrence_token(occ))
+}
+
+/// Per-occurrence classification of one file: bare spawns as
+/// (1-based line, 1-based column, token), split halves as (line,
+/// token), guarded `Command` lines, and the Other/waited counts.
 struct CustodyFileClasses {
-    bare: Vec<(usize, String)>,
+    bare: Vec<(usize, usize, String)>,
     splits: Vec<(usize, String)>,
     guarded: Vec<usize>,
     other: usize,
@@ -99876,7 +100018,7 @@ fn custody_classify_file(text: &str) -> CustodyFileClasses {
             if !enclosed && !chain.spawn_dots.is_empty() {
                 classes
                     .bare
-                    .push((line_of(occ.at), custody_occurrence_token(&occ)));
+                    .push(custody_bare_occurrence(&line_starts, &occ));
             }
             continue;
         }
@@ -99897,7 +100039,7 @@ fn custody_classify_file(text: &str) -> CustodyFileClasses {
         if !chain.spawn_dots.is_empty() {
             classes
                 .bare
-                .push((line_of(occ.at), custody_occurrence_token(&occ)));
+                .push(custody_bare_occurrence(&line_starts, &occ));
             continue;
         }
         classes
@@ -99912,6 +100054,288 @@ fn custody_classify_file(text: &str) -> CustodyFileClasses {
         }
     }
     classes.splits.sort_by_key(|&(line, _)| line);
+    classes
+}
+
+/// One custody-transfer operation: a release word opening a call.
+/// `at` is the word's offset, `open` its `(`.
+enum CustodyTransferKind {
+    IntoInner,
+    Forget,
+    Replace,
+    Swap,
+    ManuallyDrop,
+}
+
+struct CustodyTransferOp {
+    at: usize,
+    open: usize,
+    kind: CustodyTransferKind,
+}
+
+/// Every custody-transfer operation call in `text`, outside strings
+/// and comments: `into_inner(`/`forget(` in any spelling (method,
+/// path, UFCS, or definition — the definition itself carries a row
+/// as the sanctioned mechanism), `replace(`/`swap(` except method
+/// calls (`s.replace(`/`v.swap(` are value methods, never custody
+/// releases), and `ManuallyDrop::new(`. An optional turbofish is
+/// allowed before the paren (`mem::replace::<T>(` still matches):
+/// guessing the type arguments would be resolution, so any spelling
+/// matches and every match needs a row. Word boundaries hold.
+fn custody_transfer_ops(text: &str) -> Vec<CustodyTransferOp> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        if let Some(end) = custody_trivia_end(&chars, idx) {
+            idx = end;
+            continue;
+        }
+        if let Some(op) = custody_transfer_op_at(&chars, idx) {
+            let open = op.open;
+            out.push(op);
+            idx = open + 1;
+            continue;
+        }
+        idx += 1;
+    }
+    out
+}
+
+/// A transfer op opening at `idx`, if any.
+fn custody_transfer_op_at(chars: &[char], idx: usize) -> Option<CustodyTransferOp> {
+    if idx > 0 && (chars[idx - 1].is_alphanumeric() || chars[idx - 1] == '_') {
+        return None;
+    }
+    // ManuallyDrop::new goes through the constructor parser, so any
+    // path prefix (`std::mem::`, bare) matches.
+    if let Some((name, open)) = custody_parse_new_call(chars, idx)
+        && (name == "ManuallyDrop::new" || name.ends_with("::ManuallyDrop::new"))
+    {
+        return Some(CustodyTransferOp {
+            at: idx,
+            open,
+            kind: CustodyTransferKind::ManuallyDrop,
+        });
+    }
+    for (word, kind, method_ok) in [
+        ("into_inner", CustodyTransferKind::IntoInner, true),
+        ("forget", CustodyTransferKind::Forget, true),
+        ("replace", CustodyTransferKind::Replace, false),
+        ("swap", CustodyTransferKind::Swap, false),
+    ] {
+        let want: Vec<char> = word.chars().collect();
+        if chars.len() < idx + want.len() || chars[idx..idx + want.len()] != want[..] {
+            continue;
+        }
+        let after = idx + want.len();
+        if after < chars.len() && (chars[after].is_alphanumeric() || chars[after] == '_') {
+            continue;
+        }
+        if !method_ok && idx > 0 && chars[idx - 1] == '.' {
+            continue;
+        }
+        if let Some(open) = custody_call_open(chars, after) {
+            return Some(CustodyTransferOp {
+                at: idx,
+                open,
+                kind,
+            });
+        }
+    }
+    None
+}
+
+/// Offset of the call `(` after a transfer word: an optional
+/// turbofish may sit between the word and the paren.
+fn custody_call_open(chars: &[char], after: usize) -> Option<usize> {
+    let mut j = custody_skip_gap(chars, after);
+    if j + 1 < chars.len() && chars[j] == ':' && chars[j + 1] == ':' {
+        let mut k = custody_skip_gap(chars, j + 2);
+        if k < chars.len()
+            && chars[k] == '<'
+            && let Some(end) = custody_angle_end(chars, k)
+        {
+            k = end;
+        } else {
+            return None;
+        }
+        j = custody_skip_gap(chars, k);
+    }
+    (j < chars.len() && chars[j] == '(').then_some(j)
+}
+
+/// Offset just past the balanced angle group opening at `lt`, or
+/// `None` when unbalanced.
+fn custody_angle_end(chars: &[char], lt: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut j = lt;
+    while j < chars.len() {
+        if let Some(end) = custody_trivia_end(chars, j) {
+            j = end;
+            continue;
+        }
+        match chars[j] {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// First 40 chars of `text` (char-safe).
+fn custody_head40(text: &str) -> String {
+    text.chars().take(40).collect()
+}
+
+/// Last 40 chars of `text` (char-safe).
+fn custody_tail40(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > 40 {
+        chars[chars.len() - 40..].iter().collect()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Display token for a transfer op: `into_inner:<receiver>` (up to
+/// 40 chars of code before the call) or `<kind>:<first-arg-head>`.
+/// Used in messages and as the occurrence half of a transfer-row key.
+fn custody_transfer_token(chars: &[char], op: &CustodyTransferOp) -> String {
+    let (kind, head) = match op.kind {
+        CustodyTransferKind::IntoInner => {
+            let mut j = op.at;
+            while j > 0 && chars[j - 1].is_whitespace() {
+                j -= 1;
+            }
+            if j > 0 && chars[j - 1] == '.' {
+                j -= 1;
+                while j > 0 && chars[j - 1].is_whitespace() {
+                    j -= 1;
+                }
+            }
+            let end = j;
+            while j > 0 && !matches!(chars[j - 1], ';' | '{' | '}' | '(' | '[' | ',' | '=' | '\n') {
+                j -= 1;
+            }
+            let recv: String = chars[j..end].iter().collect();
+            ("into_inner", custody_tail40(recv.trim()))
+        }
+        CustodyTransferKind::Forget => ("forget", custody_first_arg_head(chars, op.open)),
+        CustodyTransferKind::Replace => ("replace", custody_first_arg_head(chars, op.open)),
+        CustodyTransferKind::Swap => ("swap", custody_first_arg_head(chars, op.open)),
+        CustodyTransferKind::ManuallyDrop => {
+            ("manuallydrop", custody_first_arg_head(chars, op.open))
+        }
+    };
+    format!("{kind}:{head}")
+}
+
+/// Head (first 40 chars) of the first argument of the call whose `(`
+/// is at `open`: balanced to a depth-zero `,`/`)`.
+fn custody_first_arg_head(chars: &[char], open: usize) -> String {
+    let mut j = custody_skip_gap(chars, open + 1);
+    let start = j;
+    let mut depth = 0;
+    while j < chars.len() {
+        if let Some(end) = custody_trivia_end(chars, j) {
+            j = end;
+            continue;
+        }
+        match chars[j] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => break,
+            _ => {}
+        }
+        j += 1;
+    }
+    custody_head40(chars[start..j].iter().collect::<String>().trim())
+}
+
+/// True when a caller path is a guard CONSTRUCTOR — the only shapes
+/// that immediately take custody of a transferred child: a bare
+/// guard tuple (`Children(...)`) or `GuardType::new` /
+/// `GuardType::from_child`. Any other guard-associated call
+/// (`adopt_proven`, methods) does NOT auto-receive: fail closed. A
+/// leading-`::` caller never matches.
+fn custody_caller_is_receiver(caller: &str) -> bool {
+    if !caller.contains("::") {
+        return CUSTODY_GUARD_TYPES.contains(&caller);
+    }
+    let mut segments: Vec<&str> = caller.split("::").collect();
+    let method = segments.pop();
+    let guard = segments.pop();
+    matches!(method, Some("new" | "from_child"))
+        && guard
+            .is_some_and(|g| CUSTODY_GUARD_TYPES.contains(&g) && g != "Child" && g != "Children")
+}
+
+/// Transfer classification of one file: bare transfer ops as
+/// (1-based line, 1-based column, token), and received lines.
+struct CustodyTransferClasses {
+    bare: Vec<(usize, usize, String)>,
+    received: Vec<usize>,
+}
+
+/// Classify every custody-transfer operation in one file's text
+/// (fix12 F1 rule). The single legal release is
+/// `ParkedSleep::into_inner` (the only guard-release fn in the
+/// crate); each `into_inner` call is received when its innermost
+/// enclosing call is a guard constructor, else it needs a
+/// transfer-exemption row. `forget`/`replace`/`swap`/
+/// `ManuallyDrop::new` never auto-pass: every occurrence needs a
+/// row with a per-site ownership reason. Enclosure is the same
+/// linear sweep as the spawn classifier.
+fn custody_classify_transfers(text: &str) -> CustodyTransferClasses {
+    let chars: Vec<char> = text.chars().collect();
+    let mut line_starts = vec![0usize];
+    for (i, c) in text.chars().enumerate() {
+        if c == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let pairs = custody_paren_pairs(text);
+    let mut classes = CustodyTransferClasses {
+        bare: Vec::new(),
+        received: Vec::new(),
+    };
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut next_pair = 0;
+    for op in custody_transfer_ops(text) {
+        let token = custody_transfer_token(&chars, &op);
+        let (line, col) = custody_line_col(&line_starts, op.at);
+        let Some(call_end) = custody_call_end(&chars, op.open) else {
+            classes.bare.push((line, col, token));
+            continue;
+        };
+        while next_pair < pairs.len() && pairs[next_pair].0 < op.at {
+            stack.push(pairs[next_pair]);
+            next_pair += 1;
+        }
+        while stack.last().is_some_and(|&(_, close)| close < call_end) {
+            stack.pop();
+        }
+        let received = matches!(op.kind, CustodyTransferKind::IntoInner)
+            && stack
+                .last()
+                .and_then(|&(open, _)| custody_caller_before(&chars, open))
+                .as_deref()
+                .is_some_and(custody_caller_is_receiver);
+        if received {
+            classes.received.push(line);
+        } else {
+            classes.bare.push((line, col, token));
+        }
+    }
     classes
 }
 
@@ -100036,191 +100460,449 @@ fn custody_basename(value: &str) -> &str {
     base.split_whitespace().next().unwrap_or(base)
 }
 
+/// Exact one-to-one correspondence between audited occurrences
+/// and exemption rows: every occurrence matches exactly one row
+/// (file, line, column, token) and every row matches exactly one
+/// occurrence. A second occurrence on a row's line (Devin F2)
+/// matches no row and fails here; a stale or duplicated row fails
+/// on the other side.
+fn custody_rows_cover_exactly(
+    what: &str,
+    occs: &[(String, usize, usize, String)],
+    rows: &[(&str, usize, usize, &str, &str, &str)],
+) {
+    for (name, line, col, token) in occs {
+        let hits = rows
+            .iter()
+            .filter(|(file, row_line, row_col, row_token, _, _)| {
+                file == name && row_line == line && row_col == col && row_token == token
+            })
+            .count();
+        assert!(
+            hits == 1,
+            "{name}:{line}:{col}: {what} ({token:?}) matches {hits} rows, want exactly 1 — wrap it in a guard or fix the exemption rows"
+        );
+    }
+    for (file, line, col, token, _, why) in rows {
+        let hits = occs
+            .iter()
+            .filter(|(name, occ_line, occ_col, occ_token)| {
+                name == file && occ_line == line && occ_col == col && occ_token == token
+            })
+            .count();
+        assert!(
+            hits == 1,
+            "exemption {file}:{line}:{col} ({token:?}) matches {hits} {what} occurrences, want exactly 1 — drop or fix the row ({why})"
+        );
+    }
+}
+
 /// Mechanical custody audit (fix8 ruling, fix11 per-occurrence
-/// fail-closed rule): every spawn-constructor occurrence in the
-/// lane-touched test files carries its own disposition. A recognized
-/// `Command` occurrence constructed inside a guard call is guarded;
-/// an inline plain allowlisted literal program is Other; a chain
-/// that reaps inline is waited. Anything else with a spawn on its
-/// chain is bare and must sit on the explicit exemption list with a
-/// checkable reason. Pure builders, orphan `.spawn()` dots, and
+/// fail-closed rule, fix12 occurrence-keyed rows + transfer audit):
+/// every spawn-constructor occurrence in the lane-touched test files
+/// carries its own disposition. A recognized `Command` occurrence
+/// constructed inside a guard call is guarded; an inline plain
+/// allowlisted literal program is Other; a chain that reaps inline
+/// is waited. Anything else with a spawn on its chain is bare and
+/// must match exactly one exemption row keyed by occurrence (file,
+/// line, column, token). Pure builders, orphan `.spawn()` dots, and
 /// malformed calls are splits, pinned exactly with custody evidence.
-/// A bare spawn fails here naming file:line.
+/// Every custody-transfer operation is audited too: each
+/// `into_inner` call must be immediately consumed by a guard
+/// constructor (else it needs a transfer row), and every
+/// `forget`/`replace`/`swap`/`ManuallyDrop::new` occurrence always
+/// needs a row. A bare spawn or transfer fails here naming
+/// file:line:column.
 ///
 /// Lane files: the six `files` entries below, count-asserted. Marker
 /// `Drop` proofs live in the round report's marker table (line refs
 /// rot; the report is regenerated per round). Each exemption pins
-/// file, line, enclosing fn, and reason; drifted, retargeted, or
-/// stale rows fail loudly. The guarded/Other/waited counts are
-/// pinned: silent lexer regressions fail here instead of passing
-/// green-to-green.
+/// file, line, column, token, enclosing fn, and reason; drifted,
+/// retargeted, stale, or doubly-blessing rows fail loudly. The
+/// guarded/Other/waited/received counts are pinned: silent lexer
+/// regressions fail here instead of passing green-to-green.
 #[test]
 fn sleep_spawns_hold_a_guard_or_exemption() {
-    // (file, line, enclosing fn, reason). Line and fn are both
-    // verified: a shift or a retarget fails, it never blesses a
-    // neighboring spawn.
-    const EXEMPT: [(&str, usize, &str, &str); 27] = [
+    // (file, line, column, token, enclosing fn, reason). A row
+    // blesses exactly one occurrence: line, column, and token must
+    // all match, and rows and bare occurrences correspond exactly.
+    // A shift, a same-line sibling, or a retarget fails loudly; it
+    // never blesses a neighboring spawn.
+    const EXEMPT: [(&str, usize, usize, &str, &str, &str); 27] = [
         (
             "src/discovery/engine_tests.rs",
             12926,
+            25,
+            "std::process::Command::new(sh)",
             "spawn",
             "SettledChild::spawn: stdin/stdout are taken and readiness is proven before Self exists; Drop kills+reaps",
         ),
         (
             "src/discovery/engine_tests.rs",
             43636,
+            17,
+            "std::process::Command::new(sleep)",
             "parked_sleep_has_a_stable_full_census",
             "proven-then-adopted by design: the park wait proves, adopt_proven takes custody; the pre-adoption window is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
-            100835,
+            101547,
+            22,
+            "std::process::Command::new(sh)",
             "owned_tree_watch_exec_restarts_the_backoff_streak",
             "READY-proven then adopt_proven takes custody, close() at tail; the pre-adoption window is die_with_parent-bounded",
         ),
         (
             "src/discovery/inventory_workload_tests.rs",
             347,
+            17,
+            "std::process::Command::new(sh)",
             "workload_fd_deadline_guard_terminates_an_acknowledged_descendant",
             "moved into WorkloadWorker; Drop kills the process group and reaps",
         ),
         (
             "src/discovery/inventory_workload_tests.rs",
             910,
+            13,
+            "std::process::Command::new(sleep)",
             "grow_native_owners_to_257",
             "moved into the local Reaper; Drop kills+waits every child",
         ),
         (
             "src/discovery/engine_tests.rs",
             20356,
+            21,
+            "std::process::Command::new(&runner)",
             "spawn_peer",
             "pushed into LoadedSeedProvider.peers (Drop kills+waits); only infallible .id() between",
         ),
         (
             "src/discovery/engine_tests.rs",
             20647,
+            17,
+            "std::process::Command::new(&runner)",
             "loaded_seed_provider_with_seed_table",
             "moved into LoadedSeedProvider (Drop kills+waits); only infallible moves between",
         ),
         (
             "src/discovery/engine_tests.rs",
             30747,
+            17,
+            "std::process::Command::new(&runner)",
             "exit_loader_subject",
             "moved into LoadedSeedProvider (Drop kills+waits); only infallible moves between",
         ),
         (
             "src/discovery/engine_tests.rs",
             26534,
+            21,
+            "std::process::Command::new(self.dir.path().join(\"tabled-runner\"))",
             "spawn_peer_library",
             "pushed into TabledSeedProvider.peers (Drop kills+waits); only infallible .id() between",
         ),
         (
             "src/discovery/engine_tests.rs",
             26606,
+            17,
+            "std::process::Command::new(&runner)",
             "loaded_tabled_provider",
             "moved into TabledSeedProvider (Drop kills+waits); only infallible moves between",
         ),
         (
             "src/discovery/engine_tests.rs",
             10802,
+            28,
+            "std::process::Command::new(&fixtures.mapper)",
             "run_capture",
             "short-lived mapper: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
         ),
         (
             "src/discovery/engine_tests.rs",
             10809,
+            27,
+            "std::process::Command::new(&fixtures.plain)",
             "run_capture",
             "short-lived plain child: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
         ),
         (
             "src/discovery/engine_tests.rs",
             10815,
+            30,
+            "std::process::Command::new(&fixtures.threaded)",
             "run_capture",
             "short-lived threaded mapper: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
         ),
         (
             "src/discovery/inventory_workload_tests.rs",
             57,
+            17,
+            "Command::new(std::env::current_exe().unwrap())",
             "run_workload_worker",
             "moved into WorkloadWorker (Drop kills the process group and reaps); only infallible .id() between",
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
             348,
+            21,
+            "Command::new(/bin/sleep)",
             "build",
             "pushed into Children (Drop kills+waits); the if/else only selects the spawn, no fallible step",
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
             355,
+            17,
+            "Command::new(/bin/sleep)",
             "build",
             "pushed into Children (Drop kills+waits); the if/else only selects the spawn, no fallible step",
         ),
         (
             "src/discovery/engine_tests.rs",
             10009,
+            21,
+            "std::process::Command::new(sleep)",
             "exit_mapping_spawn_guards_reap_dropped_children",
             "map-collect into ExitMappingChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             10071,
+            21,
+            "std::process::Command::new(sleep)",
             "exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic",
             "map-collect into ExitMappingChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             15552,
+            17,
+            "std::process::Command::new(sleep)",
             "initial_scan_zombie_member_is_silent_like_a_reaped_exit",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             15650,
+            17,
+            "std::process::Command::new(sleep)",
             "max_scan_pids_bounds_initial_scan_and_refresh",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             15895,
+            17,
+            "std::process::Command::new(sleep)",
             "zero_cap_refresh_short_circuits_the_sweep_to_empty",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             15996,
+            17,
+            "std::process::Command::new(sleep)",
             "ordinary_over_cap_refresh_performs_no_maps_sweep",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             16668,
+            17,
+            "std::process::Command::new(sleep)",
             "reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             17058,
+            17,
+            "std::process::Command::new(sleep)",
             "reconcile_waiter_outside_slice_settles_within_one_sweep",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             17170,
+            17,
+            "std::process::Command::new(sleep)",
             "reconcile_quantum_zero_defers_the_whole_slice",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             17303,
+            17,
+            "std::process::Command::new(sleep)",
             "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
             17397,
+            17,
+            "std::process::Command::new(sleep)",
             "refresh_requests_survive_allocation_exhaustion",
             "map-collect into ChildrenGuard (Drop kills+reaps); mid-collect spawn-failure stranding is die_with_parent-bounded",
+        ),
+    ];
+    // Transfer exemptions (file, line, column, token, enclosing fn,
+    // reason): into_inner calls not immediately consumed by a guard
+    // constructor, plus every forget/replace/swap/ManuallyDrop
+    // occurrence (those never auto-pass). Same exact-correspondence
+    // rule as EXEMPT.
+    const TRANSFER: [(&str, usize, usize, &str, &str, &str); 19] = [
+        (
+            "src/discovery/engine_tests.rs",
+            23352,
+            8,
+            "into_inner:fn",
+            "into_inner",
+            "the release mechanism itself: takes the child out, forgets the emptied shell",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            23357,
+            19,
+            "forget:self",
+            "into_inner",
+            "inside into_inner: forgets the emptied shell; the returned child is the single owner",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            23498,
+            27,
+            "into_inner:guard",
+            "parked_sleep_into_inner_transfers_custody_once",
+            "transfer-custody proof test: bare Child received, killed+waited inline as the documented receiver",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            30460,
+            25,
+            "into_inner:events",
+            "assess",
+            "non-custody: RefCell event log into_inner yields names, no Child involved",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            34047,
+            19,
+            "forget:child",
+            "fd_inheritor_dies_with_spawning_thread",
+            "non-Child forget: FdInheritor (raw fork struct) deliberately forgotten; reaped in-test via waitpid with SIGKILL-cause proof",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            38863,
+            27,
+            "replace:&mut engine.pinned",
+            "an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it",
+            "non-custody: PinnedObjects swap; old value moves into the new struct, still owned",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            38959,
+            27,
+            "replace:&mut engine.pinned",
+            "an_ended_pid_retirement_closes_over_the_disturbed_group_only",
+            "non-custody: PinnedObjects swap; old value moves into the new struct, still owned",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            39039,
+            27,
+            "replace:&mut engine.pinned",
+            "an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot",
+            "non-custody: PinnedObjects swap; old value moves into the new struct, still owned",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            44739,
+            19,
+            "swap:&mut survivor",
+            "a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed",
+            "non-release: swaps two SystemScopeChildGuard owners; both stay owned, nothing dropped",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            55225,
+            23,
+            "manuallydrop:first",
+            "review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan",
+            "non-Child: provider module struct; the moved-out dir guard keeps its Drop, no double dlclose",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            57524,
+            26,
+            "into_inner:child: guard",
+            "spawn",
+            "transfer into LazyLoader.child field; LazyLoader::drop kills+reaps",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            60719,
+            35,
+            "into_inner:guard",
+            "detailed_proof_multiview_expiry_resumes_saved_seeding_phase",
+            "transfer into Children table (Drop kills+waits); push is infallible",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            61616,
+            35,
+            "into_inner:guard",
+            "cgroup_trace_bracket_saved_phases_share_visit_read_and_time_allowance",
+            "transfer into Children table (Drop kills+waits); push is infallible",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            62119,
+            35,
+            "into_inner:guard",
+            "cgroup_trace_bracket_shared_slots_paths_interest_and_fairness",
+            "transfer into Children table (Drop kills+waits); push is infallible",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            64009,
+            30,
+            "into_inner:alien",
+            "peer_census_alignment_respawns_a_mismatched_peer",
+            "transfer into LoadedSeedProvider.peers; fixture Drop kills+waits every peer",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            102370,
+            26,
+            "into_inner:child: guard",
+            "spawn_1gib",
+            "transfer into TeardownChild.child field; TeardownChild::drop kills+reaps",
+        ),
+        (
+            "src/discovery/async_global_tests.rs",
+            27,
+            27,
+            "into_inner:child",
+            "with_close_failure",
+            "transfer into Case.child field; Case::drop kills+waits",
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            332,
+            43,
+            "into_inner:|error| error",
+            "build",
+            "non-custody: Mutex lock-error into_inner yields the guard, no Child involved",
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            584,
+            39,
+            "into_inner:|error| error",
+            "late_provider_fixture_waits_for_driver_exec_before_original_view",
+            "non-custody: Mutex lock-error into_inner yields the guard, no Child involved",
         ),
     ];
     let files: [(&str, &str); 6] = [
@@ -100250,13 +100932,15 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
     ];
     assert_eq!(files.len(), 6, "the lane touches 6 test files");
-    let mut bare: Vec<(String, usize, String)> = Vec::new();
+    let mut bare: Vec<(String, usize, usize, String)> = Vec::new();
+    let mut transfer_bare: Vec<(String, usize, usize, String)> = Vec::new();
     let mut splits: Vec<(String, usize)> = Vec::new();
     let mut guarded_total = 0usize;
     let mut guarded_lines: Vec<(String, usize)> = Vec::new();
     let mut split_lines: Vec<(String, usize)> = Vec::new();
     let mut other = 0usize;
     let mut waited = 0usize;
+    let mut received: Vec<(String, usize)> = Vec::new();
     for (name, source) in files {
         let classes = custody_classify_file(source);
         guarded_total += classes.guarded.len();
@@ -100265,22 +100949,23 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         for line in classes.guarded {
             guarded_lines.push((name.to_string(), line));
         }
-        for (line, token) in classes.bare {
-            bare.push((name.to_string(), line, token));
+        for (line, col, token) in classes.bare {
+            bare.push((name.to_string(), line, col, token));
         }
         for (line, _) in classes.splits {
             splits.push((name.to_string(), line));
             split_lines.push((name.to_string(), line));
         }
+        let transfers = custody_classify_transfers(source);
+        for line in transfers.received {
+            received.push((name.to_string(), line));
+        }
+        for (line, col, token) in transfers.bare {
+            transfer_bare.push((name.to_string(), line, col, token));
+        }
     }
-    for (name, lineno, token) in &bare {
-        assert!(
-            EXEMPT
-                .iter()
-                .any(|(file, line, _, _)| file == name && line == lineno),
-            "{name}:{lineno}: bare spawn (program {token:?}) with no guard — wrap it in a custody marker or add an exemption row"
-        );
-    }
+    custody_rows_cover_exactly("bare spawn", &bare, &EXEMPT);
+    custody_rows_cover_exactly("bare transfer", &transfer_bare, &TRANSFER);
     // Coverage pins: every guarded/Other/waited occurrence is counted,
     // so a lexer regression that silently drops sites fails here
     // instead of passing green-to-green. Update deliberately with each
@@ -100289,6 +100974,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     assert_eq!(guarded_total, 209, "guarded constructor occurrences");
     assert_eq!(other, 51, "Other (allowlisted literal) occurrences");
     assert_eq!(waited, 4, "inline-waited occurrences");
+    assert_eq!(received.len(), 23, "received transfer occurrences");
     // Split halves (pure builder, orphan spawn, or malformed call):
     // each is pinned exactly, with its custody evidence in
     // SPLIT_GUARDS below. A new split hides a spawn from the program
@@ -100421,7 +101107,9 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
             "{file}:{name}: spot fn lost its guarded spawn"
         );
         assert!(
-            !bare.iter().any(|(f, line, _)| f == file && in_range(*line)),
+            !bare
+                .iter()
+                .any(|(f, line, _, _)| f == file && in_range(*line)),
             "{file}:{name}: spot fn grew a bare spawn"
         );
         assert!(
@@ -100431,7 +101119,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
             "{file}:{name}: spot fn grew a split"
         );
     }
-    for (file, line, enclosing, why) in EXEMPT {
+    for (file, line, col, token, enclosing, why) in EXEMPT {
         let source = files
             .iter()
             .find(|(name, _)| *name == file)
@@ -100442,10 +101130,12 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
             .get(line - 1)
             .unwrap_or_else(|| panic!("exemption {file}:{line} drifted past end of file ({why})"));
         assert!(
-            custody_new_occurrences(text)
-                .iter()
-                .any(|occ| custody_is_command_new(&occ.name)),
-            "exemption {file}:{line} drifted: no spawn there anymore ({why})"
+            custody_new_occurrences(text).iter().any(|occ| {
+                occ.at == col - 1
+                    && custody_is_command_new(&occ.name)
+                    && custody_occurrence_token(occ) == *token
+            }),
+            "exemption {file}:{line}:{col} drifted: no spawn there anymore ({why})"
         );
         let key = format!("fn {enclosing}(");
         assert!(
@@ -100454,12 +101144,34 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
                 .rev()
                 .take(300)
                 .any(|above| above.contains(&key)),
-            "exemption {file}:{line} retargeted: not inside {enclosing}() anymore ({why})"
+            "exemption {file}:{line}:{col} retargeted: not inside {enclosing}() anymore ({why})"
         );
+    }
+    for (file, line, col, token, enclosing, why) in TRANSFER {
+        let source = files
+            .iter()
+            .find(|(name, _)| *name == file)
+            .unwrap_or_else(|| panic!("transfer names an unscanned file: {file}"))
+            .1;
+        let lines: Vec<&str> = source.lines().collect();
+        let text = lines
+            .get(line - 1)
+            .unwrap_or_else(|| panic!("transfer {file}:{line} drifted past end of file ({why})"));
+        let line_chars: Vec<char> = text.chars().collect();
         assert!(
-            bare.iter()
-                .any(|(name, lineno, _)| name == file && lineno == &line),
-            "exemption {file}:{line} is stale: no bare spawn there anymore — drop or fix the row ({why})"
+            custody_transfer_ops(text).iter().any(|op| {
+                op.at == col - 1 && custody_transfer_token(&line_chars, op) == *token
+            }),
+            "transfer {file}:{line}:{col} drifted: no transfer op there anymore ({why})"
+        );
+        let key = format!("fn {enclosing}(");
+        assert!(
+            lines[..line.min(lines.len())]
+                .iter()
+                .rev()
+                .take(300)
+                .any(|above| above.contains(&key)),
+            "transfer {file}:{line}:{col} retargeted: not inside {enclosing}() anymore ({why})"
         );
     }
 }

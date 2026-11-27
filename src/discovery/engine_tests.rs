@@ -89411,7 +89411,8 @@ fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let poison = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let poison = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_parked(poison.pid());
 
     let poison_pid = poison.pid();
     std::fs::write(
@@ -89424,7 +89425,8 @@ fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("a broken newcomer never aborts the capture");
     }
-    let healthy = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let healthy = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_parked(healthy.pid());
 
     let healthy_pid = healthy.pid();
     std::fs::write(
@@ -89776,7 +89778,8 @@ fn held_back_process_is_forgotten_when_it_exits() {
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let poison = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let poison = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_parked(poison.pid());
 
     let poison_pid = poison.pid();
     std::fs::write(
@@ -89871,7 +89874,8 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let newcomer = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let newcomer = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_parked(newcomer.pid());
 
     let newcomer_pid = newcomer.pid();
     std::fs::write(
@@ -99077,7 +99081,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
         &'static [(&'static str, &'static str)],
         &'static str,
     );
-    let parked_groups: [ParkedGroup; 7] = [
+    let parked_groups: [ParkedGroup; 10] = [
         (
             "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
             &[(
@@ -99134,6 +99138,36 @@ fn stop_then_read_sites_settle_before_sigstop() {
             )],
             "refresh_inventory_once(",
         ),
+        (
+            "poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted",
+            &[
+                (
+                    "wait_sleep_child_parked(poison.pid());",
+                    "let poison = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_parked(healthy.pid());",
+                    "let healthy = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "held_back_process_is_forgotten_when_it_exits",
+            &[(
+                "wait_sleep_child_parked(poison.pid());",
+                "let poison = ParkedSleep::spawn_unparked",
+            )],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "persistently_poisoned_tick_stops_blocking_newcomers",
+            &[(
+                "wait_sleep_child_parked(newcomer.pid());",
+                "let newcomer = ParkedSleep::spawn_unparked",
+            )],
+            "apply_ordinary_batch(",
+        ),
     ];
     for (name, pairs, anchor) in parked_groups {
         let body = needle_fn_body(source, name);
@@ -99186,11 +99220,14 @@ fn stop_then_read_sites_settle_before_sigstop() {
             assert!(settle < scan, "{name}: park must precede the first scan");
         }
     }
-    // Guard-constructed scan sites: (test, constructor markers,
-    // scan anchor). Construction proves readiness atomically
-    // (spawn plus park), so each marker must precede the first scan
-    // that can consume that child. Markers are unambiguous
-    // (exactly-once) like the quad spawn markers above.
+    // Guard-constructed scan sites with upfront spawns: (test,
+    // constructor markers, scan anchor). Construction proves readiness
+    // atomically (spawn plus park), and the first scan in the body is
+    // the first scan that can consume the child, so each marker must
+    // precede it: moving construction below that scan fails here.
+    // Mid-test spawns keep explicit parks in the quad table instead
+    // (a floating after-marker anchor could not kill their reorders).
+    // Markers are unambiguous (exactly-once).
     let ctor_order: [(&str, &[&str], &str); 28] = [
         (
             "owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest",
@@ -99290,27 +99327,17 @@ fn stop_then_read_sites_settle_before_sigstop() {
         ),
         (
             "poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted",
-            &[
-                "let kept = ParkedSleep::spawn_parked",
-                "let poison = ParkedSleep::spawn_parked",
-                "let healthy = ParkedSleep::spawn_parked",
-            ],
+            &["let kept = ParkedSleep::spawn_parked"],
             "apply_ordinary_batch(",
         ),
         (
             "held_back_process_is_forgotten_when_it_exits",
-            &[
-                "let kept = ParkedSleep::spawn_parked",
-                "let poison = ParkedSleep::spawn_parked",
-            ],
+            &["let kept = ParkedSleep::spawn_parked"],
             "apply_ordinary_batch(",
         ),
         (
             "persistently_poisoned_tick_stops_blocking_newcomers",
-            &[
-                "let poison = ParkedSleep::spawn_parked",
-                "let newcomer = ParkedSleep::spawn_parked",
-            ],
+            &["let poison = ParkedSleep::spawn_parked"],
             "apply_ordinary_batch(",
         ),
         (
@@ -99373,15 +99400,12 @@ fn stop_then_read_sites_settle_before_sigstop() {
             );
             let scan = body
                 .lines()
-                .enumerate()
-                .position(|(idx, line)| {
-                    idx > built[0]
-                        && line
-                            .split_once("//")
-                            .map_or(line, |(code, _)| code)
-                            .contains(anchor)
+                .position(|line| {
+                    line.split_once("//")
+                        .map_or(line, |(code, _)| code)
+                        .contains(anchor)
                 })
-                .unwrap_or_else(|| panic!("{name}: no {anchor} call after construction"));
+                .unwrap_or_else(|| panic!("{name}: no {anchor} call"));
             assert!(
                 built[0] < scan,
                 "{name}: construction must precede the first scan"

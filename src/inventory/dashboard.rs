@@ -2383,7 +2383,7 @@ fn detach_on_stop_signal(
     count: &std::sync::atomic::AtomicUsize,
     outputs_attempted: &std::sync::atomic::AtomicBool,
 ) -> bool {
-    let previous = match count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
+    let previous = match count.try_update(Ordering::SeqCst, Ordering::SeqCst, |seen| {
         (seen < 2).then_some(seen + 1)
     }) {
         Ok(previous) | Err(previous) => previous,

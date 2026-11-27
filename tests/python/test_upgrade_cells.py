@@ -584,6 +584,65 @@ exit 2
     return 0
 
 
+WART_11_RPM = [
+    "/usr/share/doc/p11scope",
+    "/usr/share/doc/p11scope/LICENSES",
+    "/usr/share/doc/p11scope/notices",
+    "/usr/share/doc/p11scope/notices/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/cargo",
+    "/usr/share/doc/p11scope/notices/licenses/package-files",
+    "/usr/share/doc/p11scope/notices/licenses/rust-1.99.1",
+    "/usr/share/doc/p11scope/notices/licenses/rust-1.99.1/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20",
+    "/usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/upstream",
+]
+SHARED_PREFIXES = ["/", "/usr", "/usr/bin", "/usr/share", "/usr/share/doc"]
+OWNED_FILES = [
+    "/usr/bin/p11scope",
+    "/usr/bin/p11scope-discover",
+    "/usr/share/doc/p11scope/COPYRIGHT",
+]
+
+
+def owned_paths():
+    fmt = os.environ["SIM_FORMAT"]
+    if fmt == "deb":
+        paths = SHARED_PREFIXES + OWNED_FILES + WART_11_RPM
+    else:
+        paths = ["/usr/share/doc/p11scope"] + OWNED_FILES
+    sys.stdout.write("\n".join(paths) + "\n")
+    return 0
+
+
+def uninstall_package():
+    state = state_dir()
+    try:
+        installed = (state / "installed-version").read_text().strip()
+    except OSError:
+        return 1
+    side = "old" if installed == "0.7.1" else "new"
+    if control(f"fail-uninstall-{side}"):
+        return 1
+    fake = Path(os.environ["SIM_FAKE_ROOT"])
+    fmt = os.environ["SIM_FORMAT"]
+    if fmt == "rpm":
+        for entry in WART_11_RPM:
+            if control(f"drop-wart-{side}") and entry.endswith("/upstream"):
+                continue
+            (fake / entry.lstrip("/")).mkdir(parents=True, exist_ok=True)
+        if control(f"leftover-extra-{side}"):
+            (fake / "usr/share/doc/p11scope/EXTRA").mkdir(parents=True, exist_ok=True)
+    if control(f"leftover-file-{side}"):
+        target = fake / "usr/share/doc/p11scope/STRAY"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("stray")
+    if not control(f"keep-binary-{side}"):
+        Path(os.environ["SIM_P11SCOPE_BIN"]).unlink(missing_ok=True)
+    (state / "installed-version").write_text("")
+    return 0
+
+
 def query_version():
     try:
         version = (state_dir() / "installed-version").read_text().strip()
@@ -604,15 +663,23 @@ def main():
         print(package_version(args[1]))
         return 0
     if name == "dpkg-query":
+        if "-L" in args:
+            return owned_paths()
         return query_version()
     if name == "dpkg":
+        if args and args[0] == "-r":
+            return uninstall_package()
         return install_package(args[-1])
     if name == "rpm":
         if "-qp" in args:
             print(package_version(args[-1]))
             return 0
+        if "-ql" in args:
+            return owned_paths()
         if "-q" in args:
             return query_version()
+        if "-e" in args:
+            return uninstall_package()
         return install_package(args[-1])
     return 2
 
@@ -677,8 +744,10 @@ def run_gate5_simulation(format_name="deb", old_version="0.7.1", new_version="0.
         state = base / "state"
         workdir = base / "work"
         recovery = base / "recovery"
+        fakeroot = base / "fakeroot"
         binary = base / "root" / "p11scope"
         state.mkdir()
+        fakeroot.mkdir()
         write_gate5_mockbin(mockbin)
         suffix = "deb" if format_name == "deb" else "rpm"
         old = base / f"old.{suffix}"
@@ -696,11 +765,13 @@ def run_gate5_simulation(format_name="deb", old_version="0.7.1", new_version="0.
             f"export SIM_WORKDIR={shlex.quote(str(workdir))}\n"
             f"export SIM_RECOVERY_DIR={shlex.quote(str(recovery))}\n"
             f"export SIM_P11SCOPE_BIN={shlex.quote(str(binary))}\n"
+            f"export SIM_FAKE_ROOT={shlex.quote(str(fakeroot))}\n"
             f"export SIM_FORMAT={shlex.quote(format_name)}\n"
             "P11SCOPE_GATE5_SOURCE_ONLY=1\n"
             f". {shlex.quote(str(GATE5))}\n"
             'P11SCOPE_BIN="$SIM_P11SCOPE_BIN"\n'
             'recovery_dir() { printf \'%s\' "$SIM_RECOVERY_DIR"; }\n'
+            'package_fs_root() { printf \'%s\' "$SIM_FAKE_ROOT"; }\n'
             f"main --format {shlex.quote(format_name)}"
             f" --old {shlex.quote(str(old))}"
             f" --new {shlex.quote(str(new))}"
@@ -1173,6 +1244,8 @@ class UpgradeGate5ContractTests(unittest.TestCase):
             "canary_report_sha_before",
             "canary_report_sha_after",
             "canary_survived",
+            "old_leftover_dirs",
+            "new_leftover_dirs",
             "fail_reason",
             "synthetic",
         }
@@ -1198,6 +1271,8 @@ class UpgradeGate5ContractTests(unittest.TestCase):
         self.assertIs(passed["canary_survived"], True)
         self.assertIs(passed["synthetic"], True)
         self.assertEqual(len(passed["canary_recovery_sha_before"]), 64)
+        self.assertEqual(passed["old_leftover_dirs"], ["/w/old-a", "/w/old-b"])
+        self.assertEqual(passed["new_leftover_dirs"], [])
         self.assertIs(mismatch["canary_survived"], False)
         self.assertNotEqual(
             mismatch["canary_report_sha_before"], mismatch["canary_report_sha_after"]
@@ -1207,6 +1282,21 @@ class UpgradeGate5ContractTests(unittest.TestCase):
         self.assertEqual(empty_hash["canary_recovery_sha_before"], "")
         self.assertEqual(empty_hash["canary_recovery_sha_after"], "")
         self.assertIs(empty_hash["canary_survived"], False)
+
+
+WART_11_RPM = [
+    "/usr/share/doc/p11scope",
+    "/usr/share/doc/p11scope/LICENSES",
+    "/usr/share/doc/p11scope/notices",
+    "/usr/share/doc/p11scope/notices/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/cargo",
+    "/usr/share/doc/p11scope/notices/licenses/package-files",
+    "/usr/share/doc/p11scope/notices/licenses/rust-1.99.1",
+    "/usr/share/doc/p11scope/notices/licenses/rust-1.99.1/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20",
+    "/usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20/licenses",
+    "/usr/share/doc/p11scope/notices/licenses/upstream",
+]
 
 
 class UpgradeGate5SimulationTests(unittest.TestCase):
@@ -1241,6 +1331,12 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                     result["canary_report_sha_before"],
                     result["canary_report_sha_after"],
                 )
+                if format_name == "rpm":
+                    self.assertEqual(result["old_leftover_dirs"], WART_11_RPM)
+                    self.assertEqual(result["new_leftover_dirs"], WART_11_RPM)
+                else:
+                    self.assertEqual(result["old_leftover_dirs"], [])
+                    self.assertEqual(result["new_leftover_dirs"], [])
 
     def test_simulated_wrong_package_negative_is_exact_for_both_formats(self):
         for format_name in ("deb", "rpm"):
@@ -1435,6 +1531,30 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 {"query-new-version": "0.7.1"},
                 "package manager version is '0.7.1', expected '0.7.2'",
             ),
+            (
+                "old uninstall rc",
+                {},
+                {"fail-uninstall-old": ""},
+                "old uninstall failed (see uninstall-old.log)",
+            ),
+            (
+                "old binary survives uninstall",
+                {},
+                {"keep-binary-old": ""},
+                "installed binary survived old uninstall",
+            ),
+            (
+                "old leftover file",
+                {},
+                {"leftover-file-old": ""},
+                "old uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
+            ),
+            (
+                "new leftover file",
+                {},
+                {"leftover-file-new": ""},
+                "new uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
+            ),
         ]
         for name, kwargs, controls, expected_reason in scenarios:
             with self.subTest(name=name):
@@ -1448,6 +1568,45 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                     result["fail_reason"],
                     expected_reason.format(binary=result["binary"]),
                 )
+
+    def test_simulated_rpm_uninstall_negatives_fail_with_exact_typed_reasons(self):
+        want = " ".join(WART_11_RPM)
+        extra = " ".join([WART_11_RPM[0], "/usr/share/doc/p11scope/EXTRA"] + WART_11_RPM[1:])
+        missing = " ".join(w for w in WART_11_RPM if not w.endswith("/upstream"))
+        scenarios = [
+            (
+                "old uninstall rc",
+                {"fail-uninstall-old": ""},
+                "old uninstall failed (see uninstall-old.log)",
+            ),
+            (
+                "old leftover file",
+                {"leftover-file-old": ""},
+                "old uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
+            ),
+            (
+                "old leftover extra dir",
+                {"leftover-extra-old": ""},
+                f"old uninstall leftovers differ: got [{extra}] want [{want}]",
+            ),
+            (
+                "old missing wart dir",
+                {"drop-wart-old": ""},
+                f"old uninstall leftovers differ: got [{missing}] want [{want}]",
+            ),
+            (
+                "new leftover file",
+                {"leftover-file-new": ""},
+                "new uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
+            ),
+        ]
+        for name, controls, expected_reason in scenarios:
+            with self.subTest(name=name):
+                rc, stderr, result = run_gate5_simulation("rpm", controls=controls)
+                self.assertEqual(rc, 1, stderr)
+                self.assertIsNotNone(result, stderr)
+                self.assertEqual(result["status"], "fail")
+                self.assertEqual(result["fail_reason"], expected_reason)
 
 
 class UpgradeArtifactValidationTests(unittest.TestCase):

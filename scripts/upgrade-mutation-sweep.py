@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_MODULE = ["python3", "-I", "tests/python/test_upgrade_cells.py"]
 VALIDATOR_TEST = "UpgradeArtifactValidationTests"
 GATE5_KILLER = "UpgradeGate5SimulationTests.test_simulated_negative_controls_fail_with_exact_typed_reasons"
+GATE5_RPM_KILLER = "UpgradeGate5SimulationTests.test_simulated_rpm_uninstall_negatives_fail_with_exact_typed_reasons"
 GATE6_KILLER = "UpgradeGate6ActivationTests.test_run_gate_activation_negative_controls"
 
 GATE6_POSITIVE_KILLER = (
@@ -46,6 +47,41 @@ MUTATIONS = [
         "file": "scripts/upgrade-gate5.sh",
         "old": '  validation_detail="$(validate_inventory_report "$WORKDIR/post-upgrade.json")" || fail "new capture report failed typed validation: $validation_detail"',
         "new": '  validation_detail="typed validation disabled"',
+        "killer": GATE5_KILLER,
+    },
+    {
+        "site": "gate5 leftover pin comparison",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": '  [ "$leftovers" = "$wanted" ] || fail "$phase uninstall leftovers differ: got [$leftovers] want [$wanted]"',
+        "new": '  :',
+        "killer": GATE5_RPM_KILLER,
+    },
+    {
+        "site": "gate5 leftover stray scan",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": '    stray="$(find "$probe" -not -type d 2>/dev/null | head -20)"',
+        "new": '    stray=""',
+        "killer": GATE5_KILLER,
+    },
+    {
+        "site": "gate5 old uninstall observation call",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": '  observe_uninstall_leftovers old',
+        "new": '  :',
+        "killer": GATE5_KILLER,
+    },
+    {
+        "site": "gate5 new uninstall observation call",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": '  observe_uninstall_leftovers new',
+        "new": '  :',
+        "killer": GATE5_KILLER,
+    },
+    {
+        "site": "gate5 binary-survived uninstall check",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": '  [ -e "$P11SCOPE_BIN" ] && fail "installed binary survived $phase uninstall"',
+        "new": '  :',
         "killer": GATE5_KILLER,
     },
     {

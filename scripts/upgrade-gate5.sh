@@ -42,9 +42,18 @@ DOCTOR_OLD_RC=-1; DOCTOR_NEW_RC=-1
 CAPTURE_OLD_RC=-1; CAPTURE_NEW_RC=-1
 CANARY_RECOVERY_SHA_BEFORE=""; CANARY_RECOVERY_SHA_AFTER=""
 CANARY_REPORT_SHA_BEFORE=""; CANARY_REPORT_SHA_AFTER=""
+OLD_LEFTOVER_DIRS=""; NEW_LEFTOVER_DIRS=""
 FAIL_REASON=""
 RESULT=""
 SYNTHETIC=0
+# Known v0.7.1 packaging wart (rpm): `rpm -e` removes every owned file but
+# leaves these 11 implicitly-created empty doc dirs (the rpm file list names
+# only /usr/share/doc/p11scope itself plus files; dpkg tracks and removes
+# every listed dir, so the deb leg expects none). Observed live on the
+# official 0.7.1 rpm; the 0.7.2 layout is identical (same packager, verified
+# live this round), so both phases pin the same set. Sorted LC_ALL=C.
+RPM_EMPTY_DIR_WART="/usr/share/doc/p11scope /usr/share/doc/p11scope/LICENSES /usr/share/doc/p11scope/notices /usr/share/doc/p11scope/notices/licenses /usr/share/doc/p11scope/notices/licenses/cargo /usr/share/doc/p11scope/notices/licenses/package-files /usr/share/doc/p11scope/notices/licenses/rust-1.99.1 /usr/share/doc/p11scope/notices/licenses/rust-1.99.1/licenses /usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20 /usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20/licenses /usr/share/doc/p11scope/notices/licenses/upstream"
+SHARED_PREFIXES="/ /usr /usr/bin /usr/share /usr/share/doc"
 
 need_value() {
   [ "$2" -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
@@ -84,6 +93,8 @@ emit_result() {
   GATE5_CANARY_RECOVERY_SHA_AFTER="$CANARY_RECOVERY_SHA_AFTER" \
   GATE5_CANARY_REPORT_SHA_BEFORE="$CANARY_REPORT_SHA_BEFORE" \
   GATE5_CANARY_REPORT_SHA_AFTER="$CANARY_REPORT_SHA_AFTER" \
+  GATE5_OLD_LEFTOVER_DIRS="$OLD_LEFTOVER_DIRS" \
+  GATE5_NEW_LEFTOVER_DIRS="$NEW_LEFTOVER_DIRS" \
   GATE5_FAIL_REASON="$FAIL_REASON" \
   GATE5_SYNTHETIC="$SYNTHETIC" \
   python3 - "$output" "$status" <<'PY'
@@ -135,6 +146,8 @@ result = {
     and recovery_before == recovery_after
     and bool(report_before)
     and report_before == report_after,
+    "old_leftover_dirs": text("GATE5_OLD_LEFTOVER_DIRS").split(),
+    "new_leftover_dirs": text("GATE5_NEW_LEFTOVER_DIRS").split(),
     "fail_reason": text("GATE5_FAIL_REASON"),
     "synthetic": text("GATE5_SYNTHETIC") == "1",
 }
@@ -175,6 +188,8 @@ run_self_test() {
   CANARY_RECOVERY_SHA_AFTER="$CANARY_RECOVERY_SHA_BEFORE"
   CANARY_REPORT_SHA_BEFORE="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   CANARY_REPORT_SHA_AFTER="$CANARY_REPORT_SHA_BEFORE"
+  OLD_LEFTOVER_DIRS="/w/old-a /w/old-b"
+  NEW_LEFTOVER_DIRS=""
   emit_result "pass" "$dir/gate5-result.json"
   CANARY_REPORT_SHA_AFTER="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   FAIL_REASON="self-test mismatch"
@@ -296,6 +311,72 @@ recovery_dir() {
   printf '%s' "/var/tmp/p11scope-recovered-$EUID_VAL"
 }
 
+# Filesystem root the leftover scan probes under. Empty in production; the
+# simulation suite overrides it (same sourcing seam as recovery_dir) so the
+# pinned absolute leftover paths resolve inside a throwaway fake root.
+package_fs_root() {
+  printf '%s' ""
+}
+
+observe_uninstall_leftovers() {
+  phase="$1"
+  if [ "$FORMAT" = deb ]; then
+    owned="$(dpkg-query -L p11scope 2>/dev/null)" || fail "cannot list installed files before $phase uninstall"
+  else
+    owned="$(rpm -ql p11scope 2>/dev/null)" || fail "cannot list installed files before $phase uninstall"
+  fi
+  [ -n "$owned" ] || fail "installed file list empty before $phase uninstall"
+  if [ "$FORMAT" = deb ]; then
+    dpkg -r p11scope > "$WORKDIR/uninstall-$phase.log" 2>&1 || fail "$phase uninstall failed (see uninstall-$phase.log)"
+  else
+    rpm -e p11scope > "$WORKDIR/uninstall-$phase.log" 2>&1 || fail "$phase uninstall failed (see uninstall-$phase.log)"
+  fi
+  [ -e "$P11SCOPE_BIN" ] && fail "installed binary survived $phase uninstall"
+  root="$(package_fs_root)"
+  leftovers=""
+  unexpected=""
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case " $SHARED_PREFIXES " in
+      *" $path "*) continue;;
+    esac
+    probe="$root$path"
+    [ -e "$probe" ] || [ -L "$probe" ] || continue
+    # Any non-directory in the surviving subtree (a file at the owned path
+    # itself or nested below it) is unexpected content, never the wart.
+    stray="$(find "$probe" -not -type d 2>/dev/null | head -20)"
+    if [ -n "$stray" ]; then
+      while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        hit="${hit#$root}"
+        unexpected="$unexpected $hit"
+      done <<EOF
+$stray
+EOF
+      continue
+    fi
+    found="$(find "$probe" -type d 2>/dev/null)"
+    while IFS= read -r hit; do
+      [ -n "$hit" ] || continue
+      hit="${hit#$root}"
+      leftovers="$leftovers $hit"
+    done <<EOF
+$found
+EOF
+  done <<EOF
+$owned
+EOF
+  [ -n "$unexpected" ] && fail "$phase uninstall left unexpected content:$unexpected"
+  leftovers="$(printf '%s' "$leftovers" | tr ' ' '\n' | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+  if [ "$FORMAT" = rpm ]; then
+    wanted="$RPM_EMPTY_DIR_WART"
+  else
+    wanted=""
+  fi
+  [ "$leftovers" = "$wanted" ] || fail "$phase uninstall leftovers differ: got [$leftovers] want [$wanted]"
+  if [ "$phase" = old ]; then OLD_LEFTOVER_DIRS="$leftovers"; else NEW_LEFTOVER_DIRS="$leftovers"; fi
+}
+
 run_gate_body() {
   OLD_PACKAGE_VERSION="$(package_version "$OLD")" || fail "cannot read old package metadata"
   NEW_PACKAGE_VERSION="$(package_version "$NEW")" || fail "cannot read new package metadata"
@@ -324,6 +405,11 @@ run_gate_body() {
   # 1. Install old.
   install_old || fail "old install failed (see install-old.log)"
   [ -x "$P11SCOPE_BIN" ] || fail "installed old binary missing at $P11SCOPE_BIN"
+  # 1b. The 0.7.1 uninstall wart: name (don't fail on) the leftover empty doc
+  # dirs, then reinstall pristine for the upgrade leg.
+  observe_uninstall_leftovers old
+  install_old || fail "old reinstall failed (see install-old.log)"
+  [ -x "$P11SCOPE_BIN" ] || fail "reinstalled old binary missing at $P11SCOPE_BIN"
   # 2. Old installed version must be 0.7.1.
   OLD_VERSION="$(installed_version)" || fail "cannot run installed old binary"
   [ "$OLD_VERSION" = "0.7.1" ] || fail "old version is '$OLD_VERSION', expected 0.7.1"
@@ -387,6 +473,9 @@ run_gate_body() {
   # 10. Package manager agrees the new version is installed.
   NEW_INSTALLED_PACKAGE_VERSION="$(installed_package_version)" || fail "package manager does not list new p11scope"
   [ "$NEW_INSTALLED_PACKAGE_VERSION" = "$NEW_VERSION" ] || fail "package manager version is '$NEW_INSTALLED_PACKAGE_VERSION', expected '$NEW_VERSION'"
+  # 11. Uninstall the new package and name its leftover empty doc dirs (the
+  # same known wart when the layout matches); leaves the system clean.
+  observe_uninstall_leftovers new
 
   emit_result "pass" "$RESULT"
   echo "GATE5 PASS ($FORMAT): 0.7.1 -> $NEW_VERSION, doctor+capture ok, canaries survived" >&2

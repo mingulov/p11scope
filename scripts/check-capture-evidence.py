@@ -544,17 +544,302 @@ TRACE_TERMINAL_KEYS = {
 # scope: the manifest is the only source, and it is `uncorroborated` because
 # nothing was there to confirm it. Thirteen surfaces, 1056 entries: the
 # acquired 4.0-labelled interface retains its known common 68-entry prefix.
-VERSION_SURFACES = Counter(
-    {
-        ("full", 68): 2,
-        ("full", 92): 2,
-        ("full", 104): 2,
-        ("known_prefix", 68): 2,
-        ("known_prefix", 92): 2,
-        ("known_prefix", 104): 2,
-        ("not_walked", 0): 1,
-    }
+#
+# The thirteen manifest surfaces are DERIVED from the fixture's own interface
+# definitions, not a bare (walk, count) pin. MATRIX_FIXTURE_TABLES and
+# MATRIX_FIXTURE_INTERFACES transcribe the canary build of
+# crates/discover/tests/fixture/version_matrix.c (MATRIX_INTERFACES=1,
+# SINGLE_INTERFACE=0, default 2.40 legacy, unflagged anonymous page-edge
+# name); derive_matrix_manifest_records() applies the producer's own rules
+# (pkcs11_abi::select version selection, discover.rs interface_records
+# classification, corroborates_standard, force_prefix on the corroborated
+# path, provider-scoped read_name). The self-test parses the fixture file
+# and asserts the transcription is exact, so fixture drift fails loudly
+# there. Interface[9] ("Vendor Pretend" over the anchorless tbad) never
+# corroborates: it is asserted absent from surfaces as a negative and
+# counted once in vendor_interfaces instead.
+MATRIX_FIXTURE_PATH = "crates/discover/tests/fixture/version_matrix.c"
+# Fixture table key -> (major, minor, getter anchors, shares legacy words).
+# t240 fills from the same stubs[] array as legacy, so a (2,40) snapshot of
+# either equals the legacy_240 comparison row in corroborates_standard.
+MATRIX_FIXTURE_TABLES = {
+    "legacy": (2, 40, False, True),
+    "t240": (2, 40, False, True),
+    "t30": (3, 0, True, False),
+    "t31": (3, 1, True, False),
+    "t32": (3, 2, True, False),
+    "tfuture": (3, 9, True, False),
+    "tunknown": (4, 0, True, False),
+    "tbad": (3, 2, False, False),
+}
+# The canary build's C_GetInterfaceList rows in fixture order: (name kind,
+# table key or None for a null function list). "boundary_name" is the
+# page-edge name in an anonymous mapping, refused under provider-scoped
+# read_name in the unflagged canary build (so interface[12] corroborates
+# instead of reading exact).
+MATRIX_FIXTURE_INTERFACES = (
+    ("exact", "t240"),  # [0]
+    ("exact", "t30"),  # [1]
+    ("exact", "t31"),  # [2]
+    ("exact", "t32"),  # [3]
+    ("exact", "tfuture"),  # [4]
+    ("exact", "tunknown"),  # [5]
+    ("alternate", "t32"),  # [6]
+    ("null", "t30"),  # [7]
+    ("bad_ptr", "t31"),  # [8]
+    ("deceptive", "tbad"),  # [9] vendor-only, never a surface
+    ("alternate", "legacy"),  # [10]
+    ("exact", None),  # [11] null table
+    ("boundary_name", "t32"),  # [12]
 )
+
+
+def _matrix_select_standard(version):
+    """Mirror of pkcs11_abi::select(StandardInterface): (walk, functions).
+
+    Returns None for a refused layout (unknown 2.x minor, unknown major).
+    """
+    major, minor = version
+    if (major, minor) == (2, 40):
+        return ("full", 68)
+    if major == 2:
+        return None
+    if (major, minor) in ((3, 0), (3, 1)):
+        return ("full", 92)
+    if (major, minor) == (3, 2):
+        return ("full", 104)
+    if major == 3:
+        return ("known_prefix", 104)
+    return None
+
+
+def derive_matrix_manifest_records():
+    """The thirteen typed manifest surface records plus the vendor count.
+
+    Each record is (source, walk, acquisition, functions) with the exact
+    source label the producer renders (plan.rs source_label). Only an
+    exact "PKCS 11" name read inside a provider mapping classifies exact;
+    every other corroborated interface takes corroborated_standard_prefix
+    with force_prefix (Full downgraded to KnownPrefix).
+
+    Runs at import time, before require() is defined, so the transcription
+    sanity checks raise explicitly (-O safe, unlike assert).
+    """
+    records = []
+    # The legacy surface via C_GetFunctionList: Legacy provenance 2.40
+    # selects the exact 68-slot walk.
+    records.append(("legacy_function_list", "full", "ok", 68))
+    vendor = 0
+    for index, (name, table) in enumerate(MATRIX_FIXTURE_INTERFACES):
+        if table is None:
+            if name != "exact":
+                raise AssertionError(
+                    f"matrix interface[{index}]: only the exact row has a null table"
+                )
+            records.append(
+                (f"interface[{index}] exact_standard", "not_walked", "ok", 0)
+            )
+            continue
+        major, minor, anchors, shares_legacy = MATRIX_FIXTURE_TABLES[table]
+        if name == "exact":
+            selected = _matrix_select_standard((major, minor))
+            if selected is None:
+                # A refused layout keeps the known common 68-entry prefix
+                # (inventory_tables fallback).
+                records.append(
+                    (
+                        f"interface[{index}] exact_standard",
+                        "known_prefix",
+                        "ok",
+                        68,
+                    )
+                )
+            else:
+                walk, functions = selected
+                records.append(
+                    (
+                        f"interface[{index}] exact_standard",
+                        walk,
+                        "ok",
+                        functions,
+                    )
+                )
+            continue
+        if (major, minor) == (2, 40):
+            corroborated = shares_legacy
+        elif major == 3:
+            corroborated = anchors
+        else:
+            corroborated = False
+        if not corroborated:
+            vendor += 1
+            continue
+        selected = _matrix_select_standard((major, minor))
+        if selected is None:
+            raise AssertionError(
+                f"matrix interface[{index}]: corroborated layout selects nothing"
+            )
+        walk, functions = selected
+        if walk == "full":
+            walk = "known_prefix"
+        records.append(
+            (
+                f"interface[{index}] corroborated_standard_prefix",
+                walk,
+                "ok",
+                functions,
+            )
+        )
+    if vendor != 1:
+        raise AssertionError(f"matrix fixture vendor rows: {vendor}")
+    if len(records) != 13:
+        raise AssertionError(f"matrix fixture surfaces: {len(records)}")
+    if any("interface[9]" in source for source, _, _, _ in records):
+        raise AssertionError("matrix fixture interface[9] must stay vendor-only")
+    return records, vendor
+
+
+MATRIX_MANIFEST_RECORDS, MATRIX_VENDOR_INTERFACES = derive_matrix_manifest_records()
+VERSION_SURFACES = Counter(
+    (walk, functions) for _, walk, _, functions in MATRIX_MANIFEST_RECORDS
+)
+
+
+def matrix_fixture_path():
+    """The version-matrix fixture beside this checkout (self-test only)."""
+    return Path(__file__).resolve().parents[1] / MATRIX_FIXTURE_PATH
+
+
+def matrix_fixture_transcription_matches_source():
+    """The transcription above is exactly the canary build of the fixture.
+
+    Parses crates/discover/tests/fixture/version_matrix.c strictly: build
+    defaults, fill_table versions/anchors, and the thirteen out[] rows of
+    the multi-interface branch. Any fixture drift fails loudly here so the
+    derived expectation is consciously re-pinned, never silently stale.
+    """
+    text = matrix_fixture_path().read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    def defines(name):
+        matches = re.findall(rf"^#define {name} (-?\d+)$", text, re.M)
+        require(len(matches) == 1, f"matrix fixture {name} default is not unique")
+        return int(matches[0])
+
+    config = {
+        name: defines(name)
+        for name in (
+            "LEGACY_MAJOR",
+            "LEGACY_MINOR",
+            "MATRIX_INTERFACES",
+            "SINGLE_INTERFACE",
+            "SHORT_LEGACY",
+            "MAPPED_LEGACY_WORDS",
+            "SPARSE_LEGACY",
+            "LEGACY_PADDING",
+            "MAPPED_V32_WORDS",
+            "INTERFACE_MAJOR",
+            "INTERFACE_MINOR",
+            "CAPACITY_UNIQUE",
+            "BOUNDARY_PROVIDER_MAP",
+        )
+    }
+    require(
+        config
+        == {
+            "LEGACY_MAJOR": 2,
+            "LEGACY_MINOR": 40,
+            "MATRIX_INTERFACES": 1,
+            "SINGLE_INTERFACE": 0,
+            "SHORT_LEGACY": 0,
+            "MAPPED_LEGACY_WORDS": -1,
+            "SPARSE_LEGACY": -2,
+            "LEGACY_PADDING": 0,
+            "MAPPED_V32_WORDS": -1,
+            "INTERFACE_MAJOR": 3,
+            "INTERFACE_MINOR": 2,
+            "CAPACITY_UNIQUE": 0,
+            "BOUNDARY_PROVIDER_MAP": 0,
+        },
+        f"matrix fixture canary build defaults drifted: {config!r}",
+    )
+    # The corroboration rule needs the three exports present, and the
+    # (2,40) content rule needs every table filled from stubs[].
+    for export in ("C_GetFunctionList", "C_GetInterfaceList", "C_GetInterface"):
+        require(
+            len(re.findall(rf"^CK_RV {export}\(.*\);$", text, re.M)) == 1,
+            f"matrix fixture export declaration drifted: {export}",
+        )
+    require(
+        "table->functions[i] = stubs[i]" in text,
+        "matrix fixture no longer fills tables from stubs[]",
+    )
+
+    def value(token):
+        token = token.strip()
+        if re.fullmatch(r"[A-Z_]+", token):
+            return config[token]
+        return int(token)
+
+    tables = {}
+    for match in re.finditer(
+        r"fill_table\(&(\w+),\s*([^,]+),\s*([^,]+),\s*(\d)\);", text
+    ):
+        key, major, minor, anchors = match.groups()
+        require(key not in tables, f"matrix fixture table filled twice: {key}")
+        tables[key] = (value(major), value(minor), anchors == "1")
+    require(
+        tables
+        == {
+            key: (major, minor, anchors)
+            for key, (major, minor, anchors, _) in MATRIX_FIXTURE_TABLES.items()
+        },
+        f"matrix fixture tables drifted: {tables!r}",
+    )
+    # Only the multi-interface branch publishes the thirteen rows; drop
+    # the single-interface branch textually (it reuses out[0]).
+    single = [index for index, line in enumerate(lines) if "if (SINGLE_INTERFACE)" in line]
+    require(len(single) == 1, "matrix fixture single-interface branch drifted")
+    rest = lines[single[0]:]
+    end = next(
+        offset
+        for offset, line in enumerate(rest)
+        if line.strip() == "} else {"
+    )
+    branch = "\n".join(rest[end + 1:])
+    rows = {}
+    for match in re.finditer(
+        r"out\[(\d+)\] = \(CK_INTERFACE\)\{([^,]+),\s*(.+),\s*0\};", branch
+    ):
+        index, name, table = match.groups()
+        index = int(index)
+        require(index not in rows, f"matrix fixture row published twice: {index}")
+        name = name.strip()
+        table = table.strip()
+        ternary = "MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32"
+        if table == ternary:
+            table = "&t32"
+        rows[index] = (name, table)
+    names = {
+        "exact": "exact",
+        "alternate": "alternate",
+        "deceptive": "deceptive",
+        "0": "null",
+        "(char *)(uintptr_t)1": "bad_ptr",
+        "boundary_name": "boundary_name",
+    }
+    parsed = tuple(
+        (names[name], None if table == "0" else table.removeprefix("&"))
+        for _, (name, table) in sorted(rows.items())
+    )
+    require(
+        sorted(rows) == list(range(13)),
+        f"matrix fixture interface rows drifted: {sorted(rows)!r}",
+    )
+    require(
+        parsed == MATRIX_FIXTURE_INTERFACES,
+        f"matrix fixture interfaces drifted: {parsed!r}",
+    )
 # SCANNED — the canary workload maps the provider *before* attach, so both
 # sources describe it. LP64 scans three complete tables and reports one
 # conflict; ILP32 also scans the 3.1, 3.2 and future-minor 3.9 tables and agrees
@@ -574,13 +859,37 @@ VERSION_SURFACES = Counter(
 # these are bounded recovery observations, not additional manifest demand.
 # `table_entries` counts exact target occurrences across sources, so neither
 # scan subset changes the 1056-entry union.
+#
+# Typed scan-table baselines: (major, minor, walk, functions). These are
+# runtime observations of the compiled fixtures' file-backed page tails, not
+# fixture definitions, so they stay transcribed (with the exact " table M.m"
+# source suffix each observed row carries); the terminal-3.1 extra stays
+# adaptive in version_canary_scan_shape below.
+MATRIX_SCAN_BASELINE_LP64 = (
+    (2, 40, "full", 68),
+    (2, 40, "full", 68),
+    (3, 0, "full", 92),
+)
+MATRIX_SCAN_BASELINE_IA32 = MATRIX_SCAN_BASELINE_LP64 + (
+    (3, 1, "full", 92),
+    (3, 2, "full", 104),
+    (3, 9, "known_prefix", 104),
+)
 VERSION_SURFACES_SCANNED = VERSION_SURFACES + Counter(
-    {("full", 68): 2, ("full", 92): 1}
+    (walk, functions) for _, _, walk, functions in MATRIX_SCAN_BASELINE_LP64
 )
 VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
-    {("full", 92): 1, ("full", 104): 1, ("known_prefix", 104): 1}
+    (walk, functions)
+    for _, _, walk, functions in MATRIX_SCAN_BASELINE_IA32[len(MATRIX_SCAN_BASELINE_LP64):]
 )
-VERSION_SHAPE_MANIFEST_ONLY = (1056, 104, 208, VERSION_SURFACES, 1, "ok")
+VERSION_SHAPE_MANIFEST_ONLY = (
+    1056,
+    104,
+    208,
+    VERSION_SURFACES,
+    MATRIX_VENDOR_INTERFACES,
+    "ok",
+)
 VERSION_SHAPE_SCANNED = (1056, 104, 208, VERSION_SURFACES_SCANNED, 1, "ok")
 VERSION_SHAPE_SCANNED_IA32 = (
     1056,
@@ -3211,6 +3520,10 @@ def version_canary_scan_shape(evidence, target_bits):
     The controlled fixture's file/BSS boundary varies by ABI/linker layout.
     Same-base views require their independent export witnesses; other raw
     tables cannot overlap. Partial LP64 tails must end at the page boundary.
+
+    Returns (surface counter, wanted tables, typed scan records): the typed
+    records are the baseline scan tables plus each validated extra as
+    (major, minor, walk, functions), for the exact typed surface partition.
     """
     require(len(evidence["discovery"]) == 1, "version fixture needs one provider")
     module = evidence["discovery"][0]
@@ -3225,6 +3538,8 @@ def version_canary_scan_shape(evidence, target_bits):
                    else VERSION_TABLES_SCANNED)
     base_surfaces = (VERSION_SURFACES_SCANNED_IA32 if target_bits == 32
                      else VERSION_SURFACES_SCANNED)
+    scan_records = list(MATRIX_SCAN_BASELINE_IA32 if target_bits == 32
+                        else MATRIX_SCAN_BASELINE_LP64)
     actual = table_signature(evidence)
     require(not base_tables - actual, "version fixture lost a required table")
     extra = actual - base_tables
@@ -3271,7 +3586,7 @@ def version_canary_scan_shape(evidence, target_bits):
     require(all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:])),
             "duplicate or overlapping raw fixture tables")
     if not extra:
-        return base_surfaces, base_tables
+        return base_surfaces, base_tables, scan_records
 
     added_surfaces = Counter()
     for prefix in raw:
@@ -3297,7 +3612,8 @@ def version_canary_scan_shape(evidence, target_bits):
                     for surface in evidence["surfaces"]) == 1,
                 "recovered fixture prefix lacks its exact source surface")
         added_surfaces[walk, count] += 1
-    return base_surfaces + added_surfaces, base_tables + extra
+        scan_records.append((version[0], version[1], walk, count))
+    return base_surfaces + added_surfaces, base_tables + extra, scan_records
 
 
 def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interface_list):
@@ -3312,6 +3628,70 @@ def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interf
             require(u64(evidence[name]), f"{name}: invalid count {evidence[name]!r}")
         require(evidence[name] == wanted, f"{name}: want {wanted!r}, got {evidence[name]!r}")
     require(surface_signature(evidence) == surfaces, f"unexpected surfaces: {evidence['surfaces']}")
+
+
+def exact_canary_surface_records(evidence, manifest_records, scan_records):
+    """Exact typed partition of the canary evidence surfaces.
+
+    manifest_records are the thirteen derived (source, walk, acquisition,
+    functions) rows matched by full label; scan_records are the expected
+    scan tables as (major, minor, walk, functions) matched by the exact
+    " table M.m" source suffix the producer renders. Every evidence row
+    must be consumed exactly once: a mislabeled row, a duplicate, a
+    scan-interface row, or any leftover fails. The deceptive interface[9]
+    has no manifest record, so any interface[9] row fails as unaccounted.
+    """
+    for surface in evidence["surfaces"]:
+        require(
+            set(surface) == {"source", "walk", "acquisition", "functions"},
+            f"canary surface is not a typed record: {surface!r}",
+        )
+        require(
+            type(surface["source"]) is str
+            and type(surface["walk"]) is str
+            and type(surface["acquisition"]) is str
+            and type(surface["functions"]) is int,
+            f"canary surface has untyped fields: {surface!r}",
+        )
+    remaining = list(evidence["surfaces"])
+
+    def take(predicate, what):
+        # Multiset consume-one: duplicate expected records (the two
+        # scanned 2.40 tables) each consume one matching row; a missing
+        # row fails here, an extra row fails as leftover below.
+        matches = [surface for surface in remaining if predicate(surface)]
+        require(matches, f"canary {what} is missing: {evidence['surfaces']!r}")
+        remaining.remove(matches[0])
+
+    for source, walk, acquisition, functions in manifest_records:
+        take(
+            lambda surface, source=source, walk=walk,
+            acquisition=acquisition, functions=functions: (
+                surface["source"] == source
+                and surface["walk"] == walk
+                and surface["acquisition"] == acquisition
+                and surface["functions"] == functions
+            ),
+            f"manifest surface {source}",
+        )
+    for major, minor, walk, functions in scan_records:
+        take(
+            lambda surface, major=major, minor=minor, walk=walk,
+            functions=functions: (
+                surface["source"].endswith(f" table {major}.{minor}")
+                and surface["walk"] == walk
+                and surface["acquisition"] == "ok"
+                and surface["functions"] == functions
+            ),
+            f"scan table {major}.{minor}",
+        )
+    # The deceptive interface[9] has no manifest record, so any
+    # interface[9] row lands here as unaccounted: the exclusion is the
+    # partition itself, with derive_matrix_manifest_records asserting at
+    # import that no record carries it. Defense in depth: the count
+    # backstop (exact_shape) runs before this check, so any row left
+    # over here already failed there as a Counter mismatch.
+    require(not remaining, f"canary has unaccounted surfaces: {remaining!r}")
 
 
 def entry_skips(evidence):
@@ -4547,10 +4927,16 @@ def validate_canary(lane, document, target_bits=64):
 
     scanned = discovery == "scanned"
     if scanned:
-        surfaces, wanted_tables = version_canary_scan_shape(evidence, target_bits)
-        exact_shape(evidence, 1056, 104, 208, surfaces, 1, "ok")
+        surfaces, wanted_tables, scan_records = version_canary_scan_shape(
+            evidence, target_bits
+        )
+        exact_shape(
+            evidence, 1056, 104, 208, surfaces, MATRIX_VENDOR_INTERFACES, "ok"
+        )
+        exact_canary_surface_records(evidence, MATRIX_MANIFEST_RECORDS, scan_records)
     else:
         exact_shape(evidence, *VERSION_SHAPE_MANIFEST_ONLY)
+        exact_canary_surface_records(evidence, MATRIX_MANIFEST_RECORDS, [])
         wanted_tables = VERSION_TABLES_MANIFEST_ONLY
     require(
         table_signature(evidence) == wanted_tables,
@@ -5003,6 +5389,30 @@ def version_tables_fixture(counter):
     for index, table in enumerate(table for table in tables if table["source"] == "scan"):
         table["file_offset"] = 4096 * (index + 1)
     return tables
+
+
+def canary_surface_dicts(module_path, scan_records):
+    """Typed canary surface dicts for fixtures: the thirteen derived
+    manifest records plus one "<module> table M.m" dict per scan record."""
+    dicts = [
+        {
+            "source": source,
+            "walk": walk,
+            "acquisition": acquisition,
+            "functions": functions,
+        }
+        for source, walk, acquisition, functions in MATRIX_MANIFEST_RECORDS
+    ]
+    dicts.extend(
+        {
+            "source": f"{module_path} table {major}.{minor}",
+            "walk": walk,
+            "acquisition": "ok",
+            "functions": functions,
+        }
+        for major, minor, walk, functions in scan_records
+    )
+    return dicts
 
 
 def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
@@ -6534,12 +6944,20 @@ def self_test():
     print("proxy prefix follows the effective host-sized ceiling: OK")
     print("proxy capacity fallback accepts only its exact evidence shape: OK")
 
+    # The derived manifest expectation is exactly the fixture's canary
+    # build; any drift fails here, before the fixtures below consume it.
+    matrix_fixture_transcription_matches_source()
+    print("matrix fixture transcription matches the canary build: OK")
+
     version = evidence_fixture(
         VERSION_SURFACES_SCANNED,
         sources=("scan", "manifest"),
         discovery_skipped=0,
     )
     version["discovery"][0]["tables"] = version_tables_fixture(VERSION_TABLES_SCANNED)
+    version["surfaces"] = canary_surface_dicts(
+        version["discovery"][0]["path"], MATRIX_SCAN_BASELINE_LP64
+    )
     version.update(
         table_entries=1056,
         slots=104,
@@ -6558,20 +6976,8 @@ def self_test():
     validate_canary("default-safe-profile", safe)
 
     safe32 = copy.deepcopy(safe)
-    safe32["evidence"]["surfaces"].extend(
-        [
-            {
-                "walk": walk,
-                "functions": functions,
-                "acquisition": "ok",
-                "source": f"/opt/p11.so table {major}.{minor}",
-            }
-            for major, minor, functions, walk in (
-                (3, 1, 92, "full"),
-                (3, 2, 104, "full"),
-                (3, 9, 104, "known_prefix"),
-            )
-        ]
+    safe32["evidence"]["surfaces"] = canary_surface_dicts(
+        safe32["evidence"]["discovery"][0]["path"], MATRIX_SCAN_BASELINE_IA32
     )
     safe32["evidence"]["discovery"][0]["tables"] = version_tables_fixture(
         VERSION_TABLES_SCANNED_IA32)
@@ -6582,9 +6988,9 @@ def self_test():
     safe32["evidence"]["discovery_conflicts"] = 0
     require(
         surface_signature(safe32["evidence"]) == Counter({
-            ("full", 68): 4, ("full", 92): 4, ("full", 104): 3,
+            ("full", 68): 4, ("full", 92): 4, ("full", 104): 2,
             ("known_prefix", 68): 2, ("known_prefix", 92): 2,
-            ("known_prefix", 104): 3, ("not_walked", 0): 1,
+            ("known_prefix", 104): 4, ("not_walked", 0): 1,
         }),
         "the IA32 matrix has exactly nineteen independently specified surfaces",
     )
@@ -7253,6 +7659,9 @@ def self_test():
     freeze_evidence = evidence_fixture(VERSION_SURFACES, sources=("manifest",))
     freeze_evidence["discovery"][0]["tables"] = version_tables_fixture(
         VERSION_TABLES_MANIFEST_ONLY)
+    freeze_evidence["surfaces"] = canary_surface_dicts(
+        freeze_evidence["discovery"][0]["path"], []
+    )
     freeze_evidence.update(
         table_entries=1056,
         slots=104,
@@ -7267,6 +7676,129 @@ def self_test():
     rejected(lambda: validate_canary("feature-unsafe-profile", freeze))
     rejected(lambda: validate_canary("freeze-unsafe-profile", safe))
     print("canary freeze lane is manifest-only 1056/104/208 with 13 surfaces: OK")
+    # The derived manifest content, pinned directly: interface[12]'s
+    # anonymous page-edge name is refused under provider-scoped read_name,
+    # so it corroborates (known_prefix, 104) instead of reading exact.
+    require(
+        VERSION_SURFACES
+        == Counter(
+            {
+                ("full", 68): 2,
+                ("full", 92): 2,
+                ("full", 104): 1,
+                ("known_prefix", 68): 2,
+                ("known_prefix", 92): 2,
+                ("known_prefix", 104): 3,
+                ("not_walked", 0): 1,
+            }
+        ),
+        "the derived matrix manifest content drifted",
+    )
+    require(MATRIX_VENDOR_INTERFACES == 1, "the matrix vendor count drifted")
+    require(
+        [source for source, _, _, _ in MATRIX_MANIFEST_RECORDS].count(
+            "legacy_function_list"
+        )
+        == 1
+        and all(
+            f"interface[{index}]" not in source
+            for source, _, _, _ in MATRIX_MANIFEST_RECORDS
+            for index in (9,)
+        ),
+        "the derived matrix records lost their shape",
+    )
+    for probed, wanted in (
+        ((2, 40), ("full", 68)),
+        ((2, 41), None),
+        ((3, 0), ("full", 92)),
+        ((3, 1), ("full", 92)),
+        ((3, 2), ("full", 104)),
+        ((3, 9), ("known_prefix", 104)),
+        ((4, 0), None),
+    ):
+        require(
+            _matrix_select_standard(probed) == wanted,
+            f"the select mirror drifted at {probed}",
+        )
+    print("canary matrix derivation pins its thirteen rows and vendor: OK")
+
+    def surface_by_source(document, source):
+        rows = [
+            row
+            for row in document["evidence"]["surfaces"]
+            if row["source"] == source
+        ]
+        require(len(rows) == 1, f"fixture lost its {source} row")
+        return rows[0]
+
+    # Counter-neutral mutations: the (walk, functions) multiset is
+    # unchanged, so the count backstop passes and only the exact typed
+    # partition rejects. Each proves the typed check adds power.
+    neutral_mutations = []
+    neutral_mutations.append("swap corroborated [6]/[7] sources")
+    neutral_mutations.append("swap exact [0]/[1] sources")
+    neutral_mutations.append("relabel corroborated [12] as exact")
+    neutral_mutations.append("surface the deceptive interface[9]")
+    neutral_mutations.append("relabel a scan table suffix version")
+    for label in neutral_mutations:
+        bad = copy.deepcopy(safe)
+        surfaces = bad["evidence"]["surfaces"]
+        if label.startswith("swap"):
+            first, second = (
+                ("interface[6] corroborated_standard_prefix",
+                 "interface[7] corroborated_standard_prefix")
+                if "[6]" in label
+                else ("interface[0] exact_standard", "interface[1] exact_standard")
+            )
+            left = surface_by_source(bad, first)
+            right = surface_by_source(bad, second)
+            left["source"], right["source"] = right["source"], left["source"]
+        elif label.startswith("relabel corroborated"):
+            surface_by_source(
+                bad, "interface[12] corroborated_standard_prefix"
+            )["source"] = "interface[12] exact_standard"
+        elif label.startswith("surface the deceptive"):
+            surface_by_source(
+                bad, "interface[10] corroborated_standard_prefix"
+            )["source"] = "interface[9] corroborated_standard_prefix"
+        else:
+            row = next(
+                row
+                for row in surfaces
+                if row["source"].endswith(" table 2.40")
+            )
+            row["source"] = row["source"].removesuffix("2.40") + "2.41"
+        require(
+            surface_signature(bad["evidence"])
+            == surface_signature(safe["evidence"]),
+            f"typed-check mutation is not counter-neutral: {label}",
+        )
+        settle_fixture_verdict(bad)
+        try:
+            validate_canary("default-safe-profile", bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"typed check missed: {label}")
+    print("canary typed partition rejects counter-neutral mislabels: OK")
+    for mutate in (
+        lambda d: surface_by_source(
+            d, "interface[0] exact_standard"
+        ).update(extra_key=1),
+        lambda d: surface_by_source(
+            d, "interface[0] exact_standard"
+        ).update(functions=68.0),
+        lambda d: d["evidence"].update(vendor_interfaces=0),
+        lambda d: d["evidence"].update(vendor_interfaces=2),
+        lambda d: surface_by_source(
+            d, "interface[3] exact_standard"
+        ).update(acquisition="absent"),
+    ):
+        bad = copy.deepcopy(safe)
+        mutate(bad)
+        settle_fixture_verdict(bad)
+        rejected(lambda bad=bad: validate_canary("default-safe-profile", bad))
+    print("canary typed records and vendor count are strict: OK")
     bad = copy.deepcopy(safe)
     bad["evidence"]["unregistered_mechanisms"] = 3
     rejected(lambda: validate_canary("default-safe-profile", bad))

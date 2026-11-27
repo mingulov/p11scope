@@ -35,6 +35,9 @@ _LIB = _CI + _COUNTER + _WRAP
 _PUBLIC = ("scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py", "scripts/system-scope-measure.py",
            "scripts/qualify_records.py", "scripts/release-matrix-contract.py", _PIN,
            "scripts/inventory-mt-oracle.py", "scripts/system-cell-census.py", "scripts/inventory-mt-gate.py",
+           # Read by check-capture-evidence.py's self-test, which parses the
+           # version-matrix fixture to pin the derived canary expectation.
+           "crates/discover/tests/fixture/version_matrix.c",
            "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
            "tests/fixtures/public-cli/prearm-first-use.c", "tests/fixtures/public-cli/cgroup-fork.c",
            "tests/fixtures/public-cli/chain-parent.c", "tests/fixtures/public-cli/mt_mixed.c",

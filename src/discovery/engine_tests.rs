@@ -8050,11 +8050,12 @@ int main(void) {
         .status()
         .expect("gcc must be installed");
     assert!(status.success(), "fixture must compile");
-    let mut child = std::process::Command::new(&executable)
-        .die_with_parent()
-        .spawn()
-        .expect("spawn zombie-leader fixture");
-    let pid = child.id();
+    // Custody before readiness: the guard owns the zombie-leader
+    // across the stat/shape asserts below (a panic used to strand the
+    // unreaped zombie until the manual tail).
+    let child =
+        ParkedSleep::spawn_unparked(std::process::Command::new(&executable).die_with_parent());
+    let pid = child.pid();
     wait_until_zombie(pid);
     // Guard the shape: Z with live threads, or this test proves nothing.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("live stat");
@@ -8083,8 +8084,6 @@ int main(void) {
         marked || admitted,
         "real zombie leader with a live worker must still be processed (mark/admit)"
     );
-    child.kill().ok();
-    child.wait().ok();
 }
 
 /// The admitted-pid count map mirrors `admitted_cgroup_views` exactly
@@ -11021,17 +11020,22 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         what: &str,
         holder: &std::path::Path,
         provider: &std::path::Path,
-    ) -> std::process::Child {
-        let mut child = std::process::Command::new(holder)
-            .arg(provider)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn holder");
+    ) -> ExitMappingChildGuard {
+        // Custody before readiness: the guard owns the holder across
+        // the readiness handshake below (a panic used to strand it
+        // before the caller could wrap the returned child).
+        let mut guard = ExitMappingChildGuard(
+            std::process::Command::new(holder)
+                .arg(provider)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn holder"),
+        );
         {
             use std::io::BufRead as _;
             let mut ready = String::new();
-            std::io::BufReader::new(child.stdout.take().expect("holder stdout"))
+            std::io::BufReader::new(guard.0.stdout.take().expect("holder stdout"))
                 .read_line(&mut ready)
                 .expect("holder readiness");
             assert!(
@@ -11039,7 +11043,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
                 "{what}: holder must map first"
             );
         }
-        child
+        guard
     }
 
     fn run_capture(
@@ -11122,8 +11126,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             cgroup.members(what).contains(&this),
             "{what}: the test must spawn from inside the cgroup"
         );
-        let mut holder_child =
-            ExitMappingChildGuard(spawn_holder(what, &fixtures.holder, &fixtures.provider));
+        let mut holder_child = spawn_holder(what, &fixtures.holder, &fixtures.provider);
         move_out.move_out(what);
         assert_moved_out(&cgroup, this, what);
         // Settle: tick the production cadence until a slot carries
@@ -14157,7 +14160,9 @@ struct StoppedShell(std::process::Child);
 
 impl StoppedShell {
     fn spawn() -> Self {
-        let mut child = Self(
+        // `StoppedShell` spelled out (not `Self`) so the custody gate
+        // sees the guard marker textually.
+        let mut child = StoppedShell(
             std::process::Command::new("/bin/sh")
                 .args(["-c", "printf R; kill -STOP $$"])
                 .stdout(std::process::Stdio::piped())
@@ -20864,21 +20869,22 @@ fn seed_handshake_reports_a_peer_that_cannot_report() {
     let runner = fixture._dir.path().join("seed-runner");
     let library = fixture._dir.path().join("seed-provider.so");
     let ready = fixture._dir.path().join("no-such-dir").join("peer.ready");
-    let mut child = std::process::Command::new(&runner)
-        .arg(&library)
-        .arg(&ready)
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    // Custody before readiness: the seed runner blocks until killed,
+    // so the guard owns it across the loud wait and the assert below
+    // (an assert panic used to strand it until the manual tail).
+    let mut child = ParkedSleep::spawn_unparked(
+        std::process::Command::new(&runner)
+            .arg(&library)
+            .arg(&ready),
+    );
     let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_loaded_seed_peer(&mut child, &runner, &library, &ready, |_| {});
+        wait_loaded_seed_peer(child.inner_mut(), &runner, &library, &ready, |_| {});
     }));
     assert!(
         loud.is_err(),
         "an unreported peer must fail the wait loudly"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
 }
 
 fn loaded_seed_provider() -> (
@@ -58939,19 +58945,21 @@ impl LazyLoader {
                 .unwrap()
                 .success()
         );
-        let mut child = std::process::Command::new(&binary)
-            .arg(provider)
-            .env_clear()
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        // Custody before readiness: the transient guard owns the child
+        // across the pipe takes; into_inner hands exactly one owner to
+        // the loader (whose Drop kills and reaps).
+        let mut guard = ParkedSleep::spawn_unparked(
+            std::process::Command::new(&binary)
+                .arg(provider)
+                .env_clear()
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped()),
+        );
+        let stdin = guard.inner_mut().stdin.take().unwrap();
+        let stderr = guard.inner_mut().stderr.take().unwrap();
         let mut loader = Self {
-            child,
+            child: guard.into_inner(),
             stdin,
             stderr,
         };
@@ -62806,15 +62814,15 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = fixture();
         let mut children = Children(Vec::new());
         for id in 1..=2 {
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
+            // Custody before readiness: the transient guard owns the
+            // child across the fallible open; into_inner hands exactly
+            // one owner to the fixture table.
+            let guard =
+                ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
                 .views
-                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
-            children.0.push(child);
+                .push(ProcessView::open(ProcessViewId(id), guard.pid()).unwrap());
+            children.0.push(guard.into_inner());
         }
         io.expire_on_sample.set(Some(1));
         assert!(service(&mut engine, &mut io).is_empty());
@@ -62985,12 +62993,13 @@ pub(crate) mod detailed_proof_driver {
     #[test]
     fn detailed_proof_baseline_request_rechecks_capacity_before_health() {
         let (mut engine, mut io) = fixture();
-        let child = std::process::Command::new("/bin/sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let children = Children(vec![child]);
+        // Custody before readiness: the transient guard owns the child
+        // from the spawn statement, so no fallible step can precede an
+        // owner; into_inner hands exactly one owner to the table.
+        let children = Children(vec![
+            ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"))
+                .into_inner(),
+        ]);
         let view = ProcessView::open(ProcessViewId(1), children.0[0].id()).unwrap();
         engine.views.insert(0, view);
         io.proof = ProofSession::test_scope(&Scope::Pid(std::process::id()), true);
@@ -63195,15 +63204,15 @@ pub(crate) mod detailed_proof_driver {
         assert!(!engine.frame_deferred);
     }
     fn add_child_view(engine: &mut Engine, id: u32) -> Children {
-        let child = std::process::Command::new("/bin/sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
+        // Custody before readiness: the transient guard owns the child
+        // across the fallible open; into_inner hands exactly one owner
+        // to the returned table.
+        let guard =
+            ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
         engine
             .views
-            .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
-        Children(vec![child])
+            .push(ProcessView::open(ProcessViewId(id), guard.pid()).unwrap());
+        Children(vec![guard.into_inner()])
     }
     #[test]
     fn detailed_proof_fix_persistent_partial_sample_serves_other_view_and_phases() {
@@ -63700,15 +63709,15 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = cgroup_fixture();
         let mut children = Children(Vec::new());
         for id in 1..=9 {
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
+            // Custody before readiness: the transient guard owns the
+            // child across the fallible open; into_inner hands exactly
+            // one owner to the fixture table.
+            let guard =
+                ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
                 .views
-                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
-            children.0.push(child);
+                .push(ProcessView::open(ProcessViewId(id), guard.pid()).unwrap());
+            children.0.push(guard.into_inner());
         }
         for _ in 0..3 {
             service(&mut engine, &mut io);
@@ -64203,15 +64212,15 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = cgroup_fixture();
         let mut children = Children(Vec::new());
         for id in 1..=9 {
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap();
+            // Custody before readiness: the transient guard owns the
+            // child across the fallible open; into_inner hands exactly
+            // one owner to the fixture table.
+            let guard =
+                ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
                 .views
-                .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
-            children.0.push(child);
+                .push(ProcessView::open(ProcessViewId(id), guard.pid()).unwrap());
+            children.0.push(guard.into_inner());
         }
         assert!(service(&mut engine, &mut io).is_empty());
         assert_eq!(
@@ -87626,26 +87635,32 @@ fn opus_sleeper_probe_takes_the_first_installed_busybox() {
 fn opus_static_sleeper_fallback_builds_and_sleeps() {
     let dir = tempfile::tempdir().expect("a sleeper build directory");
     let sleeper = opus_build_static_sleeper(dir.path());
-    let mut child = std::process::Command::new(&sleeper)
-        .arg("600")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the fallback sleeper spawns");
+    // Custody before readiness: the static sleeper is a 600 s child;
+    // the guard owns it across the asserts below (a panic used to
+    // strand it until the manual tail).
+    let mut child = ParkedSleep::spawn_unparked(
+        std::process::Command::new(&sleeper)
+            .arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     std::thread::sleep(std::time::Duration::from_secs(1));
     assert!(
-        child.try_wait().expect("poll the sleeper").is_none(),
+        child
+            .inner_mut()
+            .try_wait()
+            .expect("poll the sleeper")
+            .is_none(),
         "the sleeper is still asleep after a second"
     );
-    let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("the sleeper exe");
+    let exe = std::fs::read_link(format!("/proc/{}/exe", child.pid())).expect("the sleeper exe");
     assert_eq!(
         std::fs::canonicalize(&exe).expect("canonical exe"),
         std::fs::canonicalize(&sleeper).expect("canonical sleeper"),
         "the sleeper execed the fallback binary"
     );
-    child.kill().expect("reap the sleeper");
-    let _ = child.wait();
+    child.close();
 }
 
 /// Opus Probe B4: 200 static (ungrouped) sleeps over a 40-view cap, so a
@@ -99119,22 +99134,133 @@ fn custody_lexer_skips_comments_literals_and_raw_strings() {
     assert!(custody_code_keep_strings("Command::new(\"sh\")").contains("\"sh\""));
 }
 
-/// The whole statement holding the spawn at `lines[idx]`: up to 25
-/// lines down to the `;` terminator, up to 15 lines up while brackets
-/// stay open (a `;` at depth zero is a previous statement, excluded).
-/// Markers outside this window cannot bless the spawn; markers inside
-/// it are inline custody by construction.
+#[test]
+fn custody_program_analysis_classifies_by_meaning() {
+    use CustodyProgram::{EnvFamily, Family, Other, Unresolved};
+    // Basename spellings.
+    assert_eq!(
+        custody_program("Command::new(\"sleep\")", ""),
+        (Family("sleep".to_string()), "sleep".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"/bin/sleep\")", ""),
+        (Family("/bin/sleep".to_string()), "/bin/sleep".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"/usr/bin/sh\")", ""),
+        (Family("/usr/bin/sh".to_string()), "/usr/bin/sh".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"bash\")", ""),
+        (Family("bash".to_string()), "bash".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"dash\")", ""),
+        (Family("dash".to_string()), "dash".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"gcc\")", ""),
+        (Other, String::new())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"/nonexistent-sleeper-xyz\")", ""),
+        (Other, String::new())
+    );
+    // A `Command::new` inside a string is not a program.
+    assert_eq!(
+        custody_program("assert!(x.contains(\"Command::new(\\\"sleep\\\")\"))", ""),
+        (Other, String::new())
+    );
+    // Split form: the argument lives on the next line.
+    assert_eq!(
+        custody_program("Command::new(\n\"sh\"\n)", ""),
+        (Family("sh".to_string()), "sh".to_string())
+    );
+    // Variables flag; consts resolve.
+    assert_eq!(
+        custody_program("Command::new(&sleeper)", ""),
+        (Unresolved("sleeper".to_string()), "sleeper".to_string())
+    );
+    assert_eq!(
+        custody_program(
+            "Command::new(SLEEP_BIN)",
+            "const SLEEP_BIN: &str = \"/bin/sleep\";"
+        ),
+        (Family("/bin/sleep".to_string()), "/bin/sleep".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(TOOL)", "const TOOL: &str = \"gcc\";",),
+        (Other, String::new())
+    );
+    assert_eq!(
+        custody_program("Command::new(self.dir.path().join(\"x\"))", ""),
+        (
+            Unresolved("self.dir.path().join(\"x\")".to_string()),
+            "self.dir.path().join(\"x\")".to_string()
+        )
+    );
+    // `env` resolves its first program argument.
+    assert_eq!(
+        custody_program("Command::new(\"env\").arg(\"sleep\").arg(\"600\")", ""),
+        (EnvFamily("sleep".to_string()), "sleep".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"env\").args([\"-u\", \"FOO\", \"sh\"])", ""),
+        (EnvFamily("sh".to_string()), "sh".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"env\").arg(&prog)", ""),
+        (Unresolved("env (env)".to_string()), "env (env)".to_string())
+    );
+    assert_eq!(
+        custody_program("Command::new(\"env\").arg(\"gcc\")", ""),
+        (Other, String::new())
+    );
+    // `.env()` pairs are not argv.
+    assert_eq!(
+        custody_program(
+            "Command::new(\"env\").env(\"FOO\", \"bar\").arg(\"sleep\")",
+            ""
+        ),
+        (EnvFamily("sleep".to_string()), "sleep".to_string())
+    );
+    // Process spawn vs fixture spawn vs inline wait.
+    assert!(custody_has_process_spawn("command.spawn().unwrap()"));
+    assert!(custody_has_process_spawn(".spawn ()"));
+    assert!(!custody_has_process_spawn("harness.source().spawn(pid, 1)"));
+    assert!(!custody_has_process_spawn("scope.spawn(|| work())"));
+    assert!(!custody_has_process_spawn("x.contains(\".spawn(\")"));
+    assert!(custody_has_inline_wait("cmd.status().unwrap()"));
+    assert!(custody_has_inline_wait("cmd.output().unwrap()"));
+    assert!(!custody_has_inline_wait("cmd.spawn().unwrap()"));
+}
+
+/// The whole statement holding the spawn at `lines[idx]`: down to
+/// the `;` terminator (or a closing-`}` line, excluded: crossing it
+/// would swallow a sibling branch's `Command::new`), up until a
+/// `;`-terminated line, a `}`-starting line, or an item boundary.
+/// Every boundary stops unconditionally: a `;` above can only start
+/// a sibling statement (`;` never appears inside call parens outside
+/// blocks, and a closure-body `let` fails loudly by design), and
+/// crossing one blessings from a neighbor (a sibling `.status()`
+/// once faked an inline wait — silent false-pass). Mid-chain closers
+/// (`])` closing an `.args` array) never stop the walk. Markers
+/// outside this window cannot bless the spawn; markers inside it are
+/// inline custody by construction.
 fn custody_statement(lines: &[&str], idx: usize) -> String {
     let mut end = idx;
-    while end + 1 < lines.len() && end - idx < 25 {
-        if custody_code_text(lines[end]).trim_end().ends_with(';') {
+    while end + 1 < lines.len() && end - idx < 40 {
+        let here = custody_code_text(lines[end]);
+        if here.trim_end().ends_with(';') {
+            break;
+        }
+        if here.trim_start().starts_with('}') {
             break;
         }
         end += 1;
     }
     let mut start = idx;
-    let mut depth: i32 = 0;
-    while start > 0 && idx - start < 15 {
+    while start > 0 && idx - start < 30 {
         let prev = custody_code_text(lines[start - 1]);
         let trimmed = prev.trim();
         if trimmed.starts_with("fn ")
@@ -99148,53 +99274,494 @@ fn custody_statement(lines: &[&str], idx: usize) -> String {
             || trimmed.starts_with("pub(")
             || trimmed.starts_with("const ")
             || trimmed.starts_with("static ")
+            || trimmed.starts_with('}')
+            || trimmed.ends_with(';')
         {
-            break;
-        }
-        let opens = prev
-            .chars()
-            .filter(|c| *c == '(' || *c == '[' || *c == '{')
-            .count() as i32;
-        let closes = prev
-            .chars()
-            .filter(|c| *c == ')' || *c == ']' || *c == '}')
-            .count() as i32;
-        depth += closes - opens;
-        // A `;` at depth zero-or-less is a sibling statement (or the
-        // start of one): stopping here can only miss a marker above
-        // (loud false-bare), never bless from a neighbor (silent
-        // false-pass). A `;` inside our own statement (a closure-body
-        // `let`) therefore fails loudly by design.
-        if depth > 0 || (depth <= 0 && trimmed.ends_with(';')) {
             break;
         }
         start -= 1;
     }
-    lines[start..=end].join("\n")
+    lines[start..=end.min(lines.len() - 1)].join("\n")
 }
 
-/// Mechanical custody audit (fix8 ruling): every long-lived
-/// sleep/`sh` spawn in the lane-touched test files is constructed
-/// inside a `Drop`-verified guard — its whole statement names a
-/// custody marker — or is on the explicit exemption list with a
-/// checkable reason. A bare spawn fails here naming file:line.
-/// Wrap it, or exempt it; there is no third state.
+/// A `Command::new` program, classified by meaning (fix9): string
+/// spellings normalize through basename, `env` resolves its first
+/// program argument, and anything non-literal resolves through
+/// same-file `const`s or is flagged as unresolvable.
+#[derive(Debug, PartialEq, Eq)]
+enum CustodyProgram {
+    /// Basename is sleep/sh/bash/dash (any spelling).
+    Family(String),
+    /// `env` whose first program argument is in the family.
+    EnvFamily(String),
+    /// Variable/call/path no `const` pins down: flagged, must be
+    /// guarded or carry an exemption row with a reason.
+    Unresolved(String),
+    /// Anything else (gcc, true, provider binaries, consts that
+    /// resolve elsewhere).
+    Other,
+}
+
+/// Basename (after the last `/`, first whitespace token) when it is
+/// one of sleep/sh/bash/dash.
+fn custody_family_name(value: &str) -> Option<&str> {
+    let base = value.rsplit('/').next().unwrap_or(value);
+    let word = base.split_whitespace().next().unwrap_or(base);
+    match word {
+        "sleep" | "sh" | "bash" | "dash" => Some(word),
+        _ => None,
+    }
+}
+
+/// One `Command::new` argument: a string literal (decoded) or the raw
+/// expression text. The literal carries the char offset just past it
+/// (for `env` argument scanning).
+enum CustodyNewArg {
+    Literal(String, usize),
+    Expr(String),
+}
+
+/// Every `Command::new` program argument in `stmt`, found outside
+/// strings and comments. Handles `::<>` turbofish and multi-line
+/// split forms.
+fn custody_new_args(stmt: &str) -> Vec<CustodyNewArg> {
+    let chars: Vec<char> = stmt.chars().collect();
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        if let Some(end) = custody_trivia_end(&chars, idx) {
+            idx = end;
+            continue;
+        }
+        if !custody_at_new(&chars, idx) {
+            idx += 1;
+            continue;
+        }
+        idx += "Command::new".len();
+        // Optional turbofish `::<...>`.
+        if idx + 1 < chars.len() && chars[idx] == ':' && chars[idx + 1] == ':' {
+            let mut depth = 0;
+            while idx < chars.len() {
+                if chars[idx] == '<' {
+                    depth += 1;
+                } else if chars[idx] == '>' {
+                    depth -= 1;
+                    if depth == 0 {
+                        idx += 1;
+                        break;
+                    }
+                }
+                idx += 1;
+            }
+        }
+        let paren_start = idx;
+        while idx < chars.len() && chars[idx] != '(' && idx - paren_start < 60 {
+            idx += 1;
+        }
+        if idx >= chars.len() || chars[idx] != '(' {
+            continue;
+        }
+        idx += 1;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx < chars.len() && chars[idx] == '"' {
+            let (lit, end) = custody_parse_literal(&chars, idx);
+            out.push(CustodyNewArg::Literal(lit, end));
+            idx = end;
+        } else {
+            let start = idx;
+            let mut depth = 0;
+            while idx < chars.len() {
+                match chars[idx] {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' if depth == 0 => break,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => break,
+                    '"' => {
+                        let (_, end) = custody_parse_literal(&chars, idx);
+                        idx = end;
+                        continue;
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            out.push(CustodyNewArg::Expr(
+                chars[start..idx]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string(),
+            ));
+        }
+    }
+    out
+}
+
+/// True when `chars[idx..]` starts a `Command::new` outside an
+/// identifier (callers only invoke this outside strings/comments).
+/// Offset just past a string/comment/raw/char literal opening at
+/// `idx`, or `None` when `chars[idx]` opens nothing skippable. Shared
+/// by the `Command::new` and `env`-argument scanners so quoted text
+/// never yields phantom programs.
+fn custody_trivia_end(chars: &[char], idx: usize) -> Option<usize> {
+    let char = chars[idx];
+    if char == '"' {
+        return Some(custody_parse_literal(chars, idx).1);
+    }
+    if char == '/' && idx + 1 < chars.len() && chars[idx + 1] == '/' {
+        let mut end = idx;
+        while end < chars.len() && chars[end] != '\n' {
+            end += 1;
+        }
+        return Some(end);
+    }
+    if char == '/' && idx + 1 < chars.len() && chars[idx + 1] == '*' {
+        let mut depth = 1;
+        let mut end = idx + 2;
+        while end < chars.len() && depth > 0 {
+            if chars[end] == '/' && end + 1 < chars.len() && chars[end + 1] == '*' {
+                depth += 1;
+                end += 1;
+            } else if chars[end] == '*' && end + 1 < chars.len() && chars[end + 1] == '/' {
+                depth -= 1;
+                end += 1;
+            }
+            end += 1;
+        }
+        return Some(end);
+    }
+    if char == '\'' && custody_is_char_literal(chars, idx) {
+        let mut end = idx + 1;
+        if chars[end] == '\\' {
+            end += 1;
+        }
+        return Some(end + 2);
+    }
+    if char == 'r'
+        && (idx == 0 || (!chars[idx - 1].is_alphanumeric() && chars[idx - 1] != '_'))
+        && idx + 1 < chars.len()
+        && (chars[idx + 1] == '"' || chars[idx + 1] == '#')
+    {
+        let mut hashes = 0;
+        while idx + 1 + hashes < chars.len() && chars[idx + 1 + hashes] == '#' {
+            hashes += 1;
+        }
+        if idx + 1 + hashes < chars.len() && chars[idx + 1 + hashes] == '"' {
+            let mut end = idx + 2 + hashes;
+            while end < chars.len()
+                && !(chars[end] == '"' && chars[end + 1..].iter().take(hashes).all(|c| *c == '#'))
+            {
+                end += 1;
+            }
+            return Some((end + 1 + hashes).min(chars.len()));
+        }
+    }
+    None
+}
+
+fn custody_at_new(chars: &[char], idx: usize) -> bool {
+    const NEEDLE: [char; 12] = ['C', 'o', 'm', 'm', 'a', 'n', 'd', ':', ':', 'n', 'e', 'w'];
+    if chars.len() < idx + NEEDLE.len() + 1 {
+        return false;
+    }
+    if idx > 0 && (chars[idx - 1].is_alphanumeric() || chars[idx - 1] == '_') {
+        return false;
+    }
+    if chars[idx..idx + NEEDLE.len()] != NEEDLE {
+        return false;
+    }
+    matches!(chars[idx + NEEDLE.len()], '(' | ':' | ' ')
+}
+
+/// Parse a `"` literal at `chars[idx]`, decoding `\"` and `\\`.
+/// Returns (value, offset just past the closing quote).
+fn custody_parse_literal(chars: &[char], idx: usize) -> (String, usize) {
+    let mut lit = String::new();
+    let mut i = idx + 1;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            lit.push(chars[i + 1]);
+            i += 2;
+        } else if chars[i] == '"' {
+            return (lit, i + 1);
+        } else {
+            lit.push(chars[i]);
+            i += 1;
+        }
+    }
+    (lit, i)
+}
+
+/// String value of same-file `const IDENT [: type] = "literal";`.
+fn custody_const_string(file_source: &str, ident: &str) -> Option<String> {
+    let key = format!("const {ident}");
+    let mut search = 0;
+    while let Some(rel) = file_source[search..].find(&key) {
+        let pos = search + rel;
+        let before = file_source[..pos].chars().last();
+        let after = file_source[pos + key.len()..].chars().next();
+        let ok_before = before.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let ok_after = after.is_none_or(|c| c == ':' || c == '=' || c.is_whitespace());
+        search = pos + key.len();
+        if !(ok_before && ok_after) {
+            continue;
+        }
+        let mut rest = file_source[pos + key.len()..].trim_start();
+        if let Some(stripped) = rest.strip_prefix(':') {
+            rest = stripped;
+            let Some(eq) = rest.find('=') else {
+                continue;
+            };
+            if rest[..eq].contains(';') {
+                continue;
+            }
+            rest = rest[eq + 1..].trim_start();
+        } else if let Some(stripped) = rest.strip_prefix('=') {
+            rest = stripped.trim_start();
+        } else {
+            continue;
+        }
+        let body: Vec<char> = rest.chars().collect();
+        if body.first() != Some(&'"') {
+            continue;
+        }
+        let (lit, _) = custody_parse_literal(&body, 0);
+        return Some(lit);
+    }
+    None
+}
+
+/// First `env` program argument among the `.arg()`/`.args()`
+/// literals after the `new` arg, skipping bare `-x` flags and
+/// `-u`/`-C`/`-S` value pairs (`.env()` pairs are not argv and are
+/// never examined). `Ok(Some)` is the target, `Ok(None)` an empty
+/// tail, `Err` a non-literal element first.
+fn custody_env_target(stmt: &str, from: usize) -> Result<Option<String>, ()> {
+    let chars: Vec<char> = stmt.chars().collect();
+    let mut idx = from;
+    let mut skip_next = false;
+    let mut feed = |lit: String| -> Result<Option<String>, ()> {
+        if skip_next {
+            skip_next = false;
+            return Ok(None);
+        }
+        if lit == "-u" || lit == "-C" || lit == "-S" {
+            skip_next = true;
+            return Ok(None);
+        }
+        if lit.starts_with('-') {
+            return Ok(None);
+        }
+        Ok(Some(lit))
+    };
+    while idx < chars.len() {
+        if let Some(end) = custody_trivia_end(&chars, idx) {
+            idx = end;
+            continue;
+        }
+        if custody_at_call(&chars, idx, ".arg(") {
+            idx += ".arg(".len();
+            while idx < chars.len() && chars[idx].is_whitespace() {
+                idx += 1;
+            }
+            if idx < chars.len() && chars[idx] == '"' {
+                let (lit, end) = custody_parse_literal(&chars, idx);
+                idx = end;
+                if let Some(target) = feed(lit)? {
+                    return Ok(Some(target));
+                }
+                continue;
+            }
+            return Err(());
+        }
+        if custody_at_call(&chars, idx, ".args(") {
+            idx += ".args(".len();
+            loop {
+                while idx < chars.len()
+                    && (chars[idx].is_whitespace() || chars[idx] == ',' || chars[idx] == '[')
+                {
+                    idx += 1;
+                }
+                if idx >= chars.len() {
+                    break;
+                }
+                if chars[idx] == '"' {
+                    let (lit, end) = custody_parse_literal(&chars, idx);
+                    idx = end;
+                    if let Some(target) = feed(lit)? {
+                        return Ok(Some(target));
+                    }
+                    continue;
+                }
+                if chars[idx] == ']' || chars[idx] == ')' {
+                    break;
+                }
+                if let Some(end) = custody_trivia_end(&chars, idx) {
+                    idx = end;
+                    continue;
+                }
+                return Err(());
+            }
+            continue;
+        }
+        idx += 1;
+    }
+    Ok(None)
+}
+
+/// True when `chars[idx..]` starts `call` outside an identifier.
+fn custody_at_call(chars: &[char], idx: usize, call: &str) -> bool {
+    let want: Vec<char> = call.chars().collect();
+    if chars.len() < idx + want.len() {
+        return false;
+    }
+    if idx > 0 && (chars[idx - 1].is_alphanumeric() || chars[idx - 1] == '_') {
+        return false;
+    }
+    chars[idx..idx + want.len()] == want[..]
+}
+
+/// True when `code` (comment/string-stripped) spawns a process:
+/// zero-arg `.spawn()`. Fixture `spawn(a, b)` and `scope.spawn(||)`
+/// have arguments and never match.
+fn custody_has_process_spawn(code: &str) -> bool {
+    let chars: Vec<char> = code.chars().collect();
+    let mut idx = 0;
+    while idx + 6 <= chars.len() {
+        if chars[idx..].starts_with(&['.', 's', 'p', 'a', 'w', 'n']) {
+            let mut end = idx + 6;
+            while end < chars.len() && chars[end].is_whitespace() {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == '(' {
+                end += 1;
+                while end < chars.len() && chars[end].is_whitespace() {
+                    end += 1;
+                }
+                if end < chars.len() && chars[end] == ')' {
+                    return true;
+                }
+            }
+        }
+        idx += 1;
+    }
+    false
+}
+
+/// True when the statement waits inline (`.output(` / `.status(`): no
+/// `Child` persists, so there is no custody question.
+fn custody_has_inline_wait(code: &str) -> bool {
+    code.contains(".output(") || code.contains(".status(")
+}
+
+/// Worst-case program class across the statement's `Command::new`
+/// calls, plus a display token for failure messages. Severity:
+/// unresolvable first (must be disposed), then family, then other.
+fn custody_program(stmt: &str, file_source: &str) -> (CustodyProgram, String) {
+    let mut worst = (CustodyProgram::Other, String::new());
+    for arg in custody_new_args(stmt) {
+        let candidate = match &arg {
+            CustodyNewArg::Literal(value, end) => {
+                if custody_family_name(value).is_some() {
+                    CustodyProgram::Family(value.clone())
+                } else if value.rsplit('/').next().unwrap_or(value) == "env" {
+                    match custody_env_target(stmt, *end) {
+                        Ok(Some(target)) if custody_family_name(&target).is_some() => {
+                            CustodyProgram::EnvFamily(target)
+                        }
+                        Ok(_) => CustodyProgram::Other,
+                        Err(()) => CustodyProgram::Unresolved(format!("env ({value})")),
+                    }
+                } else {
+                    CustodyProgram::Other
+                }
+            }
+            CustodyNewArg::Expr(expr) => custody_expr_program(expr, file_source),
+        };
+        let rank = match &candidate {
+            CustodyProgram::Unresolved(_) => 3,
+            CustodyProgram::Family(_) | CustodyProgram::EnvFamily(_) => 2,
+            CustodyProgram::Other => 1,
+        };
+        let worst_rank = match &worst.0 {
+            CustodyProgram::Unresolved(_) => 3,
+            CustodyProgram::Family(_) | CustodyProgram::EnvFamily(_) => 2,
+            CustodyProgram::Other => 1,
+        };
+        if rank >= worst_rank {
+            let token = match &candidate {
+                CustodyProgram::Family(v)
+                | CustodyProgram::EnvFamily(v)
+                | CustodyProgram::Unresolved(v) => v.clone(),
+                CustodyProgram::Other => String::new(),
+            };
+            worst = (candidate, token);
+        }
+    }
+    worst
+}
+
+/// Classify a non-literal program expression: `&`-stripped paths
+/// resolve through same-file `const`s; calls and field access never do.
+fn custody_expr_program(expr: &str, file_source: &str) -> CustodyProgram {
+    let cleaned = custody_code_keep_strings(expr);
+    let mut core = cleaned.trim();
+    while let Some(stripped) = core.strip_prefix('&') {
+        core = stripped.trim_start();
+    }
+    if let Some(stripped) = core.strip_prefix("mut ") {
+        core = stripped.trim_start();
+    }
+    if core.starts_with('"') {
+        let chars: Vec<char> = core.chars().collect();
+        let (lit, _) = custody_parse_literal(&chars, 0);
+        return match custody_family_name(&lit) {
+            Some(_) => CustodyProgram::Family(lit),
+            None => CustodyProgram::Other,
+        };
+    }
+    let is_path = !core.is_empty()
+        && core
+            .split("::")
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    if !is_path {
+        let short: String = core.chars().take(60).collect();
+        return CustodyProgram::Unresolved(short);
+    }
+    let last = core.rsplit("::").next().unwrap_or(core);
+    match custody_const_string(file_source, last) {
+        Some(lit) => match custody_family_name(&lit) {
+            Some(_) => CustodyProgram::Family(lit),
+            None => CustodyProgram::Other,
+        },
+        None => CustodyProgram::Unresolved(core.to_string()),
+    }
+}
+
+/// Mechanical custody audit (fix8 ruling, fix9 by-meaning rule):
+/// every sleep-family spawn in the lane-touched test files is
+/// constructed inside a `Drop`-verified guard — its whole statement
+/// names a custody marker — or is on the explicit exemption list with
+/// a checkable reason. A bare spawn fails here naming file:line.
+/// Programs match by meaning: literal basename (`sleep`, `/bin/sh`,
+/// `bash`, `dash`), `env` first arguments, same-file `const`s, and
+/// anything else non-literal (flagged unresolvable). Builder splits
+/// in both directions are pinned in SPLITS with guard needles.
 ///
-/// Lane files (`git diff 9e8f9be40~1..HEAD --name-only`, plus this
-/// round's pending conversions): the three committed files plus the
-/// three this round converts. Marker types and their `Drop` proof:
-/// `ParkedSleep` (:23376), `ShWrappedSleep` (close+`Drop` kill the
-/// verified-recorded union), `ChildReaper` (engine :34416, workload
-/// :534), `ChildrenGuard` (9 local Drops, all kill+reap),
-/// `ChildGuard` (10 local Drops, all kill+reap),
-/// `ExitMappingChildGuard` (:9959), `ExitMappingChildrenGuard`
-/// (:9968), `SystemScopeChildGuard` (:51891, `live` cleared only
-/// after a reap), `OwnedMapper` (`test_subject.rs`:103). Each
-/// exemption pins file, line, enclosing fn, and reason; a drifted
-/// line or a stale row fails loudly.
+/// Lane files (fix8 range plus this round's conversions): the six
+/// `files` entries below, count-asserted. Marker `Drop` proofs live
+/// in the round report's marker table (line refs rot; the report is
+/// regenerated per round). Each exemption pins file, line, enclosing
+/// fn, and reason; drifted, retargeted, or stale rows fail loudly.
+/// Non-literal programs that no `const` pins down are flagged, never
+/// skipped: guard them or exempt them with a reason. The
+/// guarded-statement count is pinned: silent lexer/window regressions
+/// fail here instead of passing green-to-green.
 #[test]
 fn sleep_spawns_hold_a_guard_or_exemption() {
-    const MARKERS: [&str; 9] = [
+    const MARKERS: [&str; 14] = [
         "ParkedSleep::",
         "ShWrappedSleep::",
         "ChildReaper",
@@ -99204,40 +99771,111 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         "ExitMappingChildrenGuard",
         "SystemScopeChildGuard",
         "OwnedMapper",
+        "Child(",
+        "Children(",
+        "OwnedChild",
+        "OwnedStoppedChild",
+        "StoppedShell",
     ];
     // (file, line, enclosing fn, reason). Line and fn are both
     // verified: a shift or a retarget fails, it never blesses a
     // neighboring spawn.
-    const EXEMPT: [(&str, usize, &str, &str); 5] = [
+    const EXEMPT: [(&str, usize, &str, &str); 16] = [
         (
             "src/discovery/engine_tests.rs",
-            12921,
+            12924,
             "spawn",
-            "SettledChild::spawn: stdin/stdout are taken and readiness is proven before Self exists; Drop kills+reaps (:12975)",
+            "SettledChild::spawn: stdin/stdout are taken and readiness is proven before Self exists; Drop kills+reaps",
         ),
         (
             "src/discovery/engine_tests.rs",
-            43627,
+            43633,
             "parked_sleep_has_a_stable_full_census",
             "proven-then-adopted by design: the park wait proves, adopt_proven takes custody; the pre-adoption window is die_with_parent-bounded",
         ),
         (
             "src/discovery/engine_tests.rs",
-            99748,
+            100496,
             "owned_tree_watch_exec_restarts_the_backoff_streak",
-            "READY-proven then adopt_proven takes custody (:99791), close() at :99823; the pre-adoption window is die_with_parent-bounded",
+            "READY-proven then adopt_proven takes custody, close() at tail; the pre-adoption window is die_with_parent-bounded",
         ),
         (
             "src/discovery/inventory_workload_tests.rs",
             347,
             "workload_fd_deadline_guard_terminates_an_acknowledged_descendant",
-            "moved into WorkloadWorker; Drop kills the process group and reaps (:33)",
+            "moved into WorkloadWorker; Drop kills the process group and reaps",
         ),
         (
             "src/discovery/inventory_workload_tests.rs",
             910,
             "grow_native_owners_to_257",
-            "moved into the local Reaper; Drop kills+waits every child (:921)",
+            "moved into the local Reaper; Drop kills+waits every child",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            20353,
+            "spawn_peer",
+            "pushed into LoadedSeedProvider.peers (Drop kills+waits); only infallible .id() between",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            20644,
+            "loaded_seed_provider_with_seed_table",
+            "moved into LoadedSeedProvider (Drop kills+waits); only infallible moves between",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            30744,
+            "exit_loader_subject",
+            "moved into LoadedSeedProvider (Drop kills+waits); only infallible moves between",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            26531,
+            "spawn_peer_library",
+            "pushed into TabledSeedProvider.peers (Drop kills+waits); only infallible .id() between",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            26603,
+            "loaded_tabled_provider",
+            "moved into TabledSeedProvider (Drop kills+waits); only infallible moves between",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            10800,
+            "run_capture",
+            "short-lived mapper: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            10807,
+            "run_capture",
+            "short-lived plain child: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            10813,
+            "run_capture",
+            "short-lived threaded mapper: runs to completion via wait_with_output; ExitMappingChildrenGuard is backstop",
+        ),
+        (
+            "src/discovery/inventory_workload_tests.rs",
+            57,
+            "run_workload_worker",
+            "moved into WorkloadWorker (Drop kills the process group and reaps); only infallible .id() between",
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            348,
+            "build",
+            "pushed into Children (Drop kills+waits); the if/else only selects the spawn, no fallible step",
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            355,
+            "build",
+            "pushed into Children (Drop kills+waits); the if/else only selects the spawn, no fallible step",
         ),
     ];
     let new_cmd = format!("{}::{}(", "Command", "new");
@@ -99268,48 +99906,156 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
     ];
     assert_eq!(files.len(), 6, "the lane touches 6 test files");
-    let mut bare: Vec<(String, usize)> = Vec::new();
-    let mut builders: Vec<(String, usize)> = Vec::new();
+    let mut bare: Vec<(String, usize, String)> = Vec::new();
+    let mut splits: Vec<(String, usize)> = Vec::new();
+    let mut guarded = 0usize;
     for (name, source) in files {
         let lines: Vec<&str> = source.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
-            if !custody_code_text(line).contains(&new_cmd) {
-                continue;
+            let stripped = custody_code_text(line);
+            if stripped.contains(&new_cmd) {
+                let stmt = custody_statement(&lines, idx);
+                let code = custody_code_text(&stmt);
+                if MARKERS.iter().any(|marker| code.contains(marker)) {
+                    guarded += 1;
+                    continue;
+                }
+                let (program, token) = custody_program(&stmt, source);
+                match program {
+                    CustodyProgram::Other => continue,
+                    CustodyProgram::Family(_)
+                    | CustodyProgram::EnvFamily(_)
+                    | CustodyProgram::Unresolved(_) => {
+                        if custody_has_inline_wait(&code) {
+                            continue;
+                        }
+                        if !custody_has_process_spawn(&code) {
+                            splits.push((name.to_string(), idx + 1));
+                            continue;
+                        }
+                        bare.push((name.to_string(), idx + 1, token));
+                    }
+                }
+            } else if custody_has_process_spawn(&stripped) {
+                // A zero-arg `.spawn()` whose statement never names
+                // `Command::new`: the far half of a builder split.
+                let stmt = custody_statement(&lines, idx);
+                if custody_code_text(&stmt).contains(&new_cmd) {
+                    continue;
+                }
+                splits.push((name.to_string(), idx + 1));
             }
-            let stmt = custody_statement(&lines, idx);
-            let code = custody_code_text(&stmt);
-            if MARKERS.iter().any(|marker| code.contains(marker)) {
-                continue;
-            }
-            let with_strings = custody_code_keep_strings(&stmt);
-            if !with_strings.contains("\"sleep\"") && !with_strings.contains("\"sh\"") {
-                continue;
-            }
-            if !code.contains(".spawn(") {
-                builders.push((name.to_string(), idx + 1));
-                continue;
-            }
-            bare.push((name.to_string(), idx + 1));
         }
     }
-    for (name, lineno) in &bare {
+    for (name, lineno, token) in &bare {
         assert!(
             EXEMPT
                 .iter()
                 .any(|(file, line, _, _)| file == name && line == lineno),
-            "{name}:{lineno}: bare long-lived sleep/sh spawn with no guard — wrap it in a custody marker or add an exemption row"
+            "{name}:{lineno}: bare sleep-family spawn (program {token:?}) with no guard — wrap it in a custody marker or add an exemption row"
         );
     }
-    // Builder-only sleep/sh configurations (no `.spawn(` in the
-    // statement): the lone case is `ShWrappedSleep::spawn_inner`,
-    // whose constructor-internal custody the guard twins cover. A
-    // second split would hide a spawn from this scan, so the set is
-    // pinned exactly.
+    // Coverage pin: every marker-blessed spawn statement is counted,
+    // so a lexer/window regression that silently drops sites into the
+    // nonsleep bucket fails here instead of passing green-to-green.
+    // Update deliberately with each conversion (bare→guarded moves
+    // one unit from the exemption list to this count).
+    assert_eq!(guarded, 219, "guarded marker-blessed spawn statements");
+    // Split halves (builder without spawn, or spawn without
+    // `Command::new`): each is pinned exactly, with its custody
+    // evidence in SPLIT_GUARDS below. A new split hides a spawn from
+    // the program analysis, so the set fails loudly on any change.
     assert_eq!(
-        builders,
-        [("src/discovery/engine_tests.rs".to_string(), 22962)],
-        "unexpected builder-split sleep/sh configuration: {builders:?}"
+        splits,
+        [
+            ("src/discovery/engine_tests.rs".to_string(), 22968),
+            ("src/discovery/engine_tests.rs".to_string(), 22979),
+            ("src/discovery/engine_tests.rs".to_string(), 23329),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 70),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 346),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 848),
+            (
+                "src/discovery/inventory_workload_tests.rs".to_string(),
+                1985
+            ),
+            (
+                "src/discovery/inventory_workload_tests.rs".to_string(),
+                2001
+            ),
+        ],
+        "unexpected split-half configuration: {splits:?}"
     );
+    // Per-split custody needles: (file, split line, guard statement
+    // that must appear within `window` lines below, dangerous ops
+    // that must not appear between the split and the guard).
+    // Pure builders (22962, trace:70, wl:1985) construct no `Child`,
+    // so they carry no needle; their spawn halves do.
+    const SPLIT_GUARDS: [(&str, usize, &str, usize, &[&str]); 5] = [
+        (
+            "src/discovery/engine_tests.rs",
+            22979,
+            "child: Some(child),",
+            12,
+            &[],
+        ),
+        (
+            "src/discovery/engine_tests.rs",
+            23329,
+            "child: Some(child),",
+            6,
+            &[],
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            346,
+            "children.0.push(child);",
+            25,
+            &[
+                "ProcessView::open",
+                "open_spawned_view",
+                "ProviderFixture::ready",
+            ],
+        ),
+        (
+            "src/discovery/trace_system_seed_tests.rs",
+            848,
+            "capture._children.0.push(child);",
+            6,
+            &["ProviderFixture::ready", "ProcessView::open"],
+        ),
+        (
+            "src/discovery/inventory_workload_tests.rs",
+            2001,
+            "ChildReaper(child);",
+            8,
+            &["wait_for("],
+        ),
+    ];
+    for (file, line, guard, window, forbidden) in SPLIT_GUARDS {
+        let source = files
+            .iter()
+            .find(|(name, _)| *name == file)
+            .unwrap_or_else(|| panic!("split guard names an unscanned file: {file}"))
+            .1;
+        let rows: Vec<&str> = source.lines().collect();
+        let from = line.min(rows.len());
+        let to = (line + window).min(rows.len());
+        let position = rows[from..to]
+            .iter()
+            .position(|row| custody_code_text(row).contains(guard))
+            .unwrap_or_else(|| {
+                panic!("split {file}:{line} lost its guard {guard:?} within {window} lines")
+            });
+        for row in &rows[from..from + position] {
+            let code = custody_code_text(row);
+            for denied in forbidden {
+                assert!(
+                    !code.contains(denied),
+                    "split {file}:{line}: {denied:?} precedes the guard"
+                );
+            }
+        }
+    }
     // Spot pins: commented guarded spawns must resolve as guarded.
     // A `//`-handling regression in the lexer turns these silent
     // (the site vanishes from every class, green-to-green) instead
@@ -99318,6 +100064,8 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         "conservative_replays_under_churn_never_burn_capacity",
         "named_reserve_ignores_failed_attaches_across_conservative_replays",
         "collected_graph_barrier_fences_records_and_assessments",
+        "opus_static_sleeper_fallback_builds_and_sleeps",
+        "detailed_proof_baseline_request_rechecks_capacity_before_health",
     ] {
         let key = format!("fn {name}(");
         let (file, source) = files
@@ -99365,14 +100113,14 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
             lines[..line.min(lines.len())]
                 .iter()
                 .rev()
-                .take(80)
+                .take(300)
                 .any(|above| above.contains(&key)),
             "exemption {file}:{line} retargeted: not inside {enclosing}() anymore ({why})"
         );
         assert!(
             bare.iter()
-                .any(|(name, lineno)| name == file && lineno == &line),
-            "exemption {file}:{line} is stale: no bare sleep/sh spawn there anymore — drop or fix the row ({why})"
+                .any(|(name, lineno, _)| name == file && lineno == &line),
+            "exemption {file}:{line} is stale: no bare sleep-family spawn there anymore — drop or fix the row ({why})"
         );
     }
 }
@@ -105460,15 +106208,21 @@ int main(void) {
             .unwrap()
             .success()
     );
-    let mut heavy = std::process::Command::new(&binary)
-        .stdout(std::process::Stdio::piped())
-        .die_with_parent()
-        .spawn()
-        .unwrap();
+    // Custody before readiness: the mapping-heavy member lives across
+    // fallible handshake/maps/scan asserts below.
+    let mut heavy = ParkedSleep::spawn_unparked(
+        std::process::Command::new(&binary).stdout(std::process::Stdio::piped()),
+    );
     use std::io::Read as _;
     let mut ready = [0u8; 1];
-    heavy.stdout.take().unwrap().read_exact(&mut ready).unwrap();
-    let member = heavy.id();
+    heavy
+        .inner_mut()
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    let member = heavy.pid();
     let maps = std::fs::read(format!("/proc/{member}/maps")).unwrap().len() as u64;
     assert!(
         maps > OWNED_WATCH_CHEAP_SCAN_BYTES,
@@ -105480,8 +106234,7 @@ int main(void) {
         (4..=7).contains(&scans),
         "a mapping-heavy member backs off by default, got {scans} of 30"
     );
-    heavy.kill().unwrap();
-    heavy.wait().unwrap();
+    heavy.close();
 }
 
 /// Asserts `deactivate`, then `quiesce`, come before the first table read
@@ -106105,14 +106858,16 @@ impl TeardownChild {
             .status()
             .unwrap();
         assert!(built.success(), "fixture build failed: {built}");
-        let mut child = std::process::Command::new(&executable)
-            .arg("1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        // Custody before readiness: the transient guard owns the 1 GiB
+        // child (it pauses forever) across the readiness poll below;
+        // into_inner hands exactly one owner to the returned fixture.
+        let mut guard = ParkedSleep::spawn_unparked(
+            std::process::Command::new(&executable)
+                .arg("1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped()),
+        );
+        let mut stdout = guard.inner_mut().stdout.take().unwrap();
         let mut poll = libc::pollfd {
             fd: stdout.as_raw_fd(),
             events: libc::POLLIN,
@@ -106127,7 +106882,10 @@ impl TeardownChild {
         let mut ready = [0u8; 1];
         stdout.read_exact(&mut ready).unwrap();
         assert_eq!(ready, *b"R");
-        Self { child, _temp: dir }
+        Self {
+            child: guard.into_inner(),
+            _temp: dir,
+        }
     }
 
     fn pid(&self) -> u32 {

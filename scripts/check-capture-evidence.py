@@ -4,7 +4,6 @@
 """Exact evidence oracles shared by the canonical live capture lanes."""
 
 import copy
-import difflib
 import json
 import os
 import re
@@ -706,319 +705,488 @@ VERSION_SURFACES = Counter(
 )
 
 
+def derive_matrix_manifest_tables():
+    """The thirteen manifest table rows in producer order: legacy first,
+    then interfaces in fixture order skipping the vendor-only [9].
+    Manifest rows carry no file offset or export agreement (None) and
+    the manifest linkage; versions come from the transcribed tables,
+    entries from the derived surface records."""
+    interface_versions = []
+    for index, (name, table) in enumerate(MATRIX_FIXTURE_INTERFACES):
+        if index == 9:
+            continue
+        if table is None:
+            interface_versions.append((0, 0))
+        else:
+            major, minor, _, _ = MATRIX_FIXTURE_TABLES[table]
+            interface_versions.append((major, minor))
+    if len(interface_versions) != 12 or len(MATRIX_MANIFEST_RECORDS) != 13:
+        raise AssertionError("matrix fixture interface rows drifted")
+    tables = [
+        {
+            "source": "manifest",
+            "version": [2, 40],
+            "entries": 68,
+            "file_offset": None,
+            "linkage": "manifest",
+            "exports_agreeing": None,
+        }
+    ]
+    for (major, minor), record in zip(
+        interface_versions, MATRIX_MANIFEST_RECORDS[1:]
+    ):
+        tables.append(
+            {
+                "source": "manifest",
+                "version": [major, minor],
+                "entries": record[3],
+                "file_offset": None,
+                "linkage": "manifest",
+                "exports_agreeing": None,
+            }
+        )
+    if len(tables) != 13:
+        raise AssertionError("matrix fixture manifest tables drifted")
+    return tables
+
+
+MATRIX_MANIFEST_TABLES = derive_matrix_manifest_tables()
+
+
 def matrix_fixture_path():
     """The version-matrix fixture beside this checkout (self-test only)."""
     return Path(__file__).resolve().parents[1] / MATRIX_FIXTURE_PATH
 
 
-def strip_c_comments(source):
-    """C source minus comments, string-aware (escapes honoured)."""
-    out, i, length = [], 0, len(source)
-    in_string, escaped = False, False
-    while i < length:
-        char = source[i]
-        if in_string:
-            out.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            i += 1
-        elif char == '"':
-            in_string = True
-            out.append(char)
-            i += 1
-        elif char == "/" and i + 1 < length and source[i + 1] == "/":
-            end = source.find("\n", i)
-            i = length if end < 0 else end
-        elif char == "/" and i + 1 < length and source[i + 1] == "*":
-            end = source.find("*/", i + 2)
-            if end < 0:
-                raise AssertionError("matrix fixture has an unterminated comment")
-            i = end + 2
-        else:
-            out.append(char)
-            i += 1
-    return "".join(out)
+# Pinned version-matrix fixture bytes (canary build contract).
+# Re-pin procedure: after REVIEWING a fixture change, regenerate this
+# literal from the reviewed file; record semantic changes as
+# MATRIX_FIXTURE_PATCHES entries with reasons instead of silently
+# re-pinning. Any unlisted byte difference fails loudly.
+MATRIX_FIXTURE_PINNED = rb"""/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> */
+/* Function-table ABI fixture. Names come from the shared Rust field arrays;
+ * this file supplies only the published slot counts and pointer mechanics. */
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+/* Page-edge interface name placement (interface 12): 1 maps the provider
+ * file itself so the name sits in a provider mapping; 0 keeps the
+ * historical anonymous page. Only the discovery version-matrix case sets
+ * this; every other build is unchanged. */
+#ifndef BOUNDARY_PROVIDER_MAP
+#define BOUNDARY_PROVIDER_MAP 0
+#endif
+#if BOUNDARY_PROVIDER_MAP
+/* _GNU_SOURCE arrives from the compiler command line (dladdr needs it
+ * before any system header); the flagged version-matrix build passes it. */
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
-def normalize_c_region(source, signature):
-    """One function definition as a statement sequence: preprocessor lines,
-    braces and `;`-terminated statements (paren-aware, so `for` headers
-    stay whole), comments stripped, whitespace collapsed. Statement order,
-    nesting and placement are all significant; formatting is not."""
-    source = strip_c_comments(source)
-    found = None
-    at = 0
-    while found is None:
-        at = source.find(signature, at)
-        if at < 0:
-            raise AssertionError(f"matrix fixture lost {signature!r}")
-        depth, i = 0, at
-        while True:
-            if source[i] == "(":
-                depth += 1
-            elif source[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        if source[i + 1:].lstrip().startswith("{"):
-            found = at
-        else:
-            at = at + 1
-    depth, i, length = 0, found, len(source)
-    while True:
-        if i >= length:
-            raise AssertionError(f"matrix fixture {signature!r} never closes")
-        if source[i] == "{":
-            depth += 1
-        elif source[i] == "}":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-        i += 1
-    tokens, current = [], ""
-    for line in source[found:end].splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            if current.strip():
-                tokens.append(current.strip())
-            current = ""
-            tokens.append(stripped)
-        else:
-            current += " " + stripped
-    if current.strip():
-        tokens.append(current.strip())
-    statements = []
-    for token in tokens:
-        if token.startswith("#"):
-            statements.append(token)
-            continue
-        parts, buf, parens = [], "", 0
-        for char in token:
-            if char == "(":
-                parens += 1
-                buf += char
-            elif char == ")":
-                parens -= 1
-                buf += char
-            elif char in "{};" and parens == 0:
-                if buf.strip():
-                    parts.append(buf.strip())
-                parts.append(char)
-                buf = ""
-            else:
-                buf += char
-        if buf.strip():
-            parts.append(buf.strip())
-        pending = ""
-        for part in parts:
-            if part in ("{", "}"):
-                if pending:
-                    statements.append(pending)
-                    pending = ""
-                statements.append(part)
-            elif part == ";":
-                statements.append((pending + ";").strip())
-                pending = ""
-            else:
-                pending = (pending + " " + part).strip() if pending else part
-        if pending:
-            statements.append(pending)
-    return [re.sub(r"\s+", " ", item) for item in statements if item]
+typedef unsigned char CK_BYTE;
+typedef unsigned long CK_ULONG;
+typedef unsigned long CK_RV;
+typedef unsigned long CK_FLAGS;
+typedef struct { CK_BYTE major; CK_BYTE minor; } CK_VERSION;
+typedef struct { char *pInterfaceName; void *pFunctionList; CK_FLAGS flags; } CK_INTERFACE;
+typedef struct { CK_VERSION version; void *functions[104]; } Table;
 
+#define CKR_OK 0UL
+#define CKR_ARGUMENTS_BAD 7UL
+#define CKR_BUFFER_TOO_SMALL 0x150UL
+#ifndef LEGACY_MAJOR
+#define LEGACY_MAJOR 2
+#endif
+#ifndef LEGACY_MINOR
+#define LEGACY_MINOR 40
+#endif
+#ifndef MATRIX_INTERFACES
+#define MATRIX_INTERFACES 1
+#endif
+#ifndef SINGLE_INTERFACE
+#define SINGLE_INTERFACE 0
+#endif
+#ifndef SHORT_LEGACY
+#define SHORT_LEGACY 0
+#endif
+#ifndef MAPPED_LEGACY_WORDS
+#define MAPPED_LEGACY_WORDS -1
+#endif
+#ifndef SPARSE_LEGACY
+#define SPARSE_LEGACY -2
+#endif
+#ifndef LEGACY_PADDING
+#define LEGACY_PADDING 0
+#endif
+#ifndef MAPPED_V32_WORDS
+#define MAPPED_V32_WORDS -1
+#endif
+#ifndef INTERFACE_MAJOR
+#define INTERFACE_MAJOR 3
+#endif
+#ifndef INTERFACE_MINOR
+#define INTERFACE_MINOR 2
+#endif
+#ifndef PRIVACY_FIXTURE
+#define PRIVACY_FIXTURE 0
+#endif
+#ifndef PRIVACY_BLOCKS
+#define PRIVACY_BLOCKS 0
+#endif
+#ifndef UNTRUSTED_TARGETS
+#define UNTRUSTED_TARGETS 0
+#endif
+/* Capacity-only canonical2.40 surface: one getter plus distinct stubs,
+ * with remaining slots aliasing the getter. Unused tables/entry points
+ * are not populated or exported, so the declared physical tail is exact.
+ * The ordinary ABI matrix is unchanged when this opt-in is absent. */
+#ifndef CAPACITY_UNIQUE
+#define CAPACITY_UNIQUE 0
+#endif
+#if CAPACITY_UNIQUE < 0 || CAPACITY_UNIQUE > 68
+#error "CAPACITY_UNIQUE must be0..68"
+#endif
 
-# Pinned structural normal forms: statement order, nesting and placement of
-# Re-pin procedure: after REVIEWING a fixture change, regenerate with
-# normalize_c_region above and replace these literals wholesale after review.
-MATRIX_STRUCTURE_REGIONS = {
-    'fill_table': ('static void fill_table(', [
-        'static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors)',
-        '{',
-        'table->version = (CK_VERSION)',
-        '{',
-        'major, minor',
-        '}',
-        ';',
-        'for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];',
-        'table->functions[3] = (void *)C_GetFunctionList;',
-        '#if CAPACITY_UNIQUE',
-        '(void)anchors;',
-        'for (int i = 0; i < 104; i++) table->functions[i] = (void *)C_GetFunctionList;',
-        'for (int i = 0; i < CAPACITY_UNIQUE - 1; i++) table->functions[i < 3 ? i : i + 1] = stubs[i];',
-        '#else',
-        'if (anchors)',
-        '{',
-        'table->functions[68] = (void *)C_GetInterfaceList;',
-        'table->functions[69] = (void *)C_GetInterface;',
-        '}',
-        '#endif',
-        '#if UNTRUSTED_TARGETS',
-        'table->functions[0] = (void *)write;',
-        'table->functions[1] = (void *)&legacy;',
-        '#endif',
-        '}',
-    ]),
-    'fill': ('static void fill(void)', [
-        'static void fill(void)',
-        '{',
-        'static int done;',
-        'if (done) return;',
-        'done = 1;',
-        'fill_table(&legacy, LEGACY_MAJOR, LEGACY_MINOR, 0);',
-        'if (LEGACY_PADDING) memset((unsigned char *)&legacy + sizeof(CK_VERSION), 0xa5, offsetof(Table, functions) - sizeof(CK_VERSION));',
-        'if (SPARSE_LEGACY >= -1)',
-        '{',
-        'memset(legacy.functions, 0, sizeof(legacy.functions));',
-        'if (SPARSE_LEGACY >= 0) legacy.functions[SPARSE_LEGACY] = stubs[SPARSE_LEGACY];',
-        '}',
-        '#if !CAPACITY_UNIQUE',
-        'fill_table(&t240, 2, 40, 0);',
-        'fill_table(&t30, 3, 0, 1);',
-        'fill_table(&t31, 3, 1, 1);',
-        'fill_table(&t32, INTERFACE_MAJOR, INTERFACE_MINOR, 1);',
-        'if (MAPPED_V32_WORDS >= 0) short_v32 = mapped_table(&t32, offsetof(Table, functions) + MAPPED_V32_WORDS * sizeof(void *));',
-        'fill_table(&tfuture, 3, 9, 1);',
-        'fill_table(&tunknown, 4, 0, 1);',
-        'fill_table(&tbad, 3, 2, 0);',
-        'make_boundary_name();',
-        '#endif',
-        'if (SHORT_LEGACY || MAPPED_LEGACY_WORDS >= 0) make_short_legacy();',
-        '}',
-    ]),
-    'C_GetInterfaceList': ('CK_RV C_GetInterfaceList(', [
-        'CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count)',
-        '{',
-        'fill();',
-        'if (!count) return CKR_ARGUMENTS_BAD;',
-        'CK_ULONG needed = MATRIX_INTERFACES ? (SINGLE_INTERFACE ? 1 : 13) : 0;',
-        'if (!out)',
-        '{',
-        '*count = needed;',
-        'return CKR_OK;',
-        '}',
-        'if (*count < needed)',
-        '{',
-        '*count = needed;',
-        'return CKR_BUFFER_TOO_SMALL;',
-        '}',
-        'if (MATRIX_INTERFACES)',
-        '{',
-        'if (SINGLE_INTERFACE)',
-        '{',
-        'out[0] = (CK_INTERFACE)',
-        '{',
-        'exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0',
-        '}',
-        ';',
-        '}',
-        'else',
-        '{',
-        'out[0] = (CK_INTERFACE)',
-        '{',
-        'exact, &t240, 0',
-        '}',
-        ';',
-        'out[1] = (CK_INTERFACE)',
-        '{',
-        'exact, &t30, 0',
-        '}',
-        ';',
-        'out[2] = (CK_INTERFACE)',
-        '{',
-        'exact, &t31, 0',
-        '}',
-        ';',
-        'out[3] = (CK_INTERFACE)',
-        '{',
-        'exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0',
-        '}',
-        ';',
-        'out[4] = (CK_INTERFACE)',
-        '{',
-        'exact, &tfuture, 0',
-        '}',
-        ';',
-        'out[5] = (CK_INTERFACE)',
-        '{',
-        'exact, &tunknown, 0',
-        '}',
-        ';',
-        'out[6] = (CK_INTERFACE)',
-        '{',
-        'alternate, &t32, 0',
-        '}',
-        ';',
-        'out[7] = (CK_INTERFACE)',
-        '{',
-        '0, &t30, 0',
-        '}',
-        ';',
-        'out[8] = (CK_INTERFACE)',
-        '{',
-        '(char *)(uintptr_t)1, &t31, 0',
-        '}',
-        ';',
-        'out[9] = (CK_INTERFACE)',
-        '{',
-        'deceptive, &tbad, 0',
-        '}',
-        ';',
-        'out[10] = (CK_INTERFACE)',
-        '{',
-        'alternate, &legacy, 0',
-        '}',
-        ';',
-        'out[11] = (CK_INTERFACE)',
-        '{',
-        'exact, 0, 0',
-        '}',
-        ';',
-        'out[12] = (CK_INTERFACE)',
-        '{',
-        'boundary_name, &t32, 0',
-        '}',
-        ';',
-        '}',
-        '}',
-        '*count = needed;',
-        'return CKR_OK;',
-        '}',
-    ]),
-    'make_boundary_name': ('static void make_boundary_name(void)', [
-        'static void make_boundary_name(void)',
-        '{',
-        'long page = sysconf(_SC_PAGESIZE);',
-        '#if BOUNDARY_PROVIDER_MAP',
-        'if (try_provider_boundary_name()) return;',
-        '#endif',
-        'unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);',
-        'if (region == MAP_FAILED) __builtin_trap();',
-        'boundary_name = (char *)(region + page - sizeof("PKCS 11"));',
-        'memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));',
-        'if (munmap(region + page, (size_t)page) != 0) __builtin_trap();',
-        '}',
-    ]),
+#if PRIVACY_FIXTURE
+/* Closed H7 canary sessions only. All other function-table fixtures keep
+ * their original no-write CKR_OK behavior. */
+static CK_RV object_canary_rv(const char *index, CK_ULONG session) {
+    if (strcmp(index, "24") == 0 && session >= 0x701 && session <= 0x705) {
+        static const CK_RV results[] = {17, 18, 0x150, 5, 1};
+        return results[session - 0x701];
+    }
+    return CKR_OK;
+}
+#define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
+#define S(n) static CK_RV s##n(TEN_ARGS) { \
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; \
+    (void)a6; (void)a7; (void)a8; (void)a9; \
+    if (PRIVACY_BLOCKS) sleep(60); \
+    return object_canary_rv(#n, a0); \
+}
+#else
+#define S(n) static CK_RV s##n(void) { return CKR_OK; }
+#endif
+#define S10(m) S(m##0) S(m##1) S(m##2) S(m##3) S(m##4) S(m##5) S(m##6) S(m##7) S(m##8) S(m##9)
+S10(0) S10(1) S10(2) S10(3) S10(4) S10(5) S10(6) S10(7) S10(8) S10(9)
+S(100) S(101) S(102) S(103)
+#define L10(m) s##m##0, s##m##1, s##m##2, s##m##3, s##m##4, s##m##5, s##m##6, s##m##7, s##m##8, s##m##9
+static void *stubs[104] = {
+    L10(0), L10(1), L10(2), L10(3), L10(4),
+    L10(5), L10(6), L10(7), L10(8), L10(9),
+    s100, s101, s102, s103
+};
+
+CK_RV C_GetFunctionList(void **out);
+#if !CAPACITY_UNIQUE
+CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
+CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);
+#endif
+
+#if CAPACITY_UNIQUE
+#define legacy p11scope_capacity_table
+Table legacy;
+#else
+static Table legacy;
+#endif
+#if !CAPACITY_UNIQUE
+static Table t240;
+static Table t30;
+static Table t31;
+static Table t32;
+static Table tfuture;
+static Table tunknown;
+static Table tbad;
+#endif
+static void *short_legacy;
+#if !CAPACITY_UNIQUE
+static void *short_v32;
+static char *boundary_name;
+#endif
+
+static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {
+    table->version = (CK_VERSION){major, minor};
+    for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];
+    table->functions[3] = (void *)C_GetFunctionList;
+#if CAPACITY_UNIQUE
+    (void)anchors;
+    for (int i = 0; i < 104; i++) table->functions[i] = (void *)C_GetFunctionList;
+    for (int i = 0; i < CAPACITY_UNIQUE - 1; i++)
+        table->functions[i < 3 ? i : i + 1] = stubs[i];
+#else
+    if (anchors) {
+        table->functions[68] = (void *)C_GetInterfaceList;
+        table->functions[69] = (void *)C_GetInterface;
+    }
+#endif
+#if UNTRUSTED_TARGETS
+    table->functions[0] = (void *)write; /* preloaded libc, not provider-owned */
+    table->functions[1] = (void *)&legacy; /* mapped, but not executable */
+#endif
 }
 
+static void *mapped_table(Table *table, size_t available) {
+    long page = sysconf(_SC_PAGESIZE);
+    unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) __builtin_trap();
+    unsigned char *base = region + page - available;
+    memcpy(base, table, available);
+    if (munmap(region + page, (size_t)page) != 0) __builtin_trap();
+    return base;
+}
 
-def matrix_structure_matches_source(text):
-    """Every pinned region normalizes exactly: moves, reorders, re-nests
-    and content drift all fail, with a unified diff of the first drifted
-    region so the re-pin is conscious."""
-    for name, (signature, expected) in MATRIX_STRUCTURE_REGIONS.items():
-        actual = normalize_c_region(text, signature)
-        if actual != expected:
-            diff = list(difflib.unified_diff(
-                expected, actual, f"expected {name}", f"actual {name}", lineterm=""))
-            message = "matrix fixture {} drifted:\n{}".format(
-                name, "\n".join(diff[:60])
+static void make_short_legacy(void) {
+    size_t available = MAPPED_LEGACY_WORDS >= 0
+        ? offsetof(Table, functions) + MAPPED_LEGACY_WORDS * sizeof(void *)
+        : offsetof(Table, functions) + 68 * sizeof(void *) - 1;
+    short_legacy = mapped_table(&legacy, available);
+}
+
+#if !CAPACITY_UNIQUE
+#if BOUNDARY_PROVIDER_MAP
+/* Discovery refuses names outside the provider's own mappings, so the
+ * page-edge name lives in a private mapping of the provider file itself
+ * (located through dladdr), keeping the exact edge layout with an
+ * unmapped guard page. Returns 1 with boundary_name placed, 0 when the
+ * file cannot be remapped (deleted, unreachable). */
+static int try_provider_boundary_name(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    Dl_info info;
+    struct stat st;
+    int fd;
+    if (!dladdr((void *)try_provider_boundary_name, &info) || !info.dli_fname)
+        return 0;
+    fd = open(info.dli_fname, O_RDONLY);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return 0;
+    }
+    size_t file_pages = ((size_t)st.st_size + (size_t)page - 1) / (size_t)page;
+    size_t map_len = (file_pages + 1) * (size_t)page;
+    unsigned char *file_region =
+        mmap(0, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file_region == MAP_FAILED) return 0;
+    unsigned char *guard = file_region + file_pages * (size_t)page;
+    if (munmap(guard, (size_t)page) != 0) {
+        munmap(file_region, map_len);
+        return 0;
+    }
+    boundary_name = (char *)(guard - sizeof("PKCS 11"));
+    memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));
+    return 1;
+}
+#endif
+static void make_boundary_name(void) {
+    long page = sysconf(_SC_PAGESIZE);
+#if BOUNDARY_PROVIDER_MAP
+    /* A fallback keeps the fixture alive where the provider file is gone;
+     * the name is then refused like any other foreign mapping. */
+    if (try_provider_boundary_name()) return;
+#endif
+    unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) __builtin_trap();
+    boundary_name = (char *)(region + page - sizeof("PKCS 11"));
+    memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));
+    if (munmap(region + page, (size_t)page) != 0) __builtin_trap();
+}
+#endif
+
+static void fill(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    fill_table(&legacy, LEGACY_MAJOR, LEGACY_MINOR, 0);
+    if (LEGACY_PADDING)
+        memset((unsigned char *)&legacy + sizeof(CK_VERSION), 0xa5,
+               offsetof(Table, functions) - sizeof(CK_VERSION));
+    if (SPARSE_LEGACY >= -1) {
+        memset(legacy.functions, 0, sizeof(legacy.functions));
+        if (SPARSE_LEGACY >= 0) legacy.functions[SPARSE_LEGACY] = stubs[SPARSE_LEGACY];
+    }
+#if !CAPACITY_UNIQUE
+    fill_table(&t240, 2, 40, 0);
+    fill_table(&t30, 3, 0, 1);
+    fill_table(&t31, 3, 1, 1);
+    fill_table(&t32, INTERFACE_MAJOR, INTERFACE_MINOR, 1);
+    if (MAPPED_V32_WORDS >= 0)
+        short_v32 = mapped_table(&t32, offsetof(Table, functions) + MAPPED_V32_WORDS * sizeof(void *));
+    fill_table(&tfuture, 3, 9, 1);
+    fill_table(&tunknown, 4, 0, 1);
+    fill_table(&tbad, 3, 2, 0);
+    make_boundary_name();
+#endif
+    if (SHORT_LEGACY || MAPPED_LEGACY_WORDS >= 0) make_short_legacy();
+}
+
+CK_RV C_GetFunctionList(void **out) {
+    fill();
+    if (!out) return CKR_ARGUMENTS_BAD;
+    *out = (SHORT_LEGACY || MAPPED_LEGACY_WORDS >= 0) ? short_legacy : (void *)&legacy;
+    return CKR_OK;
+}
+
+#if CAPACITY_UNIQUE
+/* A reload must not perform an unledgered acquisition through an old probe.
+ * The controlled target can read this same published table as data, while
+ * deliberate C_GetFunctionList activity stays separately gated/ledgered. */
+__attribute__((constructor)) static void capacity_initialize(void) { fill(); }
+#endif
+
+#if !CAPACITY_UNIQUE
+static char exact[] = "PKCS 11";
+static char alternate[] = "Acme Standard ABI";
+static char deceptive[] = "Vendor Pretend";
+
+CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count) {
+    fill();
+    if (!count) return CKR_ARGUMENTS_BAD;
+    CK_ULONG needed = MATRIX_INTERFACES ? (SINGLE_INTERFACE ? 1 : 13) : 0;
+    if (!out) { *count = needed; return CKR_OK; }
+    if (*count < needed) { *count = needed; return CKR_BUFFER_TOO_SMALL; }
+    if (MATRIX_INTERFACES) {
+        if (SINGLE_INTERFACE) {
+            out[0] = (CK_INTERFACE){exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0};
+        } else {
+            out[0] = (CK_INTERFACE){exact, &t240, 0};
+            out[1] = (CK_INTERFACE){exact, &t30, 0};
+            out[2] = (CK_INTERFACE){exact, &t31, 0};
+            out[3] = (CK_INTERFACE){exact, MAPPED_V32_WORDS >= 0 ? short_v32 : (void *)&t32, 0};
+            out[4] = (CK_INTERFACE){exact, &tfuture, 0};
+            out[5] = (CK_INTERFACE){exact, &tunknown, 0};
+            out[6] = (CK_INTERFACE){alternate, &t32, 0};
+            out[7] = (CK_INTERFACE){0, &t30, 0};
+            out[8] = (CK_INTERFACE){(char *)(uintptr_t)1, &t31, 0};
+            out[9] = (CK_INTERFACE){deceptive, &tbad, 0};
+            out[10] = (CK_INTERFACE){alternate, &legacy, 0};
+            out[11] = (CK_INTERFACE){exact, 0, 0};
+            out[12] = (CK_INTERFACE){boundary_name, &t32, 0};
+        }
+    }
+    *count = needed;
+    return CKR_OK;
+}
+
+CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
+    (void)name;
+    fill();
+    if (!out) return CKR_ARGUMENTS_BAD;
+    Table *table = &t32;
+    if (version) {
+        CK_VERSION requested = *(CK_VERSION *)version;
+        if (requested.major == 3 && requested.minor == 0) table = &t30;
+        if (requested.major == 3 && requested.minor == 1) table = &t31;
+        if (requested.major == 3 && requested.minor == 2) table = &t32;
+    }
+    static CK_INTERFACE selected;
+    selected = (CK_INTERFACE){exact, table, flags};
+    *out = &selected;
+    return CKR_OK;
+}
+#endif
+"""
+
+# Reviewed patch table: intended (old, new, reason) deltas from the pinned
+# bytes to the live fixture. Empty today: the pin is exactly the live file.
+# Each entry applies exactly once, in order; a missing or ambiguous old
+# text fails loudly instead of silently skipping.
+MATRIX_FIXTURE_PATCHES = ()
+
+
+def apply_fixture_patches(pinned, patches):
+    """Apply reviewed (old, new, reason) deltas; each old text matches once."""
+    text = pinned
+    for old, new, reason in patches:
+        if text.count(old) != 1:
+            raise AssertionError(
+                "fixture patch does not apply exactly once: " + reason
             )
-            require(False, message)
+        text = text.replace(old, new, 1)
+    return text
+
+
+def first_byte_difference(left, right):
+    """Offset of the first differing byte, or the common-prefix length."""
+    for index, (left_byte, right_byte) in enumerate(zip(left, right)):
+        if left_byte != right_byte:
+            return index
+    return min(len(left), len(right))
+
+
+def matrix_fixture_bytes_match_live():
+    """The live fixture is byte-exact with pinned + reviewed patches.
+
+    Only line-ending normalisation applies; every other byte difference
+    fails. On mismatch the message shows the first differing offset with
+    byte context on both sides (lossless repr, no decoding).
+    """
+    live = matrix_fixture_path().read_bytes().replace(b"\r\n", b"\n")
+    expected = apply_fixture_patches(
+        MATRIX_FIXTURE_PINNED.replace(b"\r\n", b"\n"), MATRIX_FIXTURE_PATCHES
+    )
+    if live == expected:
+        return
+    at = first_byte_difference(live, expected)
+    require(
+        False,
+        "matrix fixture bytes drifted at offset {} (live {} bytes, expected "
+        "{} bytes):\nlive:     {!r}\nexpected: {!r}".format(
+            at, len(live), len(expected),
+            live[max(0, at - 48):at + 48], expected[max(0, at - 48):at + 48],
+        ),
+    )
+
+
+def fixture_bytes_comparison_has_no_normaliser(source_text):
+    """Static self-check: the byte comparison normalises line endings and
+    nothing else. `source_text` is this file's own comparison-function
+    sources (or a synthetic snippet under test). The patch-table rewrite
+    is explicit reviewed text, not a normaliser: only its exact-once
+    `replace(old, new, 1)` form is allowed besides line endings."""
+    if "def matrix_fixture_bytes_match_live(" in source_text:
+        bodies = []
+        for name in (
+            "def apply_fixture_patches(",
+            "def first_byte_difference(",
+            "def matrix_fixture_bytes_match_live(",
+        ):
+            part = source_text.split(name, 1)
+            if len(part) != 2:
+                raise AssertionError(
+                    "fixture comparison is missing " + name.rstrip("(")
+                )
+            bodies.append(part[1].split("\ndef ", 1)[0])
+        body = "\n".join(bodies)
+    else:
+        body = source_text
+    for banned in ("re.", ".strip(", ".lower(", ".upper(", ".split(",
+                  ".casefold(", "collapse", "normalize", "unicodedata",
+                  ".encode(", ".decode(", "difflib"):
+        if banned in body:
+            raise AssertionError(
+                "fixture comparison uses a forbidden normaliser: " + banned
+            )
+    if body.count('replace(b"\\r\\n", b"\\n")') != 2:
+        raise AssertionError(
+            "fixture comparison must normalise line endings on both sides"
+        )
+    allowed_replaces = {'b"\\r\\n", b"\\n"', "old, new, 1"}
+    for found in re.findall(r"\.replace\(([^)]*)\)", body):
+        if found not in allowed_replaces:
+            raise AssertionError(
+                "fixture comparison replaces beyond line endings and patches: "
+                + found
+            )
+
+
 
 
 def matrix_fixture_transcription_matches_source():
@@ -1254,10 +1422,11 @@ def matrix_fixture_transcription_matches_source():
         tuple(parsed_rows) == MATRIX_FIXTURE_INTERFACES,
         f"matrix fixture interfaces drifted: {parsed_rows!r}",
     )
-    # Structural backstop over the fine-grained pins above: statement
-    # order, nesting and placement. Anything they cannot see (moved,
-    # reordered or re-nested code) fails here with a diff.
-    matrix_structure_matches_source(text)
+    # Byte-exact backstop over the fine-grained pins above: the whole
+    # live file must equal pinned bytes plus reviewed patches. Anything
+    # the pins cannot see (moves, reorders, re-nests, comments,
+    # whitespace, string bytes) fails here with the first offset.
+    matrix_fixture_bytes_match_live()
 # SCANNED — the canary workload maps the provider *before* attach, so both
 # sources describe it. LP64 scans three complete tables and reports one
 # conflict; ILP32 also scans the 3.1, 3.2 and future-minor 3.9 tables and agrees
@@ -1300,30 +1469,15 @@ VERSION_SURFACES_SCANNED_IA32 = VERSION_SURFACES_SCANNED + Counter(
     (walk, functions)
     for _, _, walk, functions in MATRIX_SCAN_BASELINE_IA32[len(MATRIX_SCAN_BASELINE_LP64):]
 )
-VERSION_SHAPE_MANIFEST_ONLY = (
-    1056,
-    104,
-    208,
-    VERSION_SURFACES,
-    MATRIX_VENDOR_INTERFACES,
-    "ok",
-)
-VERSION_SHAPE_SCANNED = (
-    1056,
-    104,
-    208,
-    VERSION_SURFACES_SCANNED,
-    MATRIX_VENDOR_INTERFACES,
-    "ok",
-)
-VERSION_SHAPE_SCANNED_IA32 = (
-    1056,
-    104,
-    208,
-    VERSION_SURFACES_SCANNED_IA32,
-    MATRIX_VENDOR_INTERFACES,
-    "ok",
-)
+def matrix_shape(surfaces):
+    """The fixed matrix observation counts around a surface Counter:
+    single source for the shape tuples and exact_matrix_observation."""
+    return (1056, 104, 208, surfaces, MATRIX_VENDOR_INTERFACES, "ok")
+
+
+VERSION_SHAPE_MANIFEST_ONLY = matrix_shape(VERSION_SURFACES)
+VERSION_SHAPE_SCANNED = matrix_shape(VERSION_SURFACES_SCANNED)
+VERSION_SHAPE_SCANNED_IA32 = matrix_shape(VERSION_SURFACES_SCANNED_IA32)
 VERSION_TABLES_MANIFEST_ONLY = Counter(
     {
         ("manifest", (0, 0), 0): 1,
@@ -4055,17 +4209,23 @@ def exact_shape(evidence, table_entries, slots, probes, surfaces, vendor, interf
     require(surface_signature(evidence) == surfaces, f"unexpected surfaces: {evidence['surfaces']}")
 
 
-def exact_matrix_observation(evidence, *, surfaces, tables, scan_records):
-    """One seam for a version-matrix observation: counts plus the typed
-    surface partition plus the exact discovery-table signature. Canary
-    lanes pass adaptive expectations from version_canary_scan_shape;
-    induced G4/G5 pass the fixed LP64 shape. Surface rows and the table
-    evidence rows they describe are validated together, never apart."""
-    exact_shape(evidence, 1056, 104, 208, surfaces, MATRIX_VENDOR_INTERFACES, "ok")
+def exact_matrix_observation(
+    evidence, shape, *, tables, scan_records, scan_baseline, word, extras
+):
+    """One seam for a version-matrix observation: counts, the typed
+    surface partition, the exact discovery-table signature, and full
+    typed table rows. Canary lanes pass adaptive expectations from
+    version_canary_scan_shape; induced G4/G5 pass the fixed LP64 shape.
+    Surface rows and the table evidence rows they describe are validated
+    together, never apart."""
+    exact_shape(evidence, *shape)
     exact_canary_surface_records(evidence, MATRIX_MANIFEST_RECORDS, scan_records)
     require(
         table_signature(evidence) == tables,
         f"unexpected discovery tables: {evidence['discovery']}",
+    )
+    exact_matrix_table_rows(
+        evidence, scan_baseline=scan_baseline, word=word, extras=extras
     )
 
 
@@ -4139,6 +4299,154 @@ def exact_canary_surface_records(evidence, manifest_records, scan_records):
     # backstop (exact_shape) runs before this check, so any row left
     # over here already failed there as a Counter mismatch.
     require(not remaining, f"canary has unaccounted surfaces: {remaining!r}")
+
+
+TABLE_ROW_KEYS = frozenset(
+    {"entries", "exports_agreeing", "file_offset", "linkage", "source", "version"}
+)
+SCAN_LINKAGE_VOCABULARY = frozenset(
+    {"interface", "live_return", "manifest", "exports", "heuristic"}
+)
+# Baseline scan rows, (version, entries) -> (allowed linkages, exact
+# exports_agreeing). Only (3,0,92) can be a live return: it is the one
+# table BPF records name (the workload's C_GetInterface calls), and
+# those records may or may not arrive, so both linkages are allowed
+# (observed 97 heuristic vs 50 live_return across captures). Every other
+# baseline row is sweep-only (no record can name it), single-linkage, and
+# single-agreement (pure function of decoded content and the fixed
+# fixture exports, BPF-independent).
+MATRIX_SCAN_ROW_CONTRACT = {
+    ((2, 40), 68): (frozenset({"heuristic"}), 1),
+    ((3, 0), 92): (frozenset({"heuristic", "live_return"}), 3),
+    ((3, 1), 92): (frozenset({"heuristic"}), 3),
+    ((3, 2), 104): (frozenset({"heuristic"}), 3),
+    ((3, 9), 104): (frozenset({"heuristic"}), 3),
+}
+# Adaptive extra rows (terminal/paired views): sweep-only linkage, and an
+# agreement count that can only be 0/1/3 (getter anchors come as a triple
+# or not at all; @3 alone, all three, or out of range).
+EXTRA_SCAN_AGREEING = frozenset({0, 1, 3})
+
+
+def exact_table_row(table):
+    """Strict typed record: exact keys and source-independent types."""
+    require(
+        set(table) == TABLE_ROW_KEYS,
+        f"matrix table row is not a typed record: {table!r}",
+    )
+    version = table["version"]
+    require(
+        isinstance(version, list)
+        and len(version) == 2
+        and all(type(part) is int and 0 <= part <= 255 for part in version),
+        f"matrix table row has a bad version: {table!r}",
+    )
+    require(
+        type(table["entries"]) is int and table["entries"] >= 0
+        and type(table["source"]) is str
+        and type(table["linkage"]) is str
+        and (table["file_offset"] is None or type(table["file_offset"]) is int)
+        and (table["exports_agreeing"] is None
+             or type(table["exports_agreeing"]) is int),
+        f"matrix table row has untyped fields: {table!r}",
+    )
+
+
+def exact_matrix_table_rows(evidence, *, scan_baseline, word, extras):
+    """Full typed table evidence: manifest rows ordered-exact, scan rows
+    exact per-row with adaptive offsets. `scan_baseline` is the ordered
+    [(version, entries)] baseline; `extras` is None (forbidden: induced
+    lanes) or "canary" (terminal/paired views allowed under extra rules).
+    Malformed, extra, missing or misordered rows fail."""
+    require(len(evidence["discovery"]) == 1, "matrix tables need one provider")
+    tables = evidence["discovery"][0]["tables"]
+    for table in tables:
+        exact_table_row(table)
+    require(
+        all(table["source"] in ("scan", "manifest") for table in tables),
+        f"matrix table has a bad source: {tables!r}",
+    )
+    require(
+        all(key in MATRIX_SCAN_ROW_CONTRACT for key in scan_baseline),
+        f"matrix scan baseline escapes the row contract: {scan_baseline!r}",
+    )
+    manifest = [table for table in tables if table["source"] == "manifest"]
+    require(
+        manifest == MATRIX_MANIFEST_TABLES,
+        f"matrix manifest tables differ: {manifest!r}",
+    )
+    scan = [table for table in tables if table["source"] == "scan"]
+    scan_keys = [(tuple(table["version"]), table["entries"]) for table in scan]
+    if extras is None:
+        require(
+            scan_keys == scan_baseline,
+            f"matrix scan tables differ: {scan_keys!r}",
+        )
+        for table in scan:
+            key = (tuple(table["version"]), table["entries"])
+            linkages, agreeing = MATRIX_SCAN_ROW_CONTRACT[key]
+            require(
+                table["linkage"] in SCAN_LINKAGE_VOCABULARY
+                and table["linkage"] in linkages,
+                f"matrix scan table has unallowed linkage: {table!r}",
+            )
+            require(
+                table["exports_agreeing"] == agreeing,
+                f"matrix scan table has wrong export agreement: {table!r}",
+            )
+        offsets = [table["file_offset"] for table in scan]
+        require(
+            all(type(offset) is int for offset in offsets),
+            f"matrix scan tables lack file offsets: {scan!r}",
+        )
+        require(
+            all(offset % word == 0 for offset in offsets),
+            f"matrix scan tables misaligned: {offsets!r}",
+        )
+        require(
+            len(set(offsets)) == len(offsets),
+            f"matrix scan tables share offsets: {offsets!r}",
+        )
+        extents = sorted(
+            (offset, offset + word * (table["entries"] + 1))
+            for offset, table in zip(offsets, scan)
+        )
+        require(
+            all(left[1] <= right[0] for left, right in zip(extents, extents[1:])),
+            f"matrix scan tables overlap: {extents!r}",
+        )
+        return
+    require(extras == "canary", f"unknown scan extras mode: {extras!r}")
+    remaining = list(scan)
+    for key in scan_baseline:
+        matches = [
+            table
+            for table in remaining
+            if (tuple(table["version"]), table["entries"]) == key
+        ]
+        require(matches, f"matrix scan baseline row missing: {key!r}")
+        table = matches[0]
+        remaining.remove(table)
+        linkages, agreeing = MATRIX_SCAN_ROW_CONTRACT[key]
+        require(
+            table["linkage"] in SCAN_LINKAGE_VOCABULARY
+            and table["linkage"] in linkages,
+            f"matrix scan table has unallowed linkage: {table!r}",
+        )
+        require(
+            table["exports_agreeing"] == agreeing,
+            f"matrix scan table has wrong export agreement: {table!r}",
+        )
+    for table in remaining:
+        require(
+            table["linkage"] in SCAN_LINKAGE_VOCABULARY
+            and table["linkage"] == "heuristic",
+            f"matrix scan extra has unallowed linkage: {table!r}",
+        )
+        require(
+            table["exports_agreeing"] in EXTRA_SCAN_AGREEING,
+            f"matrix scan extra has wrong export agreement: {table!r}",
+        )
 
 
 def entry_skips(evidence):
@@ -5373,18 +5681,32 @@ def validate_canary(lane, document, target_bits=64):
         exact_profile_v3_selection(document, terminal=trace)
 
     scanned = discovery == "scanned"
+    baseline_tables = (
+        MATRIX_SCAN_BASELINE_IA32 if target_bits == 32 else MATRIX_SCAN_BASELINE_LP64
+    )
     if scanned:
         surfaces, wanted_tables, scan_records = version_canary_scan_shape(
             evidence, target_bits
         )
+        baseline_keys = [
+            ((major, minor), functions)
+            for major, minor, _, functions in baseline_tables
+        ]
     else:
         surfaces, wanted_tables, scan_records = (
             VERSION_SURFACES,
             VERSION_TABLES_MANIFEST_ONLY,
             [],
         )
+        baseline_keys = []
     exact_matrix_observation(
-        evidence, surfaces=surfaces, tables=wanted_tables, scan_records=scan_records
+        evidence,
+        matrix_shape(surfaces),
+        tables=wanted_tables,
+        scan_records=scan_records,
+        scan_baseline=baseline_keys,
+        word=4 if target_bits == 32 else 8,
+        extras="canary" if scanned else None,
     )
     # The discovery-skip bound lives in exact_canary_discovery_skips: none,
     # plus at most one retained internal loss, on every lane. exact_common
@@ -5629,9 +5951,12 @@ def validate_induced(lane, document):
         # sixteen).
         exact_matrix_observation(
             evidence,
-            surfaces=VERSION_SURFACES_SCANNED,
+            VERSION_SHAPE_SCANNED,
             tables=VERSION_TABLES_SCANNED,
             scan_records=MATRIX_SCAN_BASELINE_LP64,
+            scan_baseline=[((2, 40), 68), ((2, 40), 68), ((3, 0), 92)],
+            word=8,
+            extras=None,
         )
         # Known-prefix scan (owner-approved 2026-09-27): the retired
         # version skip is never emitted, so G4 carries no discovery skip
@@ -5641,9 +5966,12 @@ def validate_induced(lane, document):
     else:
         exact_matrix_observation(
             evidence,
-            surfaces=VERSION_SURFACES_SCANNED,
+            VERSION_SHAPE_SCANNED,
             tables=VERSION_TABLES_SCANNED,
             scan_records=MATRIX_SCAN_BASELINE_LP64,
+            scan_baseline=[((2, 40), 68), ((2, 40), 68), ((3, 0), 92)],
+            word=8,
+            extras=None,
         )
         exact_common(evidence, aliases=[], skipped=[], in_flight=0)
         exact_counters(
@@ -5840,12 +6168,43 @@ def kernel_control_fixture():
 
 
 def version_tables_fixture(counter):
-    tables = [{"source": source, "version": list(version), "entries": entries}
-              for (source, version, entries), count in counter.items()
-              for _ in range(count)]
+    manifest_need = Counter(
+        (tuple(version), entries)
+        for (source, version, entries), count in counter.items()
+        if source == "manifest"
+        for _ in range(count)
+    )
+    tables = []
+    for row in MATRIX_MANIFEST_TABLES:
+        key = (tuple(row["version"]), row["entries"])
+        if manifest_need[key] > 0:
+            manifest_need[key] -= 1
+            tables.append(dict(row))
+    scan_rows = []
+    for key, count in counter.items():
+        if key[0] != "scan":
+            continue
+        for _ in range(count):
+            scan_rows.append(key)
     # Disjoint synthetic offsets, not a claim about one linker layout.
-    for index, table in enumerate(table for table in tables if table["source"] == "scan"):
-        table["file_offset"] = 4096 * (index + 1)
+    for index, key in enumerate(scan_rows):
+        (major, minor), entries = key[1], key[2]
+        contract = MATRIX_SCAN_ROW_CONTRACT.get(((major, minor), entries))
+        if contract is None:
+            linkage, agreeing = "heuristic", None
+        else:
+            linkages, agreeing = contract
+            linkage = "live_return" if "live_return" in linkages else "heuristic"
+        tables.append(
+            {
+                "source": "scan",
+                "version": [major, minor],
+                "entries": entries,
+                "file_offset": 4096 * (index + 1),
+                "linkage": linkage,
+                "exports_agreeing": agreeing,
+            }
+        )
     return tables
 
 
@@ -7406,6 +7765,73 @@ def self_test():
     # build; any drift fails here, before the fixtures below consume it.
     matrix_fixture_transcription_matches_source()
     print("matrix fixture transcription matches the canary build: OK")
+    # Wiring: the transcription check must end at the byte-exact backstop
+    # (dropping that call would silently re-admit everything the
+    # fine-grained pins cannot see).
+    with open(__file__, encoding="utf-8") as handle:
+        own_source = handle.read()
+    transcription_body = own_source.split(
+        "def matrix_fixture_transcription_matches_source():", 1
+    )[1].split("\ndef ", 1)[0]
+    require(
+        "matrix_fixture_bytes_match_live()" in transcription_body,
+        "transcription check lost its byte-exact call",
+    )
+    # Patch-table mechanism: exact-once application, chained rewrites, and
+    # loud failure on missing or ambiguous old text.
+    require(
+        apply_fixture_patches(b"abc", ()) == b"abc",
+        "empty patch table must be the identity",
+    )
+    require(
+        apply_fixture_patches(
+            b"abc", ((b"b", b"B", "test"), (b"B", b"BB", "test"))
+        )
+        == b"aBBc",
+        "patches must chain in order",
+    )
+    for bad_patches in (
+        ((b"z", b"q", "test"),),
+        ((b"a", b"q", "test"),),
+    ):
+        try:
+            apply_fixture_patches(b"aaXaa", bad_patches)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("patch table accepted a bad application")
+    print("matrix fixture patch table applies exactly once: OK")
+    # The byte comparison normalises line endings and nothing else — not
+    # even in the future: this static check reads the comparison code
+    # itself and rejects any normaliser construct.
+    with open(__file__, encoding="utf-8") as handle:
+        fixture_bytes_comparison_has_no_normaliser(handle.read())
+    for bad_snippet in (
+        "x = re.sub(a, b)",
+        "x.strip(",
+        "x.lower(",
+        "x.upper(",
+        "x.split(",
+        "x.casefold(",
+        "collapse_ws(x)",
+        "normalize(x)",
+        "unicodedata.normalize(x)",
+        "x.encode(",
+        "x.decode(",
+        "import difflib",
+        'x.replace("a", "b")',
+    ):
+        try:
+            fixture_bytes_comparison_has_no_normaliser(
+                "def f(): return " + bad_snippet
+            )
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "normaliser self-check missed: " + bad_snippet
+            )
+    print("matrix fixture comparison has no normaliser: OK")
 
     version = evidence_fixture(
         VERSION_SURFACES_SCANNED,
@@ -8655,6 +9081,50 @@ def self_test():
         else:
             raise AssertionError(f"induced {lane} missed the {past} scan table")
         print(f"induced {lane} rejects the {past} scan table row: OK")
+    # Full-row kills: a malformed scan row (untyped linkage, Counter and
+    # multiset intact) must fail at the typed row layer, and an extra scan
+    # row (surfaces intact) must fail at the table signature.
+    for lane in ("G4", "G5"):
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan" and table["version"] == [3, 0]
+        )
+        victim["linkage"] = None
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix table row has untyped fields"),
+                f"induced {lane} malformed row rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the malformed row")
+        print(f"induced {lane} rejects the malformed scan table row: OK")
+        bad = copy.deepcopy(induced[lane])
+        tables = bad["evidence"]["discovery"][0]["tables"]
+        tables.append(
+            dict(
+                next(
+                    table
+                    for table in tables
+                    if table["source"] == "scan" and table["version"] == [3, 0]
+                )
+            )
+        )
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("unexpected discovery tables"),
+                f"induced {lane} extra row rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the extra row")
+        print(f"induced {lane} rejects the extra scan table row: OK")
 
     bad = copy.deepcopy(induced["G3"])
     bad["evidence"]["rv_update_failures"] = 1

@@ -19,7 +19,8 @@ STAGE, CHECKOUT = "stage", "checkout"
 SELF = "scripts/runner_inputs.py"
 # Every declared .sh input is launched directly and must be executable,
 # except these, which are only sourced (`. scripts/lib.sh`) or read.
-SOURCED = ("scripts/cleanup-traps.sh", "scripts/lib.sh", "scripts/product-build.sh")
+SOURCED = ("scripts/cleanup-traps.sh", "scripts/lib.sh", "scripts/product-build.sh",
+           "scripts/prepared-dependency-tools.sh", "scripts/prepared-dependency-snapshot.sh")
 # Runs a mode's self-test suite strictly, in a copy of that mode's declared
 # inputs (no skip passes; an undeclared file is absent there).
 _STRICT = "scripts/strict-selftest.py"
@@ -84,7 +85,18 @@ _MATRIX_SELF_TEST = (
     "scripts/lane-lib-oracle-3.py", "scripts/lane-lib-oracle-4.py", "scripts/lane-lib-oracle-5.py",
     "scripts/lane-lib-oracle-6.py", "scripts/lib.sh", "scripts/native/dump-task-storage.bpf.c",
     "scripts/native/dump-task-storage.c", "scripts/product-build.sh",
-    "scripts/qualify-task-storage-canary.py", "scripts/recorded-process-exec.py", "scripts/verify-canaries.sh")
+    "scripts/qualify-task-storage-canary.py", "scripts/recorded-process-exec.py", "scripts/verify-canaries.sh",
+    # Closure reachability via the matrix-build guard test, which reads the
+    # induced-gaps script for its provider builds; the walk pulls the whole
+    # transitive graph. Checkout-only (this tuple), never staged.
+    "scripts/verify-induced-gaps.sh", "scripts/lane-induced-gaps-oracle-1.py",
+    "scripts/lane-induced-gaps-oracle-2.py", "scripts/lane-induced-gaps-oracle-3.py",
+    "scripts/lane-induced-gaps-oracle-4.py", "scripts/lane-induced-gaps-oracle-5.py",
+    "scripts/lane-induced-gaps-oracle-6.py", "scripts/lane-induced-gaps-oracle-7.py",
+    "scripts/check-prepared-dependencies.py", "scripts/prepared-dependency-evidence.py",
+    "scripts/prepared-dependency-snapshot.sh", "scripts/prepared-dependency-tools.sh",
+    "scripts/merge-checksum-ledgers.py", "crates/discover/tests/fixture/provider.c",
+    "crates/discover/tests/fixture/helper.c")
 
 # runner -> mode -> (where the mode runs, its inputs). A `stage` mode runs
 # from the checkout-free release stage; a `checkout` mode only from a

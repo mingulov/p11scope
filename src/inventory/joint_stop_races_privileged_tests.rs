@@ -5344,9 +5344,10 @@ fn seal_cell_across_stop(force_shed: bool) -> Result<()> {
             shed.foreign,
         );
         ensure!(
-            matches!(branch, JointBranch::CallsShed | JointBranch::ReceiptStarved),
-            "{tag}: SHED: zero installs with the default link latch take the \
-             typed shed/starved branch (got {branch:?})",
+            matches!(branch, JointBranch::CallsShed),
+            "{tag}: SHED: zero installs with the default link latch, no \
+             starved receipt and unproven shed take the shed branch \
+             (got {branch:?})",
         );
         ensure!(
             finish == "published",

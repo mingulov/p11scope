@@ -305,6 +305,27 @@ class StaticValidationTests(unittest.TestCase):
         self.assertIn("privileged-lib runner declaration cannot be read", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_missing_privileged_runner_is_typed_refusal(self):
+        checker = load_script(CHECKER, "known_failing_checker_runner_absent")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            problems = checker.validate_privileged_runner(
+                root, [{"runner": "privileged-lib", "test": "x"}])
+            self.assertTrue(any("scripts/run-privileged-lib-tests.sh is missing" in problem
+                                for problem in problems))
+
+    def test_missing_suite_registry_fails_registration_typed(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        (f.root / "scripts/run-python-suites.py").unlink()
+        f.rows([row()])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("suite invocation is not registered in scripts/run-python-suites.py", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
         self.assert_bad_row(row(runner="privileged-lib"), "refused until")
 
@@ -971,6 +992,65 @@ class StaticWiringTests(unittest.TestCase):
 class StrictNullAdmissionTests(unittest.TestCase):
     SCALARS = ("null", "0", "[]")
 
+    def test_missing_static_registry_follows_row_policy(self):
+        checker = load_script(CHECKER, "known_failing_checker_registry_absent")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            self.assertEqual(checker.validate_ignored_known_failing(root, []), [])
+            problems = checker.validate_ignored_known_failing(root, [{"path": "tests/x.rs"}])
+            self.assertTrue(any("missing ignored-test registry" in problem for problem in problems))
+
+    def test_invalid_json_documents_are_typed_refusals(self):
+        f = fixture(self)
+        target = f.root / "bad-known-failing.json"
+        target.write_text("{oops\n", encoding="utf-8")
+        result = f.run_checker("--list", str(target))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        g = fixture(self)
+        target = g.root / "results.json"
+        target.write_text("{oops\n", encoding="utf-8")
+        result = g.run_checker("--results", str(target))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_documents_are_typed_refusals(self):
+        f = fixture(self)
+        result = f.run_checker("--results", str(f.root / "absent.json"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing file", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        g = fixture(self)
+        (g.root / "tests/known-failing.json").unlink()
+        result = g.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing known-failing list", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        h = fixture(self)
+        shutil.rmtree(h.root / ".github/workflows")
+        result = h.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing workflow directory", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_limitations_means_no_registry(self):
+        f = fixture(self)
+        (f.root / "docs/known-limitations.md").unlink()
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_static_registry_follows_row_policy(self):
+        checker = load_script(CHECKER, "known_failing_checker_registry_absent")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            self.assertEqual(checker.validate_ignored_known_failing(root, []), [])
+            problems = checker.validate_ignored_known_failing(root, [{"path": "tests/x.rs"}])
+            self.assertTrue(any("missing ignored-test registry" in problem for problem in problems))
+
     def test_undecodable_documents_are_typed_refusals(self):
         cases = (
             ("null-known-failing.json", b'{"rows": [\xff]}\n', ["--list"], "cannot read known-failing list"),
@@ -1168,6 +1248,13 @@ class RustDiscoveryTests(unittest.TestCase):
             root = Path(temporary)
             (root / ".release-rust-version").write_bytes(b"1.99.1\xff\n")
             self.assertFalse(checker.cargo_list_probe(root, rust_row))
+
+    def test_missing_toolchain_file_fails_probe_closed(self):
+        checker = load_script(CHECKER, "known_failing_checker_toolchain_absent")
+        rust_row = row(path="tests/inventory_command.rs", test="inventory::privileged_tests::example_cell",
+                       runner="privileged-lib")
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertFalse(checker.cargo_list_probe(Path(temporary), rust_row))
 
 
 class ScopedLegacyDeclarationTests(unittest.TestCase):
@@ -1411,6 +1498,21 @@ class FragmentAdmissionTests(unittest.TestCase):
                     self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
                                      "fragment_invalid")
 
+    def test_missing_fragment_is_fragment_invalid(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_absent_fragment")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            output = temp / "merged.json"
+            problems = runner.merge_typed_fragments(
+                [(temp / "absent.json", "test_sample.py", [], 1)], output, "github")
+            document = json.loads(output.read_text(encoding="utf-8"))
+            rows = {item["test"]: item for item in document["results"]}
+            self.assertTrue(problems)
+            self.assertEqual(rows["<suite-process>"]["state"], "failed")
+            self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                             "fragment_invalid")
+
     def test_undecodable_fragment_is_fragment_invalid(self):
         runner = load_script(ROOT / "scripts/run-python-suites.py",
                              "python_suite_runner_undecodable")
@@ -1561,6 +1663,15 @@ class WrapperFileTests(unittest.TestCase):
             document = json.loads(fragment.read_text(encoding="utf-8"))
             self.assertFalse(document["complete"])
 
+    def test_empty_suite_completes_false(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            suite = temp / "test_empty.py"
+            suite.write_text("", encoding="utf-8")
+            _result, fragment = self.run_wrapper(temp, suite)
+            document = json.loads(fragment.read_text(encoding="utf-8"))
+            self.assertFalse(document["complete"])
+
 
 class DriverReadTests(unittest.TestCase):
     def test_unreadable_driver_reports_typed(self):
@@ -1571,6 +1682,7 @@ class DriverReadTests(unittest.TestCase):
             (temp / "driver/bad.py").write_bytes(b"x = \xff\n")
             read = runner.read_driver(temp)
             self.assertIsNone(read("driver/bad.py"))
+            self.assertIsNone(read("driver/absent.py"))
             problems = runner.registry_problems(set(), [], {"x.py": "driver/bad.py"}, {}, read)
             self.assertTrue(any("does not exist" in problem for problem in problems))
 
@@ -1998,6 +2110,51 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(needle, result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_rejects_bad_host_and_shapes_typed(self):
+        converter = ROOT / "scripts/ci/privileged-lib-results.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text("X\n")
+            verdicts.write_text("X\tPASS\n")
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                     str(verdicts), str(output), "mars"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unknown host", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            verdicts.write_text("X\n")
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                     str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("malformed verdict line", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            selection.write_text("")
+            verdicts.write_text("")
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                     str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("selection is empty or duplicated", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_missing_selection_is_typed(self):
+        converter = ROOT / "scripts/ci/privileged-lib-results.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            verdicts.write_text("X\tPASS\n")
+            result = subprocess.run([sys.executable, "-I", str(converter), str(temp / "absent.txt"),
+                                     str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot read structured records", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     def test_converter_maps_healthy_registry(self):
         with tempfile.TemporaryDirectory() as temporary:

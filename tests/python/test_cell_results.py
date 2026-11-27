@@ -462,6 +462,21 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing results file", result.stderr)
 
+    def test_blank_lines_and_empty_require_file_are_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text("\n" + json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                                     "qualification": "qualified"}) + "\n\n",
+                                 encoding="utf-8")
+            require_path = temp / "require.txt"
+            require_path.write_text("", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path),
+                 "--require-file", str(require_path)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_duplicate_expected_names_fail(self):
         rows = [row("known", False, "expected-failure", "bug")]
         result = run_checker(rows, "--expected-failure", "known", "--expected-failure", "known")
@@ -752,6 +767,24 @@ class TypedCellResultsTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("missing or invalid JSON", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_unknown_option_is_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                             "qualification": "qualified"}) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path), "--bogus"],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unknown option", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_sidecar_is_silent_none(self):
+        module = load_script(CHECKER, "cell_checker_sidecar_absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(module.cell_sidecar_signature(Path(tmp), "a"), (None, None))
 
     def test_undecodable_require_file_is_typed_refusal(self):
         with tempfile.TemporaryDirectory() as tmp:

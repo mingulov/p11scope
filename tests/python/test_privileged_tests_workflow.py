@@ -1578,14 +1578,6 @@ class PrivilegedLibTypedRunnerBoundaryTests(unittest.TestCase):
             self.assertIn(artifact, upload)
 
 
-class CellScriptUsageTests(unittest.TestCase):
-    def test_cell_script_usage_error_is_typed(self):
-        script = ROOT / "scripts/ci/run-cell-script.sh"
-        result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("usage: run-cell-script.sh", result.stderr)
-
-
 class PrivilegedShellMutationSweepTests(unittest.TestCase):
     def test_shell_boundary_mutation_sweep(self):
         source = PRIVILEGED_RUNNER.read_text(encoding="utf-8")

@@ -9751,8 +9751,11 @@ fn identity_of_in_mountinfo_with_reread(
 /// The re-read receives the budget, so the retry's table open and the
 /// second resolution charge the same allowance as the first. A
 /// healable stop during the re-read preempts the first error: the
-/// stop is transient-global and must wait, while any other re-read
-/// failure keeps today's first error unchanged.
+/// stop is transient-global and must wait. A named pool park refusal
+/// preempts too: the fresh table was never consulted, so the stale
+/// missing-mount claim is unverified and the transient-global refusal
+/// must wait instead. Any other re-read failure keeps today's first
+/// error unchanged.
 fn reread_on_missing_mount(
     first: Result<MappingFileKey, String>,
     file: &std::fs::File,
@@ -9763,6 +9766,7 @@ fn reread_on_missing_mount(
         Err(error) if is_missing_mount_id_error(&error) => match reread(budget) {
             Ok(fresh) => identity_of_in_mountinfo(file, &fresh, budget),
             Err(stop) if mountinfo_detail_is_healable_stop(&stop) => Err(stop),
+            Err(refused) if mountinfo_detail_is_park_refusal(&refused) => Err(refused),
             Err(_) => Err(error),
         },
         outcome => outcome,
@@ -17956,6 +17960,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_re_read_with_a_park_refusal_reports_the_refusal() {
+        let file = open_regular(Path::new("/bin/sh")).unwrap();
+        let observer = mapping_file_key(&file).unwrap();
+        assert_ne!(
+            observer.mount_id, 999999,
+            "fixture assumes the fd's mount row is absent from the stale table"
+        );
+        let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
+        let refused = format!(
+            "{} ({} bytes read so far)",
+            crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+            11
+        );
+        let error = identity_of_in_mountinfo_with_reread(&file, stale, || Err(refused.clone()))
+            .expect_err("a refused re-read must report the refusal");
+        assert_eq!(
+            error, refused,
+            "a pool refusal preempts the unverified missing-mount claim"
+        );
+    }
+
     /// Re-read preemption twin (finding 2): a healable stop during the
     /// mount-table re-read preempts the first missing-mount error — the
     /// stop is transient-global and must wait, while any other re-read
@@ -23333,26 +23359,30 @@ mod tests {
 
     /// The map_files fallback routes a park refusal inside its unproven
     /// detail to the typed wait (keeping the composed gap text) instead
-    /// of filing fallback-unproven; other details are unchanged.
+    /// of filing fallback-unproven; other details are unchanged. Both
+    /// the bare sentence and the production mount-table wrapper classify.
     #[test]
     fn map_files_refusal_park_refusal_waits() {
-        let detail = format!(
+        let bare = format!(
             "{} ({} bytes read so far)",
             crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
             3
         );
-        assert_eq!(
-            PinOutcome::for_map_files_refusal(
-                "gap".into(),
-                PinMapFilesRefusal::Unproven(detail.clone())
-            ),
-            PinOutcome::Wait {
-                cause: WaitCause::ParkRefused,
-                retry: RetryOwner::ViewRescan,
-                reason: format!("gap (map_files fallback: {detail})"),
-            },
-            "a park refusal waits with the composed gap text"
-        );
+        let wrapped = crate::discovery::scan::mount_table_read_reason(7, &bare);
+        for detail in [bare, wrapped] {
+            assert_eq!(
+                PinOutcome::for_map_files_refusal(
+                    "gap".into(),
+                    PinMapFilesRefusal::Unproven(detail.clone())
+                ),
+                PinOutcome::Wait {
+                    cause: WaitCause::ParkRefused,
+                    retry: RetryOwner::ViewRescan,
+                    reason: format!("gap (map_files fallback: {detail})"),
+                },
+                "a park refusal waits with the composed gap text"
+            );
+        }
         assert_eq!(
             PinOutcome::for_map_files_refusal(
                 "gap".into(),
@@ -23430,6 +23460,7 @@ mod tests {
             WaitCause::HandleExhaustion,
             WaitCause::ReserveStop,
             WaitCause::BudgetStop,
+            WaitCause::ParkRefused,
             WaitCause::IoCeiling,
             WaitCause::WorkCeiling,
             WaitCause::Deadline,

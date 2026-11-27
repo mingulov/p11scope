@@ -60514,7 +60514,7 @@ fn waited_member_outcome_keeps_the_budget_stop_record() {
             "{cause:?} under an already-stopped budget never got a turn"
         );
     }
-    for cause in [HandleExhaustion, ReserveStop, BudgetStop] {
+    for cause in [HandleExhaustion, ReserveStop, BudgetStop, ParkRefused] {
         assert_eq!(
             waited_member_outcome(None, &[cause]),
             None,

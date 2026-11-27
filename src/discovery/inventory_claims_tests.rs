@@ -1093,6 +1093,12 @@ fn merge_ownership_e8_release_drains_released_owner_pins() {
         !fixture.engine.pinned.carried_ids().contains(&x_object),
         "the drained pin does not linger as carried coverage"
     );
+    assert!(
+        !fixture.engine.plan.slots.iter().any(|slot| {
+            fixture.engine.plan.is_active(slot.index) && slot.object == x_object
+        }),
+        "the drained pin keeps no active slots (retired rows may linger as tombstones)"
+    );
     mo_assert_owner_live(
         &fixture.engine.pinned,
         &fixture.engine.modules,
@@ -1103,6 +1109,294 @@ fn merge_ownership_e8_release_drains_released_owner_pins() {
     assert!(
         fixture.engine.pinned.summary(shared).is_some(),
         "the shared pin stays resolvable (scoped release drain)"
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_preserves_pin_shared_with_a_carried_view() {
+    // E8 x carried-shared: R and X share one provider file, L owns a
+    // distinct file. After E1 carries R, releasing X must preserve the
+    // shared pin: R's retained carried module still rides and keeps its
+    // active slot ("retained carried ride"), while X's own view and
+    // modules are gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_x = mo_reassign(providers[0].clone(), fixture.view_x);
+    let module_l = mo_reassign(providers[1].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_x)
+            .expect("X's module seeded")
+            .object,
+        shared,
+        "R and X share one canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the shared pin is resolvable before release"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == fixture.view_r),
+        "R's module rides before release"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == shared }),
+        "the shared object has an active slot before release"
+    );
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the carried shared pin survives X's release"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == fixture.view_r),
+        "R's retained carried module still rides after X's release"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == shared }),
+        "the carried shared pin keeps an active slot after X's release"
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_shared_pin_with_live_and_carried_riders_survives() {
+    // E8 x both: R, X and L all share one provider file. After E1
+    // carries R, releasing X preserves the shared pin for the live
+    // claimant L and the carried rider R; X itself is fully gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_x = mo_reassign(providers[0].clone(), fixture.view_x);
+    let module_l = mo_reassign(providers[0].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_x)
+            .expect("X's module seeded")
+            .object,
+        shared,
+        "R and X share one canonical pin"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_live)
+            .expect("L's module seeded")
+            .object,
+        shared,
+        "L shares the same canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the shared pin survives X's release"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == fixture.view_r),
+        "R's retained carried module still rides after X's release"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == shared }),
+        "the shared pin keeps an active slot after X's release"
+    );
+    mo_assert_owner_live(
+        &fixture.engine.pinned,
+        &fixture.engine.modules,
+        &fixture.engine.plan,
+        fixture.view_live,
+        "scoped release riders",
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_pin_shared_with_a_live_claimant_survives() {
+    // E8 x live-shared: X and L share one provider file; R owns a
+    // distinct file and is carried. Releasing X preserves the shared
+    // pin for the live claimant L through both retention paths (L's
+    // claims and the riding-module keep set); X itself is fully gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[1].clone(), fixture.view_r);
+    let module_x = mo_reassign(providers[0].clone(), fixture.view_x);
+    let module_l = mo_reassign(providers[0].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_x)
+        .expect("X's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_live)
+            .expect("L's module seeded")
+            .object,
+        shared,
+        "X and L share one canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the live-shared pin survives X's release"
+    );
+    mo_assert_owner_live(
+        &fixture.engine.pinned,
+        &fixture.engine.modules,
+        &fixture.engine.plan,
+        fixture.view_live,
+        "scoped release live-shared",
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_owner_without_filed_custody_succeeds() {
+    // E8 x no-custody: X is a retained owner that never filed any pin
+    // custody (no modules seeded, so no ownership row exists and the
+    // removal returns None). The release still succeeds as a benign
+    // no-op drain: X's view and record drop, other owners are
+    // untouched. Occurrence of the None path in this fixture is proven
+    // separately by running it under an expect() probe (must panic).
+    let mut fixture = mo_owners();
+    assert!(
+        fixture.engine.pinned.view_claims(fixture.view_x).is_none(),
+        "X files no custody before release"
+    );
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .any(|view| view.id() == fixture.view_live),
+        "the live owner stays listed"
+    );
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .any(|view| view.id() == fixture.view_r),
+        "the carried owner stays listed"
     );
 }
 

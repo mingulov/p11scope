@@ -666,11 +666,28 @@ impl Engine {
             }
         }
         let mut pinned = self.pinned.clone();
-        pinned.retire_view_only_if_proven_gone(
+        // E8 keeps every still-referenced object: live riders keep
+        // theirs through their own claims, but carried views ride
+        // claimless by design, so objects referenced by retained
+        // carried or non-owner modules must be carried through the
+        // removal explicitly — otherwise releasing their last claimant
+        // would purge the shared pin and the retained carried module
+        // and slot would vanish with it. The released owner's own
+        // modules do not ride (filtered below), so owner-only pins
+        // still drain. Unresolvable keep members are no-ops.
+        let keep: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view != owner)
+            .map(|module| module.object)
+            .filter(|id| pinned.summary(*id).is_some())
+            .collect();
+        pinned.retire_view_except_proven(
             owner,
             // Scoped release is a management decision to stop tracking
             // this owner: re-acquire re-proves from scratch.
             crate::discovery::refresh_queue::RetirementProof::OperatorRemoval,
+            &keep,
         );
         let modules: Vec<_> = self
             .modules

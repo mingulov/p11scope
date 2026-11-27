@@ -93,6 +93,62 @@ def load_capture_checker():
     return load_path(CAPTURE_CHECKER, "capture_evidence")
 
 
+# Test-owned statement of the thirteen manifest surface labels, in fixture
+# order (legacy first, then interfaces 0..12 skipping the vendor-only 9).
+# Transcribed here from the fixture plus the producer's classification
+# rules and verified against live captures — deliberately NOT imported
+# from the checker, so a derivation bug in the checker cannot hide behind
+# fixtures built from the same derivation.
+MATRIX_LABEL_ROWS = (
+    "legacy_function_list",
+    "interface[0] exact_standard",
+    "interface[1] exact_standard",
+    "interface[2] exact_standard",
+    "interface[3] exact_standard",
+    "interface[4] exact_standard",
+    "interface[5] exact_standard",
+    "interface[6] corroborated_standard_prefix",
+    "interface[7] corroborated_standard_prefix",
+    "interface[8] corroborated_standard_prefix",
+    "interface[10] corroborated_standard_prefix",
+    "interface[11] exact_standard",
+    "interface[12] corroborated_standard_prefix",
+)
+
+
+# Test-owned statement of the thirteen manifest (version, functions, walk)
+# rows in the same fixture order. Interface[12]'s anonymous page-edge name
+# is refused under provider-scoped read_name, so it corroborates
+# (known_prefix, 104) instead of reading exact.
+MATRIX_MANIFEST_ROWS = [
+    ((2, 40), 68, "full"), ((2, 40), 68, "full"),
+    ((3, 0), 92, "full"), ((3, 1), 92, "full"),
+    ((3, 2), 104, "full"), ((3, 9), 104, "known_prefix"),
+    ((4, 0), 68, "known_prefix"), ((3, 2), 104, "known_prefix"),
+    ((3, 0), 92, "known_prefix"), ((3, 1), 92, "known_prefix"),
+    ((2, 40), 68, "known_prefix"), ((0, 0), 0, "not_walked"),
+    ((3, 2), 104, "known_prefix"),
+]
+
+
+def typed_matrix_surfaces(module_path, manifest, scan):
+    """Surface dicts from test-owned literals: manifest is thirteen
+    ((major, minor), functions, walk) rows in fixture order, scan is
+    ((major, minor), functions, walk) decoded-table rows."""
+    assert len(manifest) == len(MATRIX_LABEL_ROWS) == 13
+    dicts = [
+        {"source": source, "walk": walk, "acquisition": "ok",
+         "functions": functions}
+        for source, (_, functions, walk) in zip(MATRIX_LABEL_ROWS, manifest)
+    ]
+    dicts.extend(
+        {"source": f"{module_path} table {version[0]}.{version[1]}",
+         "walk": walk, "acquisition": "ok", "functions": functions}
+        for version, functions, walk in scan
+    )
+    return dicts
+
+
 def owned_metrics_document(bits, calls=30):
     subject = load_capture_checker()
     evidence = subject.evidence_fixture(
@@ -102,9 +158,10 @@ def owned_metrics_document(bits, calls=30):
     )
     evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
         subject.VERSION_TABLES_SCANNED)
-    evidence["surfaces"] = subject.canary_surface_dicts(
-        evidence["discovery"][0]["path"], subject.MATRIX_SCAN_BASELINE_LP64
-    )
+    scan = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
+            ((3, 0), 92, "full")]
+    evidence["surfaces"] = typed_matrix_surfaces(
+        evidence["discovery"][0]["path"], MATRIX_MANIFEST_ROWS, scan)
     evidence.update(
         table_entries=1056,
         slots=104,
@@ -3370,6 +3427,46 @@ class RingLayoutTests(unittest.TestCase):
                 retained, "default-safe-profile", 0x555, positions)
 
 
+class MatrixBuildFlagsTests(unittest.TestCase):
+    # The checker's fixture transcription pins the fixture's own defaults;
+    # this pins the canary build invocations to privacy-only -D flags, so a
+    # shape-changing override (MATRIX/SINGLE/CAPACITY/BOUNDARY and friends)
+    # fails loudly instead of silently changing the provider under a stale
+    # expectation. Lives here, not in the checker: a staged script must not
+    # reference the build script (the staging closure would walk it
+    # transitively and demand it as a runner).
+    BUILD_SCRIPT = "scripts/verify-canaries.sh"
+
+    def script_text(self):
+        override = os.environ.get("MATRIX_BUILD_SCRIPT_OVERRIDE")
+        path = Path(override) if override else ROOT / self.BUILD_SCRIPT
+        return path.read_text(encoding="utf-8")
+
+    def test_canary_builds_override_no_fixture_shape_default(self):
+        joined = re.sub(r"\\\n[ \t]*", " ", self.script_text())
+        builds = {}
+        for line in joined.splitlines():
+            if "crates/discover/tests/fixture/version_matrix.c" not in line:
+                continue
+            step = re.findall(r"canary_build_step (\S+) gcc ", line)
+            target = re.findall(
+                r'-o "\$WORK/(matrix|privacy)-provider\.so" '
+                r"crates/discover/tests/fixture/version_matrix\.c",
+                line,
+            )
+            self.assertEqual((len(step), len(target)), (1, 1), line.strip())
+            name = ("matrix-provider" if target[0] == "matrix"
+                    else "privacy-provider")
+            self.assertEqual(step[0], name, line.strip())
+            self.assertNotIn(name, builds)
+            builds[name] = set(
+                re.findall(r"-D[A-Za-z_][A-Za-z0-9_]*(?:=\S+)?", line))
+        self.assertEqual(builds, {
+            "matrix-provider": {"-DPRIVACY_FIXTURE=1"},
+            "privacy-provider": {"-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1"},
+        })
+
+
 class VersionCanaryPrefixTests(unittest.TestCase):
     def recovered_profile(self):
         subject, document = self.profile(32)
@@ -3461,18 +3558,13 @@ class VersionCanaryPrefixTests(unittest.TestCase):
 
     def profile(self, bits=64, boundary=None):
         subject = load_capture_checker()
-        # Independently literal: interface[12]'s anonymous page-edge name
+        # Independently literal: walks/counts from MATRIX_MANIFEST_ROWS,
+        # labels from MATRIX_LABEL_ROWS — both test-owned, both live: the
+        # typed surface dicts below consume every field, so any drifted
+        # row fails validation. Interface[12]'s anonymous page-edge name
         # is refused under provider-scoped read_name, so it corroborates
         # (known_prefix, 104) instead of reading exact.
-        manifest = [
-            ((2, 40), 68, "full"), ((2, 40), 68, "full"),
-            ((3, 0), 92, "full"), ((3, 1), 92, "full"),
-            ((3, 2), 104, "full"), ((3, 9), 104, "known_prefix"),
-            ((4, 0), 68, "known_prefix"), ((3, 2), 104, "known_prefix"),
-            ((3, 0), 92, "known_prefix"), ((3, 1), 92, "known_prefix"),
-            ((2, 40), 68, "known_prefix"), ((0, 0), 0, "not_walked"),
-            ((3, 2), 104, "known_prefix"),
-        ]
+        manifest = MATRIX_MANIFEST_ROWS
         raw = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
                ((3, 0), 92, "full")]
         if bits == 32:
@@ -3490,9 +3582,7 @@ class VersionCanaryPrefixTests(unittest.TestCase):
              "file_offset": 4096 * (index + 1)}
             for index, (version, count, _) in enumerate(raw)
         ]
-        baseline = (subject.MATRIX_SCAN_BASELINE_IA32 if bits == 32
-                    else subject.MATRIX_SCAN_BASELINE_LP64)
-        evidence["surfaces"] = subject.canary_surface_dicts(module["path"], baseline)
+        evidence["surfaces"] = typed_matrix_surfaces(module["path"], manifest, raw)
         if boundary is not None:
             offset, count, walk = boundary
             module["tables"].append({

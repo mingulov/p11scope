@@ -3516,6 +3516,11 @@ int main(int argc, char **argv) {
                     interface_list="ok", discovery_conflicts=int(bits == 64), orphan_ops=1, operation_state_imports=1)
                 evidence["discovery"][0]["tables"] = capture["version_tables_fixture"](tables)
                 evidence["discovery"][0].update(corroborated=True, corroboration=["agreed" if bits == 32 else "conflict"])
+                # Scaffolding, not label coverage: these surfaces reuse the
+                # checker's own dict builder so the object-ledger assertions
+                # below run. Label/derivation coverage lives in the checker
+                # self-test and the independently literal
+                # test_canary_evidence fixtures.
                 baseline = capture["MATRIX_SCAN_BASELINE_IA32" if bits == 32 else "MATRIX_SCAN_BASELINE_LP64"]
                 evidence["surfaces"] = capture["canary_surface_dicts"](
                     evidence["discovery"][0]["path"], baseline)

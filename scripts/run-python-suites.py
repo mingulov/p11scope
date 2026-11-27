@@ -83,6 +83,7 @@ RUN = [
     ("test_discovery_retry_classes_oracle.py", []),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
+    ("test_guard_removal_sweep.py", []),
     ("test_canary_object.py", []),
     ("test_canary_observer_verbosity.py", []),
     ("test_ci_dependency_selection.py", []),

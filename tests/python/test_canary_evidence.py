@@ -32,7 +32,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 SUBJECT = ROOT / "scripts" / "check-canary-evidence.py"
 DUMPER = ROOT / "scripts" / "dump-owned-bpf-maps.py"
-CAPTURE_CHECKER = ROOT / "scripts" / "check-capture-evidence.py"
+# The guard-removal sweep points this at a temp mutated checker copy;
+# unset, it is the tree checker.
+CAPTURE_CHECKER = Path(
+    os.environ.get("P11SCOPE_CAPTURE_CHECKER_OVERRIDE", "")
+    or ROOT / "scripts" / "check-capture-evidence.py"
+)
 PROBE_ENTRY = ROOT / "tests" / "python" / "json_signal_lifetime_probe.py"
 
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -3598,6 +3603,9 @@ class VersionCanaryPrefixTests(unittest.TestCase):
             lambda d: scan_tables_of(d)[-1].update(source='manifest'),
             lambda d: scan_tables_of(d)[-1].update(exports_agreeing=1),
             lambda d: scan_tables_of(d)[-1].update(exports_agreeing=True),
+            # The (4,0,68) paired view sees only ordinal 3: exactly 1.
+            lambda d: scan_tables_of(d)[-2].update(exports_agreeing=0),
+            lambda d: scan_tables_of(d)[-2].update(exports_agreeing=3),
             lambda d: scan_tables_of(d)[-1].update(linkage='exports'),
             lambda d: scan_tables_of(d)[-2].update(file_offset=23713),
             lambda d: scan_tables_of(d)[-3].update(file_offset=23712),
@@ -3660,10 +3668,14 @@ class VersionCanaryPrefixTests(unittest.TestCase):
             [(version, count, walk) for version, count, walk, _, _ in raw])
         if boundary is not None:
             offset, count, walk = boundary
+            # Test-owned anchor derivation for the (3,1) terminal table,
+            # independent of the checker's list: agreement is exactly the
+            # exported ordinals below the entry count.
+            agreeing = sum(anchor < count for anchor in (3, 68, 69))
             module["tables"].insert(scan_block_end(module["tables"]), {
                 "source": "scan", "version": [3, 1], "entries": count,
                 "file_offset": offset, "linkage": "heuristic",
-                "exports_agreeing": 3 if count > 68 else (1 if count > 3 else 0),
+                "exports_agreeing": agreeing,
             })
             evidence["surfaces"].append({
                 "source": module["path"] + " table 3.1", "acquisition": "ok",
@@ -3691,6 +3703,14 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         for offset, count, walk in (
             (8 * page - 8 * 60, 59, "known_prefix"),
             (8 * page - 8 * 32, 31, "known_prefix"),
+            # Anchor boundaries: agreement is exactly the exported
+            # ordinals below the count (0, 1, 1, 2, 3). Each extra ends
+            # at its page boundary and trails the baseline tables.
+            (5 * page - 8 * 4, 3, "known_prefix"),
+            (5 * page - 8 * 5, 4, "known_prefix"),
+            (5 * page - 8 * 69, 68, "known_prefix"),
+            (5 * page - 8 * 70, 69, "known_prefix"),
+            (5 * page - 8 * 71, 70, "known_prefix"),
             # Full rows can cross a page; the report has no VMA-end witness.
             (8 * page - 8 * 60, 92, "full"),
             (7 * page, 92, "full"),
@@ -3715,6 +3735,10 @@ class VersionCanaryPrefixTests(unittest.TestCase):
             lambda d: scan_tables_of(d)[-1].update(version=[3, 2]),
             lambda d: scan_tables_of(d)[-1].update(source="manifest"),
             lambda d: scan_tables_of(d)[-1].update(exports_agreeing=2),
+            # Impossible agreements on the 59-entry row: only ordinal 3
+            # is in range, so exactly 1.
+            lambda d: scan_tables_of(d)[-1].update(exports_agreeing=0),
+            lambda d: scan_tables_of(d)[-1].update(exports_agreeing=3),
             lambda d: scan_tables_of(d)[-1].update(linkage="live_return"),
             lambda d: d["evidence"]["discovery"][0]["tables"].insert(
                 scan_block_end(d["evidence"]["discovery"][0]["tables"]),
@@ -3753,6 +3777,130 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             subject.validate_canary("default-safe-profile", ia32, 32)
 
+    def test_extra_count_and_offset_rules_refuse_their_violations(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        # Two terminal partials are not a pair: the counts rule fires.
+        subject, document = self.profile(
+            boundary=(8 * page - 8 * 60, 59, "known_prefix"))
+        module = document["evidence"]["discovery"][0]
+        module["tables"].insert(scan_block_end(module["tables"]), {
+            "source": "scan", "version": [3, 1], "entries": 60,
+            "file_offset": 5 * page - 8 * 61, "linkage": "heuristic",
+            "exports_agreeing": 1,
+        })
+        document["evidence"]["surfaces"].append({
+            "source": module["path"] + " table 3.1", "acquisition": "ok",
+            "walk": "known_prefix", "functions": 60,
+        })
+        with self.assertRaisesRegex(
+                AssertionError, "unrelated terminal fixture prefixes"):
+            subject.validate_canary("default-safe-profile", document)
+        # A complete row still needs an aligned offset.
+        subject, document = self.profile(
+            boundary=(8 * page - 8 * 60, 92, "full"))
+        scan_tables_of(document)[-1].update(
+            file_offset=scan_tables_of(document)[-1]["file_offset"] + 1)
+        with self.assertRaisesRegex(AssertionError, "invalid raw table offset"):
+            subject.validate_canary("default-safe-profile", document)
+        # An aligned partial must still end at its page boundary.
+        subject, document = self.profile(
+            boundary=(8 * page - 8 * 60, 59, "known_prefix"))
+        scan_tables_of(document)[-1].update(
+            file_offset=scan_tables_of(document)[-1]["file_offset"] + 8)
+        with self.assertRaisesRegex(
+                AssertionError, "does not end at its page boundary"):
+            subject.validate_canary("default-safe-profile", document)
+        # An extent past 2**64 overflows even from a valid offset.
+        subject, document = self.profile(
+            boundary=(8 * page - 8 * 60, 92, "full"))
+        scan_tables_of(document)[-1].update(file_offset=(1 << 64) - 8)
+        with self.assertRaisesRegex(AssertionError, "raw table extent overflows"):
+            subject.validate_canary("default-safe-profile", document)
+        # An extra without its exact source surface is unproven.
+        subject, document = self.profile(
+            boundary=(8 * page - 8 * 60, 59, "known_prefix"))
+        document["evidence"]["surfaces"].pop()
+        with self.assertRaisesRegex(
+                AssertionError, "lacks its exact source surface"):
+            subject.validate_canary("default-safe-profile", document)
+
+    def test_same_base_pair_rules_refuse_their_violations(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        # Mixed versions at one base are not a pair.
+        subject, document = self.recovered_profile()
+        next(table for table in scan_tables_of(document)
+             if table["version"] == [3, 2]).update(file_offset=23712)
+        with self.assertRaisesRegex(
+                AssertionError, "duplicate or conflicting same-base"):
+            subject.validate_canary("default-safe-profile", document, 32)
+        # Each paired view needs its own export witness.
+        for entries, agreeing in ((68, 0), (70, 1)):
+            with self.subTest(entries=entries, agreeing=agreeing):
+                offset = 8 * page - 8 * 71
+                subject, document = self.profile(
+                    boundary=(offset, 70, "known_prefix"))
+                module = document["evidence"]["discovery"][0]
+                module["tables"].insert(scan_block_end(module["tables"]), {
+                    "source": "scan", "version": [3, 1], "entries": 68,
+                    "file_offset": offset, "linkage": "heuristic",
+                    "exports_agreeing": 1,
+                })
+                document["evidence"]["surfaces"].append({
+                    "source": module["path"] + " table 3.1",
+                    "acquisition": "ok", "walk": "known_prefix", "functions": 68,
+                })
+                next(table for table in scan_tables_of(document)
+                     if table["version"] == [3, 1]
+                     and table["entries"] == entries).update(
+                         exports_agreeing=agreeing)
+                with self.assertRaisesRegex(
+                        AssertionError, "lacks its independent export witness"):
+                    subject.validate_canary("default-safe-profile", document)
+
+    def test_ia32_recovery_rules_refuse_their_violations(self):
+        # A single IA32 view needs its witness too.
+        subject, document = self.recovered_profile()
+        next(table for table in scan_tables_of(document)
+             if table["version"] == [3, 2]).update(exports_agreeing=0)
+        with self.assertRaisesRegex(
+                AssertionError, "lacks its independent export witness"):
+            subject.validate_canary("default-safe-profile", document, 32)
+        # A 92-entry IA32 extension needs its same-base common prefix.
+        subject, document = self.recovered_profile()
+        next(table for table in scan_tables_of(document)
+             if table["version"] == [4, 0] and table["entries"] == 92).update(
+                 file_offset=25088)
+        with self.assertRaisesRegex(
+                AssertionError, "lacks its same-base common prefix"):
+            subject.validate_canary("default-safe-profile", document, 32)
+
+    def test_extra_agreement_is_exact_at_every_anchor_boundary(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        for count, walk, bad in (
+            (69, "known_prefix", (0, 1, 3)),
+            (68, "known_prefix", (0, 2, 3)),
+            (70, "known_prefix", (1, 2)),
+            (92, "full", (0, 1, 2)),
+            (4, "known_prefix", (0, 2, 3)),
+            (3, "known_prefix", (1, 2, 3)),
+        ):
+            offset = (
+                8 * page - 8 * 60 if count == 92
+                else 5 * page - 8 * (count + 1)
+            )
+            with self.subTest(count=count):
+                subject, healthy = self.profile(boundary=(offset, count, walk))
+                subject.validate_canary("default-safe-profile", healthy)
+                for agreeing in bad:
+                    with self.subTest(agreeing=agreeing):
+                        document = copy.deepcopy(healthy)
+                        scan_tables_of(document)[-1].update(
+                            exports_agreeing=agreeing)
+                        self.assertNotEqual(document, healthy)
+                        with self.assertRaises(AssertionError):
+                            subject.validate_canary(
+                                "default-safe-profile", document)
+
 
 class OwnedMetricsOracleTests(unittest.TestCase):
     def test_owned_metrics_fixture_keeps_abi_specific_future_minor_scan(self):
@@ -3780,6 +3928,15 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     bad["evidence"]["discovery"][0]["tables"].remove(future[0])
                     with self.assertRaises(AssertionError):
                         capture.validate_canary("owned-default-metrics", bad, bits)
+
+    def test_owned_metrics_refuses_a_non_metrics_schema(self):
+        for bits in (32, 64):
+            with self.subTest(bits=bits):
+                capture, document = owned_metrics_document(bits)
+                bad = copy.deepcopy(document)
+                bad["schema"] = "profile"
+                with self.assertRaisesRegex(AssertionError, "^profile$"):
+                    capture.validate_canary("owned-default-metrics", bad, bits)
 
     def test_owned_metrics_require_exact_30_and_closed_run_evidence(self):
         canary = load_subject(TARGET_BITS)

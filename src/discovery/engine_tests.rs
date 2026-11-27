@@ -23462,17 +23462,26 @@ impl ShWrappedSleep {
             }
         }
         let child = command.die_with_parent().spawn().expect("spawn shell");
-        let pid = child.id();
-        wait_sh_wrapped_sleep_spawned(pid);
-        // Recorded for the `Drop` fallback: a fixture that cannot prove
-        // its grandchild set fails here with a named reason.
-        let grandchildren = sh_wrapped_sleep_grandchildren(pid)
-            .expect("ShWrappedSleep spawn records its grandchild");
-        Self {
-            pid,
+        // Custody FIRST: the guard exists (and `Drop` is armed) before
+        // any fallible proof runs, so a proof panic unwinds through
+        // cleanup instead of stranding the tree.
+        let mut this = Self {
+            pid: child.id(),
             child: Some(child),
-            grandchildren,
-        }
+            grandchildren: Vec::new(),
+        };
+        this.prove_tree();
+        this
+    }
+
+    /// Prove the wrapped tree settled and record it: waits for the
+    /// sleep grandchild, then records the OBSERVED list (no second read
+    /// that could race a shell exit). Panics loudly; safe on a
+    /// constructed guard because `Drop` owns cleanup on unwind.
+    fn prove_tree(&mut self) {
+        let observed = wait_sh_wrapped_sleep_spawned(self.pid);
+        self.grandchildren = parse_sh_children_list(&observed, self.pid)
+            .expect("ShWrappedSleep prove records its grandchild");
     }
 
     /// Wrap an arbitrary child for error-path tests: no recorded
@@ -23641,6 +23650,27 @@ fn sh_wrapped_sleep_drop_covers_an_unlistable_shell() {
     );
 }
 
+/// Error-path twin: a tree-proof failure on a constructed guard still
+/// cleans up — no leftover shell. An `sh` blocked in `read` never
+/// forks, so the 500-try bound trips deterministically (5 s nominal).
+#[test]
+fn sh_wrapped_sleep_failed_proof_leaves_no_process() {
+    let shell = std::process::Command::new("sh")
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn non-forking shell");
+    let mut guard = ShWrappedSleep::from_child_for_test(shell);
+    let pid = guard.pid;
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.prove_tree()));
+    assert!(loud.is_err(), "a never-forking shell must fail the proof");
+    drop(guard);
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "a failed proof still cleans up its shell"
+    );
+}
+
 /// A long-lived direct-sleeper fixture child with panic-safe cleanup.
 /// Constructors arm parent-death; `close` kills/reaps loudly; `Drop`
 /// repeats best-effort so a mid-test panic (including a loud readiness
@@ -23657,13 +23687,17 @@ impl ParkedSleep {
     /// Readiness and cleanup custody arrive together: no scan can run
     /// on an unproven child, and no panic path can leak it.
     fn spawn_parked(command: &mut std::process::Command) -> Self {
-        let child = command.die_with_parent().spawn().expect("spawn sleeper");
-        let pid = child.id();
-        wait_sleep_child_parked(pid);
-        Self {
-            pid,
-            child: Some(child),
-        }
+        // Custody first: prove on the constructed guard so a park panic
+        // unwinds through `Drop`.
+        let this = Self::spawn_unparked(command);
+        this.prove_parked();
+        this
+    }
+
+    /// Prove the child parked. Safe on a constructed guard: a panic
+    /// unwinds through `Drop`, which owns cleanup.
+    fn prove_parked(&self) {
+        wait_sleep_child_parked(self.pid);
     }
 
     /// Spawn `command` with parent-death armed but prove nothing: the
@@ -23698,8 +23732,15 @@ impl ParkedSleep {
     }
 
     fn close(mut self) {
+        // Fail-closed order (mirrors `ShWrappedSleep::close`): kill
+        // while the child is still in the guard, take only to wait, so
+        // a kill failure unwinds through `Drop` with custody intact.
+        self.child
+            .as_mut()
+            .expect("ParkedSleep closed twice")
+            .kill()
+            .expect("kill parked sleeper");
         let mut child = self.child.take().expect("ParkedSleep closed twice");
-        child.kill().expect("kill parked sleeper");
         child.wait().expect("reap parked sleeper");
     }
 }
@@ -23753,18 +23794,98 @@ fn parked_sleep_drop_kills_without_a_close() {
     );
 }
 
+/// Error-path twin: a proof failure on a constructed guard still
+/// cleans up — no leftover pid. An `sh` blocked in `read` never parks,
+/// so the spin bound trips deterministically (10 s nominal).
+#[test]
+fn parked_sleep_failed_proof_leaves_no_process() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "read line"]).stdin(std::process::Stdio::piped());
+    let guard = ParkedSleep::spawn_unparked(&mut cmd);
+    let pid = guard.pid();
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.prove_parked()));
+    assert!(loud.is_err(), "a never-parking child must fail the proof");
+    drop(guard);
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "a failed proof still cleans up its child"
+    );
+}
+
+/// `spawn_unparked` has no fallible step after `spawn`: a spawn failure
+/// is loud and creates no process, so there is no pid to strand.
+#[test]
+fn parked_sleep_unparked_spawn_failure_creates_no_process() {
+    let loud = std::panic::catch_unwind(|| {
+        ParkedSleep::spawn_unparked(&mut std::process::Command::new(
+            "/nonexistent-sleeper-xyz",
+        ));
+    });
+    assert!(loud.is_err(), "spawn failure is loud");
+}
+
+/// `close` on an already-reaped child fails loudly (kill answers
+/// ESRCH) without hanging: the unwind-time `Drop` finds the child
+/// still inside and its kill/wait no-op cleanly. The reap bypasses the
+/// handle (`Child` caches exit status, so a handle reap would make
+/// `kill` succeed).
+#[test]
+fn parked_sleep_close_on_reaped_child_fails_loud_without_hang() {
+    let raw = std::process::Command::new("true").spawn().unwrap();
+    let pid = raw.id();
+    let mut status = 0;
+    // SAFETY: blocking reap of our own just-exited child.
+    assert_eq!(
+        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+        pid as libc::pid_t,
+        "the probe child reaps behind its handle"
+    );
+    let guard = ParkedSleep::adopt_proven(raw);
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.close()));
+    let error = loud.expect_err("close on a reaped child must fail loudly");
+    let message = error.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(
+        message.contains("kill parked sleeper"),
+        "named failure reason, got {message:?}"
+    );
+}
+
+/// Load-bearing language guarantee behind custody-first constructors:
+/// a fully built local drops when a later statement panics, so proving
+/// on the constructed guard cannot leak on unwind.
+#[test]
+fn unwind_drops_a_constructed_guard_before_proof() {
+    struct Probe(std::rc::Rc<std::cell::Cell<bool>>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _probe = Probe(dropped.clone());
+        panic!("injected proof failure");
+    }));
+    assert!(loud.is_err(), "the injected failure panics");
+    assert!(dropped.get(), "unwind drops constructed locals");
+}
+
 /// Readiness for `sh -c` wrapped sleepers past a preload-presence poll:
 /// the poll proves one mapping, not a settled member — the loader may
 /// still be mapping the rest when it passes. The shell forks its sleep
 /// only past its own startup (loader included), so a live grandchild
 /// proves the member's maps final. (Do not park the shell pid itself:
 /// it `wait()`s, never `nanosleep`s.)
-fn wait_sh_wrapped_sleep_spawned(pid: u32) {
+/// Wait for the shell's first live grandchild and return the observed
+/// non-empty `children` text, so the caller records exactly what the
+/// wait saw instead of re-reading (which could race a shell exit).
+fn wait_sh_wrapped_sleep_spawned(pid: u32) -> String {
     for _ in 0..500 {
-        if std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-            .is_ok_and(|children| !children.trim().is_empty())
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         {
-            return;
+            if !children.trim().is_empty() {
+                return children;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -99426,15 +99547,25 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "{helper}: no parking construction"
         );
     }
-    // Guard constructors stay proved: the sh guard waits for its
-    // grandchild inside `spawn_inner`, the direct guard parks inside
-    // `spawn_parked`. Deleting either wait leaves every other needle
-    // green while reintroducing the scan-after-spawn race, so these
-    // whole-statement pins kill that revert (M13/M16).
+    // Guard constructors stay proved through custody-first methods:
+    // `spawn_inner`/`spawn_parked` construct, then call
+    // `prove_tree`/`prove_parked`, which wait and record. Deleting a
+    // call or a wait leaves every other needle green while
+    // reintroducing the scan-after-spawn race, so these whole-statement
+    // pins kill those reverts (M19a-M19d).
     let sh_spawn = needle_fn_body(source, "spawn_inner");
     assert!(
-        needle_stmt_line(sh_spawn, "wait_sh_wrapped_sleep_spawned(pid);").is_some(),
-        "sh guard: no grandchild wait in the constructor"
+        needle_stmt_line(sh_spawn, "this.prove_tree();").is_some(),
+        "sh guard: constructor never proves its tree"
+    );
+    let sh_prove = needle_fn_body(source, "prove_tree");
+    assert!(
+        needle_stmt_line(
+            sh_prove,
+            "let observed = wait_sh_wrapped_sleep_spawned(self.pid);"
+        )
+        .is_some(),
+        "sh guard: no grandchild wait in the proof"
     );
     let sh_wait = needle_fn_body(source, "wait_sh_wrapped_sleep_spawned");
     assert!(
@@ -99447,19 +99578,44 @@ fn stop_then_read_sites_settle_before_sigstop() {
     );
     let parked_spawn = needle_fn_body(source, "spawn_parked");
     assert!(
-        needle_stmt_line(parked_spawn, "wait_sleep_child_parked(pid);").is_some(),
-        "direct guard: no park in the constructor"
+        needle_stmt_line(parked_spawn, "this.prove_parked();").is_some(),
+        "direct guard: constructor never proves its park"
     );
-    // The sh guard records its grandchild set at construction and the
+    let parked_prove = needle_fn_body(source, "prove_parked");
+    assert!(
+        needle_stmt_line(parked_prove, "wait_sleep_child_parked(self.pid);").is_some(),
+        "direct guard: no park in the proof"
+    );
+    // The sh guard records its grandchild set in the proof and the
     // `Drop` fallback kills the recorded set: deleting either line
     // strands on the unlistable branch with every test still green.
     for stmt in [
-        ".expect(\"ShWrappedSleep spawn records its grandchild\");",
+        ".expect(\"ShWrappedSleep prove records its grandchild\");",
         "kill_sh_sleep_grandchildren(&self.grandchildren);",
     ] {
         assert!(
             needle_stmt_line(source, stmt).is_some(),
             "sh guard lost its recorded-set statement {stmt:?}"
+        );
+    }
+    // Both `close` methods kill while the child is still inside the
+    // guard and take only to wait: taking first would disarm `Drop`
+    // before the fail-closed kill (M20a/M20b).
+    for (kill, take) in [
+        (
+            ".expect(\"kill wrapped shell\");",
+            "let mut child = self.child.take().expect(\"ShWrappedSleep closed twice\");",
+        ),
+        (
+            ".expect(\"kill parked sleeper\");",
+            "let mut child = self.child.take().expect(\"ParkedSleep closed twice\");",
+        ),
+    ] {
+        let kill_at = needle_stmt_line(source, kill).unwrap_or_else(|| panic!("no {kill:?}"));
+        let take_at = needle_stmt_line(source, take).unwrap_or_else(|| panic!("no {take:?}"));
+        assert!(
+            kill_at < take_at,
+            "close must kill before it takes custody out: {kill:?} at {kill_at}, {take:?} at {take_at}"
         );
     }
     // Custody presence per converted site: (test, constructor marker,

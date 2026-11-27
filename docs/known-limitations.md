@@ -2977,6 +2977,11 @@ The old bounds are measurements, not a product startup SLA.
   same way; past both tiers the class is poisoned instead, so every
   revival-shaped first staging there gaps without consuming and
   uncertain pre-loss calls can never become positive attribution.
+  The poison set grows one entry per distinct evicted class past
+  both tiers; its keyspace is domains times attach objects
+  (at most 131072 per `--max-endpoints`), with no tight
+  cross-product bound since native domains mint unbounded, so the
+  census models the single-domain worst case.
   Room for a pass's folds is pre-evicted once per pass with a single
   window of probes; the due loop then only inserts. Both victim
   sweeps rotate oldest-first with a resume cursor, like the age drain,

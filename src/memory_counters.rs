@@ -1453,6 +1453,7 @@ mod tests {
     #[test]
     fn memory_line_stays_below_pipe_atomic_limit_at_caps() {
         use crate::caller_metadata::presentation::MAX_CALLER_METADATA_RECORDS;
+        use crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT;
         use crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES;
         use crate::discovery::caller_registry::{
             DEFAULT_MAX_CALLERS, DEFAULT_MAX_EDGES, DEFAULT_MAX_GAPS, DEFAULT_MAX_MODULES,
@@ -1484,7 +1485,11 @@ mod tests {
                 pair_folded: cap(65_536, 48),
                 pair_fold_lost: cap(65_536, 48),
                 pair_fold_lost_overflow: cap(65_536, 48),
-                pair_fold_lost_poisoned: cap(1024, 64),
+                // Single-domain worst case: every attach object poisons.
+                // Native domains mint unbounded, so no tight
+                // cross-product cap exists; multi-domain runs scale
+                // with distinct evicted classes past both exact tiers.
+                pair_fold_lost_poisoned: cap(MAX_INVENTORY_ENDPOINT_LIMIT as usize, 64),
                 preadmission: cap(4096, 112),
                 pending_ids: cap(65_536, 128),
                 placement_generations: cap(65_536, 64),

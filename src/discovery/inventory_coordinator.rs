@@ -46877,6 +46877,38 @@ int main(void) {
         assert_eq!(gaps, 4, "one gap per poisoned newcomer");
     }
 
+    /// The poison set grows per class past both exact tiers with no
+    /// 1024-class cap: 1030 distinct evicted classes fill both tiers
+    /// (cap 2) and poison the other 1026. Pins the single-domain
+    /// worst case the census models (every attach object poisons).
+    #[test]
+    fn poison_set_grows_per_class_past_both_exact_tiers() {
+        let (mut native, _caller) = NativeScene::new();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for object in 0..1030u32 {
+            native.scene.coordinator.insert_fold_latch(PairKey {
+                image: DomainCookie::scripted(native.domain, 41),
+                exec: 9,
+                object,
+            });
+        }
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost.len(),
+            2,
+            "the exact tier holds its cap"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost_overflow.len(),
+            2,
+            "the overflow tier holds its cap"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_fold_lost_poisoned.len(),
+            1026,
+            "past-1024 classes poison without a cap"
+        );
+    }
+
     /// Devin #2: finishing a domain drops its folded pairs along
     /// with its tombstones; other domains' entries stay. (Latch
     /// halves arrive with the latch in GREEN.)

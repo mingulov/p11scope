@@ -1199,6 +1199,10 @@ Additive budgets are:
   bound a second exact tier covers further evictions the same way;
   past both tiers the class is poisoned instead, so every
   revival-shaped first staging there gaps without consuming.
+  The poison set grows per distinct evicted class past both tiers
+  with no pre-cap; its keyspace has no tight product bound
+  (domains mint unbounded), so the census models the
+  single-domain worst case of every attach object poisoned.
   `exec_prune_overflow` counts
   pruned EXEC stashes discarded past their tombstone bound; the domain
   latches EXEC loss and late rows there read `exec_record_lost`. EXEC

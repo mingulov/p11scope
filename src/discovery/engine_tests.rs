@@ -7649,6 +7649,33 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
     assert_eq!(projected.reason, "process exited mid-flight");
 }
 
+/// Static guard: the no-unique-loader-context error texts are filing
+/// literals only (mark_partial) — never matched as a retry predicate.
+/// Retry vs file is decided by the typed `LoaderAttachResolution`
+/// (registry count plus the deferred re-arm mark), so ambiguity and
+/// unmarked states cannot share a text-matched retry arm. (The render
+/// fold that projects these texts to the public row is classification
+/// for display, not a retry decision, and lives in render.rs.)
+#[test]
+fn no_retry_predicate_matches_the_no_unique_context_text() {
+    let source = include_str!("engine.rs");
+    for prefix in [
+        "a manifest getter's process had no unique attached loader context",
+        "a refreshed provider had no unique attached loader context",
+    ] {
+        for pattern in [
+            format!("== \"{prefix}"),
+            format!("!= \"{prefix}"),
+            format!(".contains(\"{prefix}"),
+        ] {
+            assert!(
+                !source.contains(pattern.as_str()),
+                "engine.rs must not predicate on the filing text: {pattern}"
+            );
+        }
+    }
+}
+
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
 /// the bound. The child must already be killed (else this proves nothing).
 fn wait_until_zombie(pid: u32) {
@@ -38967,12 +38994,10 @@ fn an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot() {
     assert_eq!(session.physical_gap_summary().episodes, 0);
 }
 
-/// Twin of the refreshed-export retry: a manifest getter view whose loader
-/// arm deferred (refresh already queued) retries its getter attach instead
-/// of filing a permanent gap for a transient the re-arm resolves. Without
-/// a queued refresh it still files.
+/// NoneNoContext: zero contexts with an ordinary queued refresh (no typed
+/// deferred mark) files. Queue presence alone never retries.
 #[test]
-fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
+fn manifest_getter_attach_with_unmarked_queued_refresh_files_the_gap() {
     let sleeps = e06_spawn_sleeps(1);
     let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
     let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
@@ -38988,12 +39013,20 @@ fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
     let _ = engine.pinned.absorb(pins);
     engine.manifests = vec![manifest];
     engine.manifest_ordinals = vec![0];
-    // A prior pass requested this view's loader (ungating it), but the arm
-    // deferred: no context, and the re-arm refresh is already queued.
     engine.getter_loader_views.insert(view);
     assert!(!engine.loader_arming_gated(view));
     assert!(engine.loader_registry.ids_for_view(view).is_empty());
-    engine.refresh_queue.remove_for_test(&pid);
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "an ordinary rescan request queues"
+    );
+    assert!(
+        engine
+            .refresh_queue
+            .get(&pid)
+            .is_some_and(|request| request.deferred_rearm.is_none()),
+        "ordinary requests carry no deferred mark"
+    );
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
     let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
@@ -39007,17 +39040,244 @@ fn manifest_getter_attach_with_queued_refresh_retries_without_filing_the_gap() {
         "{:?}",
         engine.counters.object_skips
     );
-    let filed = engine.counters.object_skips.len();
+}
+
+/// Fail-closed twin: two attached contexts are ambiguous even beside a
+/// marked queued refresh — the count wins, the gap still files. (There is
+/// no ambiguity escape through the getter path: for getter-only views it
+/// is the only site that can file.)
+#[test]
+fn manifest_getter_attach_with_two_attached_contexts_still_files_the_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let (path, offset) = executable_file_mapping(pid);
+    let (manifest, pins) = manifest_and_pins_for(&path);
+    let mut manifest = with_getters(manifest, &[("C_GetFunctionList", 0, offset + 0x10)]);
+    manifest.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&manifest));
+    let _ = engine.pinned.absorb(pins);
+    engine.manifests = vec![manifest];
+    engine.manifest_ordinals = vec![0];
+    for hook in [0x2100u64, 0x2200u64] {
+        let spec = LoaderContextSpec {
+            view,
+            loader: PinnedObjectId(9),
+            mapping: Some(MapEntry {
+                start: 0x4000,
+                end: 0x5000,
+                file_offset: 0x2000,
+                permissions: *b"r-xp",
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 7,
+                raw_path: Some(b"/lib/ld.so".to_vec()),
+            }),
+            hook: SymbolFact {
+                virtual_address: hook,
+                file_offset: hook,
+            },
+            state_address: None,
+        };
+        let prepared = engine.loader_registry.preflight(spec).unwrap();
+        let context = engine.loader_registry.prepare(prepared).unwrap();
+        engine.loader_registry.mark_attached(context).unwrap();
+    }
+    assert_eq!(engine.loader_registry.ids_for_view(view).len(), 2);
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "a refresh queues beside the ambiguity"
+    );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live manifest getter hook"
+                && skip.reason
+                    == "a manifest getter's process had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// NoneNoContext with a non-empty registry: prepared-but-unattached contexts
+/// are not a deferred re-arm, so even a marked queued refresh files.
+#[test]
+fn manifest_getter_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let (path, offset) = executable_file_mapping(pid);
+    let (manifest, pins) = manifest_and_pins_for(&path);
+    let mut manifest = with_getters(manifest, &[("C_GetFunctionList", 0, offset + 0x10)]);
+    manifest.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&manifest));
+    let _ = engine.pinned.absorb(pins);
+    engine.manifests = vec![manifest];
+    engine.manifest_ordinals = vec![0];
+    engine.getter_loader_views.insert(view);
+    assert!(!engine.loader_arming_gated(view));
+    let spec = LoaderContextSpec {
+        view,
+        loader: PinnedObjectId(9),
+        mapping: Some(MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        }),
+        hook: SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let prepared = engine.loader_registry.preflight(spec).unwrap();
+    let _context = engine.loader_registry.prepare(prepared).unwrap();
+    assert_eq!(engine.loader_registry.ids_for_view(view).len(), 1);
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "a refresh queues beside the unattached context"
+    );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live manifest getter hook"
+                && skip.reason
+                    == "a manifest getter's process had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Healthy twin: a typed deferred re-arm retries once with no gap, then the
+/// landed re-arm attaches the getter with no gap.
+#[test]
+fn manifest_getter_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let sleeps = e06_spawn_sleeps(1);
+    let pids: Vec<u32> = sleeps.iter().map(|sleep| sleep.pid()).collect();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&pids);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    refresh_inventory_once(&mut engine);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let (path, offset) = executable_file_mapping(pid);
+    let (manifest, pins) = manifest_and_pins_for(&path);
+    let mut manifest = with_getters(manifest, &[("C_GetFunctionList", 0, offset + 0x10)]);
+    manifest.surfaces.clear();
+    assert!(crate::manifest_input::is_getter_only(&manifest));
+    let _ = engine.pinned.absorb(pins);
+    engine.manifests = vec![manifest];
+    engine.manifest_ordinals = vec![0];
+    engine.getter_loader_views.insert(view);
+    assert!(!engine.loader_arming_gated(view));
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
     assert!(
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "the deferred arm's re-arm request queues"
     );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    let mut session = ScriptedSession::with_records([], 0);
+    session.dynamic_attach_reports_added = true;
+    let mut additions_allowed = true;
     let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
     assert_eq!(outcome, (false, false, true, false));
-    assert_eq!(
-        engine.counters.object_skips.len(),
-        filed,
-        "the retry files no second gap: {:?}",
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live manifest getter hook"),
+        "the retry files nothing: {:?}",
+        engine.counters.object_skips
+    );
+    // The re-arm lands next pass: one context attaches and the fresh arm
+    // attempt consumes the mark.
+    let spec = LoaderContextSpec {
+        view,
+        loader: PinnedObjectId(9),
+        mapping: Some(MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        }),
+        hook: SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let prepared = engine.loader_registry.preflight(spec).unwrap();
+    let context = engine.loader_registry.prepare(prepared).unwrap();
+    engine.loader_registry.mark_attached(context).unwrap();
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = None;
+    let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
+    assert_ne!(
+        outcome,
+        (false, false, true, false),
+        "the landed re-arm attaches instead of retrying"
+    );
+    assert!(
+        session
+            .dynamic_export_links
+            .iter()
+            .any(|link| link.0 == context),
+        "the getter attached under the loader context: {:?}",
+        session.dynamic_export_links
+    );
+    // The no-unique-context gap stays absent across retry plus attach.
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live manifest getter hook"
+                && skip.reason
+                    == "a manifest getter's process had no unique attached loader context"
+        }),
+        "no no-context gap across retry plus attach: {:?}",
         engine.counters.object_skips
     );
 }
@@ -95821,12 +96081,11 @@ fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
     );
 }
 
-/// A deferred loader arm queues the view's refresh for next tick; the same
-/// tick's export attach must retry with it instead of filing a permanent
-/// gap for a condition the re-arm resolves. Filing here leaves a stale
-/// PARTIAL skip beside exact counts (metrics-cgroup flake).
+/// NoneNoContext: zero contexts with an ordinary queued refresh (no typed
+/// deferred mark) files. Queue presence alone is not proof of a deferred
+/// re-arm — it also covers plain rescans — so it must never retry.
 #[test]
-fn export_attach_with_queued_refresh_retries_without_filing_the_gap() {
+fn export_attach_with_unmarked_queued_refresh_files_the_gap() {
     let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
@@ -95834,25 +96093,31 @@ fn export_attach_with_queued_refresh_retries_without_filing_the_gap() {
     assert!(engine.refresh_queue.is_empty());
     assert!(
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
-        "the deferred arm's re-arm request queues"
+        "an ordinary rescan request queues"
+    );
+    assert!(
+        engine
+            .refresh_queue
+            .get(&pid)
+            .is_some_and(|request| request.deferred_rearm.is_none()),
+        "ordinary requests carry no deferred mark"
     );
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.kill().unwrap();
     child.wait().unwrap();
-    assert_eq!(outcome, (false, false, true, false));
+    assert_eq!(outcome, (false, false, false, false));
     assert!(
-        !engine
-            .counters
-            .object_skips
-            .iter()
-            .any(|skip| skip.subject == "live export hook"),
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
         "{:?}",
         engine.counters.object_skips
     );
 }
 
-/// Fail-closed twin: two attached contexts are ambiguous, never a deferred
-/// arm, so a queued refresh does not retry them — the gap still files.
+/// Fail-closed twin: two attached contexts are ambiguous even beside a
+/// (stale or raced) deferred mark — the count wins, the gap still files.
 #[test]
 fn export_attach_with_two_attached_contexts_still_files_the_gap() {
     use p11scope_manifest::elf::SymbolFact;
@@ -95889,6 +96154,11 @@ fn export_attach_with_two_attached_contexts_still_files_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues beside the ambiguity"
     );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.kill().unwrap();
     child.wait().unwrap();
@@ -95900,6 +96170,280 @@ fn export_attach_with_two_attached_contexts_still_files_the_gap() {
         }),
         "{:?}",
         engine.counters.object_skips
+    );
+}
+
+/// NoneNoContext with a non-empty registry: prepared-but-unattached contexts
+/// are not a deferred re-arm, so even a marked queued refresh files.
+#[test]
+fn export_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    let spec = LoaderContextSpec {
+        view,
+        loader: PinnedObjectId(9),
+        mapping: Some(MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        }),
+        hook: SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let prepared = engine.loader_registry.preflight(spec).unwrap();
+    let _context = engine.loader_registry.prepare(prepared).unwrap();
+    assert_eq!(engine.loader_registry.ids_for_view(view).len(), 1);
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "a refresh queues beside the unattached context"
+    );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// View-scoped mark: a deferred re-arm owed to another view sharing the pid
+/// does not retry this view — it files.
+#[test]
+fn export_attach_with_foreign_deferred_mark_files_the_gap() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "a refresh queues"
+    );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(ProcessViewId(999));
+    assert_ne!(view, ProcessViewId(999), "the mark names another view");
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome, (false, false, false, false));
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Healthy twin: a typed deferred re-arm retries once with no gap, then the
+/// landed re-arm attaches with no gap. Filing here would leave the stale
+/// PARTIAL skip beside exact counts (metrics-cgroup flake).
+#[test]
+fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() {
+    use p11scope_manifest::elf::SymbolFact;
+
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
+    assert!(
+        engine.request_refresh(pid, crate::attach::monotonic_ns()),
+        "the deferred arm's re-arm request queues"
+    );
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    assert_eq!(outcome, (false, false, true, false));
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live export hook"),
+        "the retry files nothing: {:?}",
+        engine.counters.object_skips
+    );
+    // The re-arm lands next pass: one context attaches and the fresh arm
+    // attempt consumes the mark.
+    let spec = LoaderContextSpec {
+        view,
+        loader: PinnedObjectId(9),
+        mapping: Some(MapEntry {
+            start: 0x4000,
+            end: 0x5000,
+            file_offset: 0x2000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7,
+            raw_path: Some(b"/lib/ld.so".to_vec()),
+        }),
+        hook: SymbolFact {
+            virtual_address: 0x2100,
+            file_offset: 0x2100,
+        },
+        state_address: None,
+    };
+    let prepared = engine.loader_registry.preflight(spec).unwrap();
+    let context = engine.loader_registry.prepare(prepared).unwrap();
+    engine.loader_registry.mark_attached(context).unwrap();
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = None;
+    let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_ne!(
+        outcome,
+        (false, false, true, false),
+        "the landed re-arm attaches instead of retrying"
+    );
+    // The no-unique-context gap stays absent across retry plus attach.
+    // (Unrelated attach skips from the fake fixture pins, e.g. ELF
+    // segment checks, are pinned by their own tests, not here.)
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live export hook"
+                && skip.reason == "a refreshed provider had no unique attached loader context"
+        }),
+        "no no-context gap across retry plus attach: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Mark lifecycle through real arms: a handles-wait deferral stamps the
+/// typed re-arm mark on the queued entry, and the next arm attempt
+/// consumes it (re-arming only on a fresh deferral). Without the stamp
+/// the retry never fires; without consumption a stale mark would retry
+/// forever after the re-arm resolved another way.
+#[test]
+fn deferred_rearm_mark_is_stamped_on_deferral_and_consumed_on_rearm() {
+    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    engine.inject_loader_pin_skip_for_test = Some(Skipped {
+        subject: crate::discovery::identity::PIN_WAIT_SUBJECT.into(),
+        reason: format!(
+            "opening object within retained target root: {}",
+            crate::discovery::identity::PIN_BUDGET_STOP_DETAIL
+        ),
+    });
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(
+        engine
+            .refresh_queue
+            .get(&pid)
+            .is_some_and(|request| request.deferred_rearm == Some(view)),
+        "a deferred arm stamps the typed mark: {:?}",
+        engine.refresh_queue.get(&pid)
+    );
+    assert!(
+        engine.loader_registry.ids_for_view(view).is_empty(),
+        "a deferred arm binds no context"
+    );
+    // The re-arm attempt consumes the mark; on this live view it lands.
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut ScriptedSession::default(),
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        !engine.loader_registry.ids_for_view(view).is_empty(),
+        "the re-arm landed a context"
+    );
+    assert!(
+        engine
+            .refresh_queue
+            .get(&pid)
+            .is_none_or(|request| request.deferred_rearm != Some(view)),
+        "a landed re-arm consumes the mark"
+    );
+}
+
+/// A consumed-and-requeued entry resets the deferred mark: the old
+/// deferral is spent, so a re-arm that never lands files on the next
+/// pass instead of retrying forever on a stale mark.
+#[test]
+fn deferred_rearm_mark_resets_on_consumed_requeue() {
+    let mut engine = Engine::empty();
+    let pid = 424242u32;
+    let view = ProcessViewId(7);
+    assert!(engine.request_refresh(pid, None));
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    assert!(engine.request_refresh_consumed(pid, None));
+    assert!(
+        engine
+            .refresh_queue
+            .get(&pid)
+            .is_some_and(|request| request.deferred_rearm.is_none()),
+        "a fresh insert never preserves the mark"
+    );
+}
+
+/// Releasing a view drops its deferred marks: IDs recycle, so a stale
+/// mark must never satisfy a later view reusing the ID. The entries
+/// themselves stay queued.
+#[test]
+fn deferred_rearm_mark_cleared_on_view_release() {
+    let mut engine = Engine::empty();
+    let pid = 424243u32;
+    let view = ProcessViewId(8);
+    assert!(engine.request_refresh(pid, None));
+    engine
+        .refresh_queue
+        .get_mut(&pid)
+        .unwrap()
+        .deferred_rearm = Some(view);
+    engine.release_view_id(view);
+    let request = engine.refresh_queue.get(&pid).unwrap();
+    assert!(
+        request.deferred_rearm.is_none(),
+        "release clears the mark"
     );
 }
 

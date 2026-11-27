@@ -82,6 +82,15 @@ pub(crate) struct RefreshRequest {
     // longer qualifies as fresh through `deferred_fresh` and cannot
     // earn it again (preserved across serial renewal like the flag).
     pub(crate) fresh_carry_spent: bool,
+    // A deferred loader arm for exactly this view is owed a re-arm
+    // through this entry: set only by the `LoaderArmOutcome::Deferred`
+    // path after queueing, cleared when that view's arm is attempted
+    // again, when the entry is consumed and re-queued fresh (never
+    // preserved like the carry flags above), and when the view is
+    // released. Export and manifest-getter attach retry only on this
+    // typed fact plus an empty loader registry — never on mere queue
+    // presence, which also covers ordinary rescans.
+    pub(crate) deferred_rearm: Option<ProcessViewId>,
 }
 
 /// What one queue intake decided. Filing (marks, counters, age notes,
@@ -187,6 +196,10 @@ impl RefreshQueue {
                 fresh_carry_spent: existing
                     .as_ref()
                     .is_some_and(|request| request.fresh_carry_spent),
+                // Never preserved: a consumed entry's deferral is spent.
+                // If the re-arm never landed, the next pass finds no mark
+                // and files the gap instead of retrying forever.
+                deferred_rearm: None,
             },
         );
         RefreshIntake::Accepted {
@@ -278,6 +291,17 @@ impl RefreshQueue {
             .is_some_and(|request| request.owner == Some(view))
         {
             self.queue.remove(&pid);
+        }
+    }
+
+    /// Drops a released view's deferred re-arm marks: view IDs recycle, so
+    /// a stale mark must never satisfy a later view reusing the ID. The
+    /// entries themselves stay queued (their work is still owed).
+    pub(crate) fn clear_deferred_rearm_for_view(&mut self, view: ProcessViewId) {
+        for request in self.queue.values_mut() {
+            if request.deferred_rearm == Some(view) {
+                request.deferred_rearm = None;
+            }
         }
     }
 

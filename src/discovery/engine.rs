@@ -6557,6 +6557,36 @@ enum GetterOwner {
     AwaitLoader,
 }
 
+/// Why a view has no manifest getter owner (typed so callers never match
+/// the filing text to decide retry vs file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetterNoOwner {
+    /// Zero or ambiguous attached contexts (see [`LoaderAttachResolution`]).
+    NoUniqueContext,
+    /// The loader could not be identified from maps/exe.
+    LoaderUnidentifiable,
+    /// The view-owned attach-owner ID space was exhausted.
+    IdsExhausted,
+}
+
+/// Typed loader-attach resolution for one view (fail-closed): the single
+/// decision shared by refreshed-export and manifest-getter attach, so the
+/// two sites cannot diverge. Only [`LoaderAttachResolution::NoneDeferredRearm`]
+/// may retry, and only while its typed re-arm mark is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderAttachResolution {
+    /// Exactly one attached, non-tombstoned loader context: attach under it.
+    Unique(LoaderContextId),
+    /// Registry empty for the view and its queued refresh carries the typed
+    /// deferred re-arm mark for this view: the re-arm resolves it next pass.
+    NoneDeferredRearm,
+    /// No attached context and no deferred re-arm owed (registry empty
+    /// without a mark, or non-empty with none attached): file the gap.
+    NoneNoContext,
+    /// Two or more attached contexts with `n` counted: ambiguous, file.
+    Ambiguous(usize),
+}
+
 impl PauseClosure {
     fn new(additions_allowed: bool) -> Self {
         Self {
@@ -17824,6 +17854,7 @@ impl Engine {
         }
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
+        self.refresh_queue.clear_deferred_rearm_for_view(id);
         self.pending_leader_exit_order.remove(&id);
         self.leader_exit_hook_ns.remove(&id);
         // The tick prunes retry counts only at its start: a view released
@@ -28887,17 +28918,59 @@ impl Engine {
         Ok(sites)
     }
 
+    /// Typed loader-attach resolution for `view`: the single predicate
+    /// shared by refreshed-export and manifest-getter attach. Counts
+    /// attached, non-tombstoned contexts first (ambiguity can never
+    /// retry), then admits a retry only for an empty registry with the
+    /// typed deferred re-arm mark for exactly this view on its queued
+    /// refresh. View-scoped (never pid-only): a mark for another view
+    /// sharing the pid does not retry this view.
+    fn resolve_loader_attach(&self, view: ProcessViewId) -> LoaderAttachResolution {
+        let attached: Vec<_> = self
+            .loader_registry
+            .ids_for_view(view)
+            .into_iter()
+            .filter(|context| {
+                !self.loader_registry.is_tombstoned(*context)
+                    && self
+                        .loader_registry
+                        .context(*context)
+                        .is_some_and(|context| context.was_attached)
+            })
+            .collect();
+        match attached.as_slice() {
+            [context] => LoaderAttachResolution::Unique(*context),
+            [] => {
+                if !self.loader_registry.ids_for_view(view).is_empty() {
+                    return LoaderAttachResolution::NoneNoContext;
+                }
+                let deferred = self
+                    .views
+                    .iter()
+                    .find(|candidate| candidate.id() == view)
+                    .and_then(|found| self.refresh_queue.get(&found.pid()))
+                    .is_some_and(|request| request.deferred_rearm == Some(view));
+                if deferred {
+                    LoaderAttachResolution::NoneDeferredRearm
+                } else {
+                    LoaderAttachResolution::NoneNoContext
+                }
+            }
+            _ => LoaderAttachResolution::Ambiguous(attached.len()),
+        }
+    }
+
     /// The attach owner for `view`'s manifest getter hooks: its unique
     /// attached loader context, or — only for a process with no loader
     /// to arm (no `PT_INTERP`: a statically linked program) — a
     /// view-owned id that retires with the view. A dynamically linked
     /// process the scope left unarmed awaits its loader (see
-    /// [`GetterOwner::AwaitLoader`]). `Err` carries the named reason no
-    /// owner exists.
+    /// [`GetterOwner::AwaitLoader`]). `Err` carries the typed reason no
+    /// owner exists; callers file the matching fixed text, never match it.
     fn manifest_getter_context(
         &mut self,
         view: ProcessViewId,
-    ) -> Result<GetterOwner, &'static str> {
+    ) -> Result<GetterOwner, GetterNoOwner> {
         if let Some(context) = self.view_getter_contexts.get(&view) {
             return Ok(GetterOwner::Context(*context));
         }
@@ -28916,7 +28989,7 @@ impl Engine {
         match contexts.as_slice() {
             [context] => return Ok(GetterOwner::Context(*context)),
             [] => {}
-            _ => return Err("a manifest getter's process had no unique attached loader context"),
+            _ => return Err(GetterNoOwner::NoUniqueContext),
         }
         if self.original_ending(view) {
             return Ok(GetterOwner::Ending);
@@ -28929,7 +29002,7 @@ impl Engine {
             return Ok(GetterOwner::Ending);
         };
         if !self.loader_registry.ids_for_view(view).is_empty() {
-            return Err("a manifest getter's process had no unique attached loader context");
+            return Err(GetterNoOwner::NoUniqueContext);
         }
         match Self::loader_locator(&self.views[position], &mut self.budget) {
             Ok(None) => {}
@@ -28944,17 +29017,17 @@ impl Engine {
                 return Ok(GetterOwner::AwaitLoader);
             }
             Ok(Some(_)) => {
-                return Err("a manifest getter's process had no unique attached loader context");
+                return Err(GetterNoOwner::NoUniqueContext);
             }
             Err(_) => {
-                return Err("a manifest getter's process loader could not be identified");
+                return Err(GetterNoOwner::LoaderUnidentifiable);
             }
         }
         let Some(context) = LoaderContextId::view_owned(self.next_view_getter_context) else {
-            return Err("the manifest getter attach-owner ID space was exhausted");
+            return Err(GetterNoOwner::IdsExhausted);
         };
         let Some(next) = self.next_view_getter_context.checked_add(1) else {
-            return Err("the manifest getter attach-owner ID space was exhausted");
+            return Err(GetterNoOwner::IdsExhausted);
         };
         self.next_view_getter_context = next;
         self.view_getter_contexts.insert(view, context);
@@ -29073,24 +29146,36 @@ impl Engine {
             // Skipped, not settled: the requested scan arms the loader and
             // a later pass attaches the getters under it.
             Ok(GetterOwner::AwaitLoader) => return (false, false, true, false),
-            Err(reason) => {
-                // Like the refreshed-export twin below: a deferred loader
-                // arm queued this view's refresh for next tick, so retry
-                // with the re-arm instead of filing a permanent gap for a
-                // transient. Other reasons (unidentifiable loader,
-                // exhausted owner IDs) still file: those are never a
-                // deferred arm.
-                if reason == "a manifest getter's process had no unique attached loader context"
-                    && let Some(pid) = self
-                        .views
-                        .iter()
-                        .find(|candidate| candidate.id() == view)
-                        .map(ProcessView::pid)
-                    && self.refresh_queue.contains_key(&pid)
-                {
-                    return (false, false, true, false);
-                }
-                self.mark_partial("live manifest getter hook", reason);
+            Err(GetterNoOwner::NoUniqueContext)
+                if matches!(
+                    self.resolve_loader_attach(view),
+                    LoaderAttachResolution::NoneDeferredRearm
+                ) =>
+            {
+                // Typed deferred re-arm only: empty registry plus the re-arm
+                // mark for this view. Ambiguity, non-empty registries and
+                // unmarked views file below — never retried.
+                return (false, false, true, false);
+            }
+            Err(GetterNoOwner::NoUniqueContext) => {
+                self.mark_partial(
+                    "live manifest getter hook",
+                    "a manifest getter's process had no unique attached loader context",
+                );
+                return (false, false, false, false);
+            }
+            Err(GetterNoOwner::LoaderUnidentifiable) => {
+                self.mark_partial(
+                    "live manifest getter hook",
+                    "a manifest getter's process loader could not be identified",
+                );
+                return (false, false, false, false);
+            }
+            Err(GetterNoOwner::IdsExhausted) => {
+                self.mark_partial(
+                    "live manifest getter hook",
+                    "the manifest getter attach-owner ID space was exhausted",
+                );
                 return (false, false, false, false);
             }
         };
@@ -29153,7 +29238,7 @@ impl Engine {
         if modules.is_empty() {
             return (false, true, false, false);
         }
-        let contexts: Vec<_> = self
+        let attached: Vec<_> = self
             .loader_registry
             .ids_for_view(view)
             .into_iter()
@@ -29165,34 +29250,29 @@ impl Engine {
                         .is_some_and(|context| context.was_attached)
             })
             .collect();
-        let [context] = contexts.as_slice() else {
+        let [context] = attached.as_slice() else {
             // An ending group has no arm and needs no hook: it cannot call
             // or load again, so there is nothing left to attach.
-            if contexts.is_empty() && self.original_ending(view) {
+            if attached.is_empty() && self.original_ending(view) {
                 self.invalidate_causal_timing();
                 return (false, true, false, false);
             }
-            // A deferred loader arm queued this view's refresh for next
-            // tick; the re-arm resolves the missing context, so retry with
-            // it instead of filing a permanent gap for a transient. Filing
-            // here leaves a stale PARTIAL skip beside exact counts. An
-            // ambiguous pair (two attached) still files: that is never a
-            // deferred arm.
-            if contexts.is_empty()
-                && let Some(pid) = self
-                    .views
-                    .iter()
-                    .find(|candidate| candidate.id() == view)
-                    .map(ProcessView::pid)
-                && self.refresh_queue.contains_key(&pid)
-            {
-                return (false, false, true, false);
+            // Typed resolution shared with the manifest-getter site: retry
+            // only a deferred re-arm (empty registry plus the re-arm mark
+            // for this view). Ambiguity and missing context without a mark
+            // file a permanent gap — attribution is impossible or unowed.
+            match self.resolve_loader_attach(view) {
+                LoaderAttachResolution::NoneDeferredRearm => {
+                    return (false, false, true, false);
+                }
+                _ => {
+                    self.mark_partial(
+                        "live export hook",
+                        "a refreshed provider had no unique attached loader context",
+                    );
+                    return (false, false, false, false);
+                }
             }
-            self.mark_partial(
-                "live export hook",
-                "a refreshed provider had no unique attached loader context",
-            );
-            return (false, false, false, false);
         };
         let pinned = self.pinned.clone();
         let collected =
@@ -30195,6 +30275,17 @@ impl Engine {
         if self.loader_arming_gated(view_id) {
             return Ok(false);
         }
+        // This attempt consumes any prior deferred re-arm mark for the view;
+        // only a fresh `Deferred` outcome below re-arms it. Without this a
+        // stale mark would retry forever after the re-arm resolved another
+        // way (success or ordinary failure on a retained entry, whose
+        // ordinary re-queues leave existing fields untouched).
+        let pid = self.views[position].pid();
+        if let Some(request) = self.refresh_queue.get_mut(&pid)
+            && request.deferred_rearm == Some(view_id)
+        {
+            request.deferred_rearm = None;
+        }
         self.loader_arms = self.loader_arms.saturating_add(1);
         let named = matches!(self.scope, Scope::Pid(_));
         let result = self.arm_loader_for_view(position, session, additions_allowed, pending_views);
@@ -30269,9 +30360,16 @@ impl Engine {
                 // this is per-view scheduling, not frame exhaustion,
                 // and the tick's U-07 sweep notes none either.
                 // (`generation_valid` held, so `position` still names
-                // this view.)
+                // this view.) Stamp the typed deferred re-arm on the
+                // queued entry: export and manifest-getter attach retry
+                // (once, next pass) on exactly this fact, never on mere
+                // queue presence. If the queue refused the request there
+                // is no entry to stamp, so no retry is owed.
                 let pid = self.views[position].pid();
                 self.request_refresh(pid, crate::attach::monotonic_ns());
+                if let Some(request) = self.refresh_queue.get_mut(&pid) {
+                    request.deferred_rearm = Some(view_id);
+                }
                 Ok(changed)
             }
             LoaderArmOutcome::Changed(changed) => Ok(changed),

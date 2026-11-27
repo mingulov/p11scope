@@ -24,6 +24,13 @@ FIXTURES = ROOT / "tests/fixtures/dual-build-callers"
 CHILDREN = (ROOT / "scripts/verify-attach-e2e.sh", ROOT / "scripts/verify-canaries.sh")
 PREPARED = ("P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
             "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC")
+# The fake checkout's staged repo files: the drivers the dual-build flows
+# execute plus the contract's import closure (scripts/ci/*). The closure
+# must cover every non-stdlib import of the staged contract, checked by
+# test_staged_scripts_cover_the_contract_import_closure.
+STAGED_REPO_SCRIPTS = ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh",
+                       "release-matrix-contract.py", "runner_inputs.py")
+STAGED_CONTRACT_CLOSURE = ("scripts/ci/result_row.py",)
 
 SPIKE_RECORDER = r"""
 #include <stdio.h>
@@ -187,9 +194,12 @@ class DualBuildCallerTests(unittest.TestCase):
         (self.repo / "scripts").mkdir(parents=True)
         for source in CHILDREN:
             shutil.copy2(source, self.repo / "scripts" / source.name)
-        for name in ("product-build.sh", "cargo.sh", "lib.sh", "cleanup-traps.sh", "release-matrix-contract.py",
-                     "runner_inputs.py"):
+        for name in STAGED_REPO_SCRIPTS:
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        for name in STAGED_CONTRACT_CLOSURE:
+            destination = self.repo / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, destination)
         shutil.copy2(FIXTURES / "record-preparer.py", self.repo / "scripts/prepare-dependencies.py")
         shutil.copy2(ROOT / ".release-rust-version", self.repo / ".release-rust-version")
         self.bin = self.base / "PATH tripwires"
@@ -224,6 +234,43 @@ class DualBuildCallerTests(unittest.TestCase):
         shutil.copy2(FIXTURES / "unused-tool.sh", path)
         path.chmod(0o755)
         return path
+
+    def test_staged_scripts_cover_the_contract_import_closure(self):
+        # The fake checkout stages a hand-maintained file list while the
+        # contract's imports move (the result_row move broke every staged
+        # runpy with ModuleNotFoundError): the staged set must cover the
+        # contract's transitive repo import closure, or the next moved
+        # import fails here naming the missing staged path.
+        import ast
+        staged = {"scripts/" + source.name for source in CHILDREN}
+        staged.update("scripts/" + name for name in STAGED_REPO_SCRIPTS)
+        staged.update(STAGED_CONTRACT_CLOSURE)
+        # Module-top loads: the contract plus the sibling runner_inputs it
+        # execs via runpy at import time, then every transitive import.
+        pending = ["scripts/release-matrix-contract.py", "scripts/runner_inputs.py"]
+        seen, missing = set(pending), []
+        while pending:
+            tree = ast.parse((ROOT / pending.pop()).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names = [node.module.split(".")[0]]
+                elif isinstance(node, ast.Import):
+                    names = [alias.name.split(".")[0] for alias in node.names]
+                else:
+                    continue
+                for name in names:
+                    for candidate in ("scripts/ci/%s.py" % name, "scripts/%s.py" % name):
+                        if (ROOT / candidate).is_file():
+                            if candidate not in seen:
+                                seen.add(candidate)
+                                pending.append(candidate)
+                            if candidate not in staged:
+                                missing.append(candidate)
+                            break
+        self.assertEqual(sorted(set(missing)), [],
+                         "the fake checkout does not stage the contract import closure; "
+                         "add the missing files to STAGED_CONTRACT_CLOSURE (scripts/ci/*) "
+                         "or STAGED_REPO_SCRIPTS (scripts/*)")
 
     def configure(self, statuses):
         self.config.write_text(json.dumps({"events": str(self.events),

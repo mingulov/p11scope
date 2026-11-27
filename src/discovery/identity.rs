@@ -21248,42 +21248,51 @@ mod tests {
         assert!(!skipped.is_empty(), "the rejection is disclosed");
     }
 
-    #[test]
-    fn absorbing_rotation_across_views_survives_newcomer_view_removal() {
-        // Two scan views share one provider file: the long-lived view A
-        // pins generation 1, the newcomer view B observes generation 2.
-        // The rotation merges B's raw onto A's kept id; removing B then
-        // prunes only B's raw — the fresh object, its alias and A's
-        // module aliasing survive (no eviction orphans them).
+    /// Two scan views in different mount namespaces rotated onto one
+    /// id, with custody filed through the production scan-aliasing path
+    /// on both sides (raw row plus pin claim, as the run-learned commit
+    /// does: absorb, then `alias_scanned_module_under`). View B carries
+    /// a distinct mount namespace, so its raw differs from A's and the
+    /// newcomer removal below must drain exactly that raw.
+    struct TwoViewCustody {
+        acc: PinnedObjects,
+        kept: PinnedObjectId,
+        raw_a: RawObjectInstance,
+        raw_b: RawObjectInstance,
+        module_a: ScannedModule,
+        view_a: crate::process::ProcessViewId,
+        view_b: crate::process::ProcessViewId,
+    }
+
+    fn aliased_two_view_rotation(dir: &tempfile::TempDir) -> TwoViewCustody {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
         };
-        let dir = tempfile::tempdir().unwrap();
-        let file = backing_file(&dir, "provider.so");
+        let file = backing_file(dir, "provider.so");
         let view_a = crate::process::ProcessViewId(11);
         let view_b = crate::process::ProcessViewId(12);
-        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let mut module_a = module(key);
+        module_a.view = view_a;
+        let mut module_b = module(key);
+        module_b.view = view_b;
+        module_b.mount_namespace = crate::process::MountNamespaceId {
+            device: 1,
+            inode: 424242,
+        };
+        let mut first = view_pin(&module_a, key.device.minor + 1, "aaaaaaaa", 1, false);
         reback(&mut first, &file);
         let raw_a = first.raw_to_id.keys().next().unwrap().clone();
-        first
-            .raw_ownership
-            .entry(view_a)
-            .or_default()
-            .insert(raw_a.clone());
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(first).is_empty());
         let kept = acc.pinned().next().unwrap().id;
-        let mut second = image_pins(&[(key, "aaaaaaaa", 2)]);
+        acc.alias_scanned_module_under(&module_a, view_a);
+        let mut second = view_pin(&module_b, key.device.minor + 1, "aaaaaaaa", 2, false);
         reback(&mut second, &file);
         let kept_mapping = acc.by_id.values().next().unwrap().mapping;
         second.by_id.values_mut().next().unwrap().mapping = kept_mapping;
         let raw_b = second.raw_to_id.keys().next().unwrap().clone();
-        second
-            .raw_ownership
-            .entry(view_b)
-            .or_default()
-            .insert(raw_b.clone());
+        assert_ne!(raw_a, raw_b, "two namespaces file two raws");
         let skipped = acc.absorb(second);
         assert!(!acc.rejects(key), "a touched file is not a collision");
         assert!(acc.supersedes(key), "the rotation is recorded");
@@ -21291,12 +21300,51 @@ mod tests {
         assert!(acc.by_id.contains_key(&kept), "the id is stable");
         assert_eq!(acc.raw_to_id.get(&raw_a), Some(&kept), "A's raw survives");
         assert_eq!(acc.raw_to_id.get(&raw_b), Some(&kept), "B's raw merges");
+        acc.alias_scanned_module_under(&module_b, view_b);
         assert!(
-            acc.module_aliased_under(&module(key), view_a),
+            acc.module_aliased_under(&module_a, view_a),
             "the long-lived view stays aliased"
         );
+        assert!(
+            acc.module_aliased_under(&module_b, view_b),
+            "the newcomer view is aliased before removal"
+        );
+        TwoViewCustody {
+            acc,
+            kept,
+            raw_a,
+            raw_b,
+            module_a,
+            view_a,
+            view_b,
+        }
+    }
+
+    #[test]
+    fn absorbing_rotation_across_views_survives_newcomer_view_removal() {
+        // Two scan views share one provider file: the long-lived view A
+        // pins generation 1, the newcomer view B observes generation 2.
+        // The rotation merges B's raw onto A's kept id; removing B then
+        // prunes only B's raw — the fresh object, its alias and A's
+        // module aliasing survive (no eviction orphans them).
+        let dir = tempfile::tempdir().unwrap();
+        let custody = aliased_two_view_rotation(&dir);
+        let TwoViewCustody {
+            mut acc,
+            kept,
+            raw_a,
+            raw_b,
+            module_a,
+            view_a,
+            view_b,
+        } = custody;
         // The newcomer view goes: only its raw is pruned.
-        acc.remove_view(view_b);
+        let removed = acc.remove_view(view_b);
+        assert!(removed.is_some(), "the newcomer view removal must execute");
+        assert!(
+            removed.unwrap().pins.contains(&kept),
+            "the retired claims name the kept id"
+        );
         assert!(
             acc.by_id.contains_key(&kept),
             "the fresh object survives newcomer removal"
@@ -21307,10 +21355,156 @@ mod tests {
             "the long-lived alias survives"
         );
         assert!(
-            acc.module_aliased_under(&module(key), view_a),
+            !acc.raw_to_id.contains_key(&raw_b),
+            "the newcomer raw is pruned"
+        );
+        assert!(
+            acc.module_aliased_under(&module_a, view_a),
             "the long-lived view stays aliased after newcomer removal"
         );
+        assert!(
+            !acc.raw_ownership.contains_key(&view_b),
+            "the retired view files no raw rows"
+        );
         assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn absorbing_rotation_shared_alias_survives_newcomer_view_removal() {
+        // Same-namespace views share one scan raw (a raw carries no
+        // view): A pins generation 1, newcomer B observes generation 2,
+        // both file custody through the production aliasing path.
+        // Removing B must prune nothing — the shared raw stays retained
+        // through A — while B's own ownership rows drop.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let view_a = crate::process::ProcessViewId(11);
+        let view_b = crate::process::ProcessViewId(12);
+        let mut module_a = module(key);
+        module_a.view = view_a;
+        let mut module_b = module(key);
+        module_b.view = view_b;
+        let mut first = view_pin(&module_a, key.device.minor + 1, "aaaaaaaa", 1, false);
+        reback(&mut first, &file);
+        let raw_a = first.raw_to_id.keys().next().unwrap().clone();
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(first).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        acc.alias_scanned_module_under(&module_a, view_a);
+        let mut second = view_pin(&module_b, key.device.minor + 1, "aaaaaaaa", 2, false);
+        reback(&mut second, &file);
+        let kept_mapping = acc.by_id.values().next().unwrap().mapping;
+        second.by_id.values_mut().next().unwrap().mapping = kept_mapping;
+        let raw_b = second.raw_to_id.keys().next().unwrap().clone();
+        assert_eq!(raw_a, raw_b, "one namespace files one shared raw");
+        let skipped = acc.absorb(second);
+        assert!(!acc.rejects(key), "a touched file is not a collision");
+        assert!(acc.supersedes(key), "the rotation is recorded");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        acc.alias_scanned_module_under(&module_b, view_b);
+        let removed = acc.remove_view(view_b);
+        assert!(removed.is_some(), "the newcomer view removal must execute");
+        assert!(
+            acc.by_id.contains_key(&kept),
+            "the fresh object survives newcomer removal"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw_a),
+            Some(&kept),
+            "the shared alias survives through the long-lived view"
+        );
+        assert!(
+            acc.module_aliased_under(&module_a, view_a),
+            "the long-lived view stays aliased after newcomer removal"
+        );
+        assert!(
+            !acc.raw_ownership.contains_key(&view_b),
+            "the retired view files no raw rows"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn absorbing_rotation_newcomer_view_excepted_keep_spares_its_raw() {
+        // The except-carry shape: the newcomer view retires with the
+        // kept id in the keep set, so its raw is spared by the keep
+        // disjunct even though no surviving view files it.
+        let dir = tempfile::tempdir().unwrap();
+        let custody = aliased_two_view_rotation(&dir);
+        let TwoViewCustody {
+            mut acc,
+            kept,
+            raw_a,
+            raw_b,
+            module_a,
+            view_a,
+            view_b,
+        } = custody;
+        let removed = acc.remove_view_except(view_b, &std::collections::BTreeSet::from([kept]));
+        assert!(removed.is_some(), "the newcomer view removal must execute");
+        assert!(
+            acc.by_id.contains_key(&kept),
+            "the kept object stays resolvable"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw_b),
+            Some(&kept),
+            "the excepted newcomer raw is spared"
+        );
+        assert_eq!(
+            acc.raw_to_id.get(&raw_a),
+            Some(&kept),
+            "the long-lived alias survives"
+        );
+        assert!(
+            acc.module_aliased_under(&module_a, view_a),
+            "the long-lived view stays aliased"
+        );
+        assert_eq!(acc.pinned().count(), 1, "one file, one object");
+    }
+
+    #[test]
+    fn absorbing_rotation_unowned_id_drains_its_retained_raw() {
+        // No dangling raw-to-id rows: the long-lived view's claims are
+        // dropped first (the post-bind scrub shape), so when the
+        // newcomer view retires the kept id is unowned and both the id
+        // and its still-filed raws drain, even the raw the surviving
+        // view still files. Module aliasing then fails closed.
+        let dir = tempfile::tempdir().unwrap();
+        let custody = aliased_two_view_rotation(&dir);
+        let TwoViewCustody {
+            mut acc,
+            kept,
+            raw_a,
+            raw_b,
+            module_a,
+            view_a,
+            view_b,
+        } = custody;
+        acc.drop_view_claims(view_a);
+        let removed = acc.remove_view(view_b);
+        assert!(removed.is_some(), "the newcomer view removal must execute");
+        assert!(
+            !acc.by_id.contains_key(&kept),
+            "the unowned id is collected"
+        );
+        assert!(
+            !acc.raw_to_id.contains_key(&raw_a),
+            "the unowned id drains its retained raw"
+        );
+        assert!(
+            !acc.raw_to_id.contains_key(&raw_b),
+            "the newcomer raw is pruned"
+        );
+        assert!(
+            !acc.module_aliased_under(&module_a, view_a),
+            "aliasing fails closed once the raw drains"
+        );
+        assert_eq!(acc.pinned().count(), 0, "nothing is stranded");
     }
 
     /// The kept staging and the incoming scan of one touched file, with

@@ -17971,16 +17971,10 @@ fn refresh_requests_survive_allocation_exhaustion() {
 /// the shape test below pins the defensive initial-scan sites.)
 #[test]
 fn id_exhaustion_publishes_skip_instead_of_failing() {
-    let mut children: Vec<_> = (0..2)
-        .map(|_| {
-            std::process::Command::new("sleep")
-                .arg("600")
-                .die_with_parent()
-                .spawn()
-                .unwrap()
-        })
+    let children: Vec<_> = (0..2)
+        .map(|_| ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600")))
         .collect();
-    let mut pids: Vec<_> = children.iter().map(|child| child.id()).collect();
+    let mut pids: Vec<_> = children.iter().map(|child| child.pid()).collect();
     let dir = tempfile::tempdir().expect("a scope directory");
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
@@ -18013,13 +18007,9 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    // Readiness (flake hardening): pre-exec a child is a fork of this
-    // dynamic test binary, and its exe link already resolves then (to our
-    // own image) — so only discover once no child's exe link still points
-    // at us. Identical sleep groups keep selection deterministic.
-    for child in &children {
-        wait_sleep_child_parked(child.id());
-    }
+    // Readiness comes from the guard constructor (each child parked
+    // before the vec holds it); identical sleep groups keep selection
+    // deterministic.
 
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     // Pin the wall tick quantum: the counts below measure admission/cap
@@ -18065,11 +18055,6 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         "exhaustion retains the queued refresh: {:?}",
         engine.refresh_queue
     );
-
-    for child in &mut children {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
 }
 
 /// Task 3 (cgroup-256 A2): `discover_plan` must not fatally propagate
@@ -22721,14 +22706,11 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
 fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -22750,7 +22732,7 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
     );
     assert!(
         engine.owned_watch_seen.contains_key(&me)
-            && engine.owned_watch_seen.contains_key(&sleeper.id()),
+            && engine.owned_watch_seen.contains_key(&sleeper.pid()),
         "noticed members take first-seen times"
     );
     assert!(
@@ -22805,22 +22787,18 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         engine.owned_watch_unproven.is_empty(),
         "a degraded exact-PID run has no tree to watch"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 #[test]
 fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -22840,11 +22818,11 @@ fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
         "a retained member stays with the frames"
     );
     assert!(
-        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        engine.owned_watch_unproven.contains_key(&sleeper.pid()),
         "an unretained member joins the rotation"
     );
     assert_eq!(
-        engine.owned_watch_unproven[&sleeper.id()].scans,
+        engine.owned_watch_unproven[&sleeper.pid()].scans,
         1,
         "one member scans once when newest and oldest coincide"
     );
@@ -22864,13 +22842,13 @@ fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
     // so a stable tree costs no steady-state scans.
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("rewrite cgroup.procs");
     let rejoined = 1_000 + 2 * OWNED_WATCH_SCAN_MIN_NS;
     engine.owned_tree_watch(Some(rejoined));
     assert!(
-        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        engine.owned_watch_unproven.contains_key(&sleeper.pid()),
         "the member rejoins while live"
     );
     engine.owned_tree_watch(Some(rejoined + OWNED_WATCH_RESCAN_HORIZON_NS));
@@ -22878,8 +22856,7 @@ fn owned_tree_watch_skips_retained_prunes_exited_and_aged_members() {
         engine.owned_watch_unproven.is_empty(),
         "an unproven member ages out at the horizon"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// A re-noticed member keeps its original first-seen time: a live but
@@ -22953,14 +22930,11 @@ fn owned_tree_watch_renotice_keeps_first_seen_time() {
 fn owned_tree_watch_backs_off_unproductive_members() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -22999,8 +22973,7 @@ fn owned_tree_watch_backs_off_unproductive_members() {
     // Past the backoff the rotation resumes.
     engine.owned_tree_watch(Some(second + 25_000_000));
     assert_eq!(scans(&engine), 6, "a slow starter still gets rescanned");
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Pre-open facts consult: a watch repeat over an unchanged member reuses
@@ -23074,14 +23047,11 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes() {
 #[test]
 fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23122,8 +23092,7 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
         count_second.get()
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// The consult misses when the file changed: overwriting a member-mapped
@@ -23134,8 +23103,8 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
 /// Rust `sleep` on some hosts) waiting on a `sleep 600` grandchild and
 /// preloading a tmpfs copy of libc so the test owns the bytes it
 /// overwrites; the maps check keeps a silently ignored preload from going
-/// vacuous. Killing `sh` orphans the grandchild, which exits on its own
-/// 30 s bound; nothing else tracks it.
+/// vacuous. The guard reaps the `sleep` grandchild with the shell, so no
+/// orphan pollutes system-wide enumerations.
 #[test]
 fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
@@ -23410,6 +23379,29 @@ fn owned_tree_watch_repeat_counts_its_hits() {
     sleeper.close();
 }
 
+/// Parse and validate a `children`-file body: every field must be a
+/// positive pid. Pure, so malformed input has deterministic unit tests.
+/// (The kernel always writes positive tgids; these clauses fail closed
+/// on anything else rather than trusting the text. A negative pid must
+/// never reach `kill`, where it would address a process group.)
+fn parse_sh_children_list(text: &str, pid: u32) -> Result<Vec<i32>, String> {
+    let grandchildren: Vec<i32> = text
+        .split_whitespace()
+        .map(|field| {
+            field
+                .parse::<i32>()
+                .map_err(|_| format!("sh member {pid} has an unparsable child {field:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if grandchildren.iter().all(|grandchild| *grandchild > 0) {
+        Ok(grandchildren)
+    } else {
+        Err(format!(
+            "sh member {pid} has a non-pid child {grandchildren:?}"
+        ))
+    }
+}
+
 /// Pids listed in a shell member's `children` file: the live sleep
 /// grandchild. Fails loudly when the list is unreadable or unparsable —
 /// an unknown grandchild set must never silently pass as empty.
@@ -23419,22 +23411,7 @@ fn owned_tree_watch_repeat_counts_its_hits() {
 fn sh_wrapped_sleep_grandchildren(pid: u32) -> Result<Vec<i32>, String> {
     let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .map_err(|error| format!("sh member {pid} children unreadable: {error}"))?;
-    children
-        .split_whitespace()
-        .map(|text| {
-            text.parse::<i32>()
-                .map_err(|_| format!("sh member {pid} has an unparsable child {text:?}"))
-        })
-        .collect::<Result<Vec<i32>, String>>()
-        .and_then(|grandchildren| {
-            if grandchildren.iter().all(|pid| *pid > 0) {
-                Ok(grandchildren)
-            } else {
-                Err(format!(
-                    "sh member {pid} has a non-pid child {grandchildren:?}"
-                ))
-            }
-        })
+    parse_sh_children_list(&children, pid)
 }
 
 /// SIGKILL every pid in `grandchildren`, ignoring delivery errors: the
@@ -23453,11 +23430,14 @@ fn kill_sh_sleep_grandchildren(grandchildren: &[i32]) {
 /// Spawning returns only after the sleep grandchild exists (so the shell
 /// is exec'd and settled, and pre-scan maps reads are stable); `close`
 /// SIGKILLs shell and grandchild and verifies both gone, loudly; `Drop`
-/// repeats that best-effort so a mid-test panic cannot strand a 600 s
-/// orphan visible to system-wide enumerations.
+/// repeats best-effort so a mid-test panic cannot strand a 600 s
+/// orphan visible to system-wide enumerations. The grandchild set is
+/// recorded at construction: if the fresh list is ever unreadable,
+/// `Drop` still kills the recorded set instead of stranding it.
 struct ShWrappedSleep {
     pid: u32,
     child: Option<std::process::Child>,
+    grandchildren: Vec<i32>,
 }
 
 impl ShWrappedSleep {
@@ -23484,9 +23464,25 @@ impl ShWrappedSleep {
         let child = command.die_with_parent().spawn().expect("spawn shell");
         let pid = child.id();
         wait_sh_wrapped_sleep_spawned(pid);
+        // Recorded for the `Drop` fallback: a fixture that cannot prove
+        // its grandchild set fails here with a named reason.
+        let grandchildren = sh_wrapped_sleep_grandchildren(pid)
+            .expect("ShWrappedSleep spawn records its grandchild");
         Self {
             pid,
             child: Some(child),
+            grandchildren,
+        }
+    }
+
+    /// Wrap an arbitrary child for error-path tests: no recorded
+    /// grandchild set (the tests below supply the failure).
+    fn from_child_for_test(child: std::process::Child) -> Self {
+        let pid = child.id();
+        Self {
+            pid,
+            child: Some(child),
+            grandchildren: Vec::new(),
         }
     }
 
@@ -23495,11 +23491,18 @@ impl ShWrappedSleep {
     }
 
     fn close(mut self) {
-        let mut child = self.child.take().expect("ShWrappedSleep closed twice");
+        // Fail-closed order: list and kill while the child is still in
+        // the guard, so a panic here unwinds through `Drop` (which owns
+        // cleanup) instead of stranding a moved-out shell+grandchild.
         let grandchildren = sh_wrapped_sleep_grandchildren(self.pid)
             .expect("ShWrappedSleep close lists its grandchild");
-        child.kill().expect("kill wrapped shell");
+        self.child
+            .as_mut()
+            .expect("ShWrappedSleep closed twice")
+            .kill()
+            .expect("kill wrapped shell");
         kill_sh_sleep_grandchildren(&grandchildren);
+        let mut child = self.child.take().expect("ShWrappedSleep closed twice");
         child.wait().expect("reap wrapped shell");
         // SIGKILL lands asynchronously and init reaps on its own
         // schedule: poll for disappearance, then fail loudly on a
@@ -23526,7 +23529,14 @@ impl Drop for ShWrappedSleep {
         if let Some(child) = self.child.as_mut() {
             match sh_wrapped_sleep_grandchildren(self.pid) {
                 Ok(grandchildren) => kill_sh_sleep_grandchildren(&grandchildren),
-                Err(reason) => eprintln!("ShWrappedSleep drop cannot list grandchildren: {reason}"),
+                // Unlistable (the shell died unexpectedly): fall back to
+                // the set recorded at construction. Reuse cannot
+                // intervene — a `sleep 600` that never exited still holds
+                // its pid — so this never silently strands.
+                Err(reason) => {
+                    eprintln!("ShWrappedSleep drop cannot list grandchildren: {reason}");
+                    kill_sh_sleep_grandchildren(&self.grandchildren);
+                }
             }
             let _ = child.kill();
             let _ = child.wait();
@@ -23554,6 +23564,192 @@ fn sh_wrapped_sleep_grandchildren_list_fails_closed() {
     assert!(
         missing.is_err(),
         "an unreadable children list must fail closed, got {missing:?}"
+    );
+}
+
+/// The children-list parser accepts exactly positive pids: empty is
+/// empty (no phantom kills), digits parse, and malformed or
+/// non-positive fields fail — each clause below has a deletion mutant
+/// in the sweep (M14a/M14b).
+#[test]
+fn sh_children_list_parse_rejects_malformed_and_non_positive() {
+    assert_eq!(parse_sh_children_list("", 7), Ok(Vec::new()));
+    assert_eq!(parse_sh_children_list("123 456\n", 7), Ok(vec![123, 456]));
+    assert!(parse_sh_children_list("12x", 7).is_err());
+    assert!(parse_sh_children_list("123 abc", 7).is_err());
+    assert!(parse_sh_children_list("0", 7).is_err());
+    assert!(parse_sh_children_list("-5", 7).is_err());
+    assert!(parse_sh_children_list("123 -5", 7).is_err());
+}
+
+/// Construction records the live grandchild set: the `Drop` fallback
+/// below never fires on an empty record for a normally built guard.
+#[test]
+fn sh_wrapped_sleep_spawn_records_a_live_grandchild() {
+    let guard = ShWrappedSleep::spawn();
+    assert!(
+        !guard.grandchildren.is_empty(),
+        "construction records the live grandchild"
+    );
+    guard.close();
+}
+
+/// `close` on an unlistable shell fails loudly with the named reason,
+/// and the unwind-time `Drop` still reaps the real child: custody is
+/// never lost on the error path. `u32::MAX` makes the list path
+/// deterministically unreadable with no pid-reuse window.
+#[test]
+fn sh_wrapped_sleep_close_fails_closed_on_unreadable_children() {
+    let sleeper = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn shell stand-in");
+    let mut guard = ShWrappedSleep::from_child_for_test(sleeper);
+    let pid = guard.pid;
+    guard.pid = u32::MAX;
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.close()));
+    let error = loud.expect_err("close must fail loudly on an unreadable grandchild list");
+    let message = error.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(
+        message.contains("lists its grandchild"),
+        "named failure reason, got {message:?}"
+    );
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "the error path still reaps the shell"
+    );
+}
+
+/// `Drop` on an unlistable shell neither panics nor strands: it runs
+/// the recorded-set fallback and reaps the shell. The `i32::MAX`
+/// record is deterministically unkillable (ESRCH), so the fallback
+/// line executes with no observable side effect.
+#[test]
+fn sh_wrapped_sleep_drop_covers_an_unlistable_shell() {
+    let sleeper = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn shell stand-in");
+    let pid = sleeper.id();
+    let mut guard = ShWrappedSleep::from_child_for_test(sleeper);
+    guard.pid = u32::MAX;
+    guard.grandchildren = vec![i32::MAX];
+    drop(guard);
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "drop still reaps an unlistable shell"
+    );
+}
+
+/// A long-lived direct-sleeper fixture child with panic-safe cleanup.
+/// Constructors arm parent-death; `close` kills/reaps loudly; `Drop`
+/// repeats best-effort so a mid-test panic (including a loud readiness
+/// panic before any manual cleanup) cannot strand a 600 s sleep visible
+/// to system-wide enumerations.
+struct ParkedSleep {
+    pid: u32,
+    child: Option<std::process::Child>,
+}
+
+impl ParkedSleep {
+    /// Spawn `command` (the caller sets program and args), arm
+    /// parent-death, and prove the child parked before returning.
+    /// Readiness and cleanup custody arrive together: no scan can run
+    /// on an unproven child, and no panic path can leak it.
+    fn spawn_parked(command: &mut std::process::Command) -> Self {
+        let child = command.die_with_parent().spawn().expect("spawn sleeper");
+        let pid = child.id();
+        wait_sleep_child_parked(pid);
+        Self {
+            pid,
+            child: Some(child),
+        }
+    }
+
+    /// Spawn `command` with parent-death armed but prove nothing: the
+    /// test proves readiness itself (settle, exec-row, or handshake)
+    /// before first consumption. Cleanup custody is still immediate.
+    fn spawn_unparked(command: &mut std::process::Command) -> Self {
+        let child = command.die_with_parent().spawn().expect("spawn sleeper");
+        let pid = child.id();
+        Self {
+            pid,
+            child: Some(child),
+        }
+    }
+
+    /// Take cleanup custody of an already-proven live child.
+    fn adopt_proven(child: std::process::Child) -> Self {
+        let pid = child.id();
+        Self {
+            pid,
+            child: Some(child),
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Reach the inner child for fixture-specific I/O (a release write,
+    /// a deliberate mid-test signal); custody stays with the guard.
+    fn inner_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("ParkedSleep used after close")
+    }
+
+    fn close(mut self) {
+        let mut child = self.child.take().expect("ParkedSleep closed twice");
+        child.kill().expect("kill parked sleeper");
+        child.wait().expect("reap parked sleeper");
+    }
+}
+
+impl Drop for ParkedSleep {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// `spawn_parked` returns a parked child and `close` reaps it: after
+/// `close` the pid is provably gone.
+#[test]
+fn parked_sleep_spawns_parked_and_closes_loudly() {
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let pid = sleeper.pid();
+    assert!(
+        !crate::process::process_proven_exited(pid),
+        "a just-spawned sleeper is alive"
+    );
+    sleeper.close();
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "close reaps the sleeper"
+    );
+}
+
+/// Dropping the guard kills a live child even when it never parked and
+/// even when custody arrived through `adopt_proven`.
+#[test]
+fn parked_sleep_drop_kills_without_a_close() {
+    let first = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let first_pid = first.pid();
+    drop(first);
+    assert!(
+        crate::process::process_proven_exited(first_pid),
+        "drop kills an unparked sleeper"
+    );
+    let raw = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn adoptee");
+    let second_pid = raw.id();
+    drop(ParkedSleep::adopt_proven(raw));
+    assert!(
+        crate::process::process_proven_exited(second_pid),
+        "drop kills an adopted sleeper"
     );
 }
 
@@ -23739,23 +23935,28 @@ fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
 #[test]
 fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("unshare")
-        .args(["-U", "-m", "--propagation", "unchanged", "sleep", "600"])
-        .spawn()
-        .expect("spawn unshared sleeper (needs unshare(1) and user namespaces)");
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("unshare").args([
+        "-U",
+        "-m",
+        "--propagation",
+        "unchanged",
+        "sleep",
+        "600",
+    ]));
+
     // `unshare` without `--fork` execs in place: the member pid ends up
     // a parked `sleep`, so the parked proof covers it.
-    wait_sleep_child_parked(sleeper.id());
+
     let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read observer mount ns");
-    let member_ns =
-        std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.id())).expect("read member mount ns");
+    let member_ns = std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.pid()))
+        .expect("read member mount ns");
     assert_ne!(
         observer_ns, member_ns,
         "the member runs in a foreign mount namespace (non-vacuous)"
     );
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23790,8 +23991,7 @@ fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
         0,
         "foreign-namespace groups never hit (all skip)"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Replacing a mapped file by rename never consults: the maps render
@@ -23886,19 +24086,13 @@ fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
 fn owned_tree_watch_rotation_reaches_the_middle_member() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut first_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn first sleeper");
-    let mut second_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn second sleeper");
-    wait_sleep_child_parked(first_sleeper.id());
-    wait_sleep_child_parked(second_sleeper.id());
+    let first_sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let second_sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+        format!("{me}\n{}\n{}\n", first_sleeper.pid(), second_sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23915,7 +24109,7 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
     engine.owned_tree_watch(Some(first));
     engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
     engine.owned_tree_watch(Some(first + 2 * OWNED_WATCH_SCAN_MIN_NS));
-    let mut pids = vec![me, first_sleeper.id(), second_sleeper.id()];
+    let mut pids = vec![me, first_sleeper.pid(), second_sleeper.pid()];
     pids.sort_unstable();
     for pid in &pids {
         assert_eq!(
@@ -23927,10 +24121,9 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
             "fair rotation scans every member, extremes and middle: {pids:?}"
         );
     }
-    first_sleeper.kill().expect("kill first sleeper");
-    first_sleeper.wait().expect("reap first sleeper");
-    second_sleeper.kill().expect("kill second sleeper");
-    second_sleeper.wait().expect("reap second sleeper");
+    first_sleeper.close();
+
+    second_sleeper.close();
 }
 
 /// A rotation member that gains a retained view leaves the rotation:
@@ -23939,14 +24132,11 @@ fn owned_tree_watch_rotation_reaches_the_middle_member() {
 fn owned_tree_watch_prunes_members_that_gain_retained_views() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23959,19 +24149,18 @@ fn owned_tree_watch_prunes_members_that_gain_retained_views() {
     engine.next_view_id = 1;
     engine.owned_tree_watch(Some(1_000));
     assert!(
-        engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        engine.owned_watch_unproven.contains_key(&sleeper.pid()),
         "the unretained member joins the rotation"
     );
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(0), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(0), sleeper.pid()).expect("sleeper view opens"));
     engine.owned_tree_watch(Some(1_000 + OWNED_WATCH_SCAN_MIN_NS));
     assert!(
-        !engine.owned_watch_unproven.contains_key(&sleeper.id()),
+        !engine.owned_watch_unproven.contains_key(&sleeper.pid()),
         "a newly retained member leaves the rotation for the frames"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Telemetry-only watch scans merge quietly: a scan that finds
@@ -23982,14 +24171,11 @@ fn owned_tree_watch_prunes_members_that_gain_retained_views() {
 fn owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{me}\n{}\n", sleeper.id()),
+        format!("{me}\n{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -24015,8 +24201,7 @@ fn owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache() {
         engine.loader_plan_cache.is_some(),
         "a telemetry-only watch run keeps the cached loader plan"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Transient watch view opens charge the capture budget: even a
@@ -24247,19 +24432,13 @@ fn watch_run_over_budget_bounds_time_and_io() {
 fn owned_tree_watch_spent_budget_scans_exactly_one_member_per_run() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let me = std::process::id();
-    let mut first_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn first sleeper");
-    let mut second_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn second sleeper");
-    wait_sleep_child_parked(first_sleeper.id());
-    wait_sleep_child_parked(second_sleeper.id());
+    let first_sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let second_sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n{}\n", first_sleeper.id(), second_sleeper.id()),
+        format!("{}\n{}\n", first_sleeper.pid(), second_sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -24282,10 +24461,9 @@ fn owned_tree_watch_spent_budget_scans_exactly_one_member_per_run() {
         2,
         "the unscanned member keeps its rotation slot"
     );
-    first_sleeper.kill().expect("kill first sleeper");
-    first_sleeper.wait().expect("reap first sleeper");
-    second_sleeper.kill().expect("kill second sleeper");
-    second_sleeper.wait().expect("reap second sleeper");
+    first_sleeper.close();
+
+    second_sleeper.close();
 }
 
 /// The lazy user-pid selector stops once its room fills: two user pids
@@ -44702,13 +44880,16 @@ fn wait_sleep_child_parked(pid: u32) {
 /// while the loader maps the rest.
 #[test]
 fn parked_sleep_has_a_stable_full_census() {
-    let mut child = std::process::Command::new("sleep")
+    let child = std::process::Command::new("sleep")
         .arg("600")
         .die_with_parent()
         .spawn()
         .unwrap();
     let pid = child.id();
     wait_sleep_child_parked(pid);
+    // The park above is the behavior under test; custody only (the
+    // explicit wait stays so the helper itself is exercised).
+    let _child = ParkedSleep::adopt_proven(child);
     let first = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let second = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
@@ -44721,8 +44902,6 @@ fn parked_sleep_has_a_stable_full_census() {
         maps_have_executable_image(&second, &exe),
         "the stable maps carry the image row"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A live `sleep` child whose exec has completed and whose loader is mapped.
@@ -45329,6 +45508,7 @@ fn closed_tick_with_provider_free_newcomer_marks_no_additions_blocked() {
     let sleep = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("600")
+            .die_with_parent()
             .spawn()
             .expect("a provider-free newcomer"),
     );
@@ -45413,6 +45593,7 @@ fn stopped_tick_with_provider_newcomer_marks_unobserved_calls() {
     let anchor = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("600")
+            .die_with_parent()
             .spawn()
             .expect("an anchor member"),
     );
@@ -45454,6 +45635,7 @@ fn stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls() {
     let anchor = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("600")
+            .die_with_parent()
             .spawn()
             .expect("an anchor member"),
     );
@@ -45470,6 +45652,7 @@ fn stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls() {
     let newcomer = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("600")
+            .die_with_parent()
             .spawn()
             .expect("a provider-free newcomer"),
     );
@@ -45495,6 +45678,7 @@ fn stopped_tick_without_newcomer_marks_no_unobserved_calls() {
     let anchor = SystemScopeChildGuard::new(
         std::process::Command::new("sleep")
             .arg("600")
+            .die_with_parent()
             .spawn()
             .expect("an anchor member"),
     );
@@ -67561,13 +67745,8 @@ fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
     // Pin the wall tick quantum: the probe pins below measure admission
     // logic, not scheduler wall time under parallel load.
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let mut head = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn provider-free newcomer");
-    let head_pid = head.id();
-    wait_sleep_child_parked(head_pid);
+    let head = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let head_pid = head.pid();
     // Cgroup scope naming exactly the retained pids plus the viewless
     // newcomer: hermetic enumeration, over-cap ticks, no retirements.
     let dir = tempfile::tempdir().expect("a scope directory");
@@ -67601,8 +67780,6 @@ fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
     );
     assert_eq!(engine.exploratory_evictions, 0, "nothing evicted");
     assert_eq!(engine.discovery_truncated, 0, "completion is not loss");
-    let _ = head.kill();
-    let _ = head.wait();
 }
 
 /// Lane-A P3, fail-closed twin: the same tick must NOT viewless-complete a
@@ -87954,13 +88131,9 @@ fn failed_scarce_rotation_attempt_skips_failed_newcomer_sink() {
 /// gap records the dropped pass.
 #[test]
 fn dropped_apply_keeps_earlier_data_and_names_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -87986,21 +88159,16 @@ fn dropped_apply_keeps_earlier_data_and_names_gap() {
         "a counted named gap records the dropped pass: {:?}",
         engine.counters.object_skips
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// P1-5 first-candidate site: the tick's First `inventory_candidate`
 /// failing drops that pass with a gap, keeping earlier state.
 #[test]
 fn dropped_first_candidate_keeps_earlier_data() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -88022,21 +88190,16 @@ fn dropped_first_candidate_keeps_earlier_data() {
         "a counted named gap records the dropped pass: {:?}",
         engine.counters.object_skips
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// P1-5 final-candidate site: the tick's Final `inventory_candidate`
 /// failing drops that pass with a gap, keeping earlier state.
 #[test]
 fn dropped_final_candidate_keeps_earlier_data() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -88056,21 +88219,16 @@ fn dropped_final_candidate_keeps_earlier_data() {
         "a counted named gap records the dropped pass: {:?}",
         engine.counters.object_skips
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// P1-5 healthy twin: two healthy passes admit and refresh with no
 /// dropped-pass gap. Must pass both before and after containment.
 #[test]
 fn healthy_twin_has_no_dropped_pass_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -88088,20 +88246,13 @@ fn healthy_twin_has_no_dropped_pass_gap() {
         "a healthy twin emits no dropped-pass gap: {:?}",
         engine.counters.object_skips
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// A `sleep` child parked before return: every caller scans it through
 /// engine ticks with exact assertions, so it must hold a stable shape.
-fn spawn_sleep() -> std::process::Child {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    child
+fn spawn_sleep() -> ParkedSleep {
+    ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"))
 }
 
 /// With candidate reuse enabled, a refresh whose post-retirement rescan
@@ -88110,8 +88261,8 @@ fn spawn_sleep() -> std::process::Child {
 /// the full-rebuild twin run beside it.
 #[test]
 fn stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin() {
-    let mut child = spawn_sleep();
-    let pid = child.id();
+    let child = spawn_sleep();
+    let pid = child.pid();
     let (mut reused, _dir_a) = engine_over_cgroup_naming(&[pid]);
     let (mut full, _dir_b) = engine_over_cgroup_naming(&[pid]);
     reused.set_enable_candidate_reuse_for_test(true);
@@ -88153,8 +88304,7 @@ fn stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin() {
         "reuse records identical skips"
     );
     assert_eq!(reused.views.len(), full.views.len());
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// A tick whose inputs move between the First build and the Final build
@@ -88162,8 +88312,8 @@ fn stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin() {
 /// must not reuse: both builds run, exactly as without the feature.
 #[test]
 fn changed_inputs_between_builds_disable_candidate_reuse() {
-    let mut child = spawn_sleep();
-    let pid = child.id();
+    let child = spawn_sleep();
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     // Pin the wall tick quantum like the other tick twins: the call counts
     // below measure rebuild logic, not scheduler wall time under load.
@@ -88173,8 +88323,8 @@ fn changed_inputs_between_builds_disable_candidate_reuse() {
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     let calls = engine.inventory_candidate_calls_for_test;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 0, "the departed view is removed");
     assert_eq!(
@@ -88193,8 +88343,8 @@ fn changed_inputs_between_builds_disable_candidate_reuse() {
 /// the same latched pins as the full twin.
 #[test]
 fn between_builds_pinned_latch_disables_candidate_reuse() {
-    let mut child = spawn_sleep();
-    let pid = child.id();
+    let child = spawn_sleep();
+    let pid = child.pid();
     let (mut reused, _dir_a) = engine_over_cgroup_naming(&[pid]);
     let (mut full, _dir_b) = engine_over_cgroup_naming(&[pid]);
     reused.set_enable_candidate_reuse_for_test(true);
@@ -88241,8 +88391,7 @@ fn between_builds_pinned_latch_disables_candidate_reuse() {
         full.pinned.provider_changed(),
         "the full twin commits the latched pins"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Property twin (oracle = full rebuild): twin engines driven through
@@ -88265,8 +88414,8 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
         let mut state = seed;
         // Four in-scope sleepers up front: the first batch admits all of
         // them, later steps refresh or remove them in random order.
-        let mut children: Vec<std::process::Child> = (0..4).map(|_| spawn_sleep()).collect();
-        let pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+        let mut children: Vec<ParkedSleep> = (0..4).map(|_| spawn_sleep()).collect();
+        let pids: Vec<u32> = children.iter().map(|child| child.pid()).collect();
         let (mut reused, _dir_a) = engine_over_cgroup_naming(&pids);
         let (mut full, _dir_b) = engine_over_cgroup_naming(&pids);
         reused.set_enable_candidate_reuse_for_test(true);
@@ -88282,12 +88431,10 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
             match xorshift(&mut state) % 3 {
                 0 if children.len() > 1 => {
                     let index = 1 + (xorshift(&mut state) as usize) % (children.len() - 1);
-                    let mut child = children.remove(index);
-                    child.kill().unwrap();
-                    child.wait().unwrap();
+                    children.remove(index).close();
                 }
                 1 => {
-                    let pid = children[(xorshift(&mut state) as usize) % children.len()].id();
+                    let pid = children[(xorshift(&mut state) as usize) % children.len()].pid();
                     reused.request_refresh(pid, None);
                     full.request_refresh(pid, None);
                 }
@@ -88318,9 +88465,8 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
                 "seed {seed:#x} step {step}: reuse built more candidates than full"
             );
         }
-        for mut child in children {
-            child.kill().unwrap();
-            child.wait().unwrap();
+        for child in children {
+            child.close();
         }
     }
 }
@@ -88330,13 +88476,9 @@ fn candidate_reuse_matches_full_rebuild_over_random_delta_sequences() {
 /// instead of aborting, keeping earlier data.
 #[test]
 fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -88356,8 +88498,7 @@ fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
         "a counted named gap records the real dropped pass: {:?}",
         engine.counters.object_skips
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// A planned-module pin lost on committed state degrades only that
@@ -89060,13 +89201,9 @@ fn published_inventory_pass_gaps(engine: &Engine) -> Vec<&Skipped> {
 #[test]
 fn repeated_drops_publish_exactly_one_fixed_gap() {
     const ERROR: &str = "test-forced apply failure";
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89120,8 +89257,7 @@ fn repeated_drops_publish_exactly_one_fixed_gap() {
         ("discovery subject", "discovery unavailable"),
         "the dropped-pass gap itself projects to a schema reason"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Drops with different error texts share the one fixed gap: the first
@@ -89131,13 +89267,9 @@ fn repeated_drops_publish_exactly_one_fixed_gap() {
 fn drops_with_different_errors_share_the_one_fixed_gap() {
     const APPLY: &str = "test-forced apply failure";
     const POISON: &str = "test-forced poisoned candidate failure";
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89163,8 +89295,7 @@ fn drops_with_different_errors_share_the_one_fixed_gap() {
         engine.plan.skipped
     );
     assert_eq!(*published[0], first[0], "the first drop's text stays");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// An idle tick (nothing requested, nothing changed) also resets the
@@ -89172,13 +89303,9 @@ fn drops_with_different_errors_share_the_one_fixed_gap() {
 #[test]
 fn idle_tick_resets_the_consecutive_drop_chain() {
     const ERROR: &str = "test-forced apply failure";
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89195,8 +89322,7 @@ fn idle_tick_resets_the_consecutive_drop_chain() {
         engine.consecutive_dropped_passes, 0,
         "an idle tick breaks the chain"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// A healthy tick resets the consecutive-drop chain: drop, healthy,
@@ -89204,13 +89330,9 @@ fn idle_tick_resets_the_consecutive_drop_chain() {
 #[test]
 fn healthy_tick_resets_the_consecutive_drop_chain() {
     const ERROR: &str = "test-forced apply failure";
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89239,8 +89361,7 @@ fn healthy_tick_resets_the_consecutive_drop_chain() {
         engine.refresh_queue.contains_key(&pid),
         "two drops after a healthy tick still retain the request for retry"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Only tick drops count toward the consecutive-drop chain: a dropped
@@ -89282,25 +89403,17 @@ fn admission_gaps(engine: &Engine) -> Vec<&Skipped> {
 /// the capture from claiming complete coverage.
 #[test]
 fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
-    let mut kept = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(kept.id());
-    let kept_pid = kept.id();
+    let kept = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let kept_pid = kept.pid();
     let (mut engine, dir) = engine_over_cgroup_naming(&[kept_pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let mut poison = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(poison.id());
-    let poison_pid = poison.id();
+    let poison = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let poison_pid = poison.pid();
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{kept_pid}\n{poison_pid}\n"),
@@ -89311,13 +89424,9 @@ fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("a broken newcomer never aborts the capture");
     }
-    let mut healthy = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(healthy.id());
-    let healthy_pid = healthy.id();
+    let healthy = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let healthy_pid = healthy.pid();
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{kept_pid}\n{poison_pid}\n{healthy_pid}\n"),
@@ -89367,24 +89476,12 @@ fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
         .map(crate::render::capture_skipped_out)
         .collect();
     assert_eq!(projected[0].reason, "discovery unavailable");
-    let _ = kept.kill();
-    let _ = kept.wait();
-    let _ = poison.kill();
-    let _ = poison.wait();
-    let _ = healthy.kill();
-    let _ = healthy.wait();
 }
 
 /// A `sleep` child parked before return: every caller admits it through
 /// isolation passes with exact strike/gap assertions.
-fn sleeping_child() -> std::process::Child {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    child
+fn sleeping_child() -> ParkedSleep {
+    ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"))
 }
 
 fn write_procs(dir: &tempfile::TempDir, pids: &[u32]) {
@@ -89410,10 +89507,10 @@ fn view_pids(engine: &Engine) -> Vec<u32> {
 /// and commits the healthy one in that same pass.
 #[test]
 fn same_pass_isolation_admits_the_healthy_newcomer_and_holds_the_broken_one() {
-    let mut kept = sleeping_child();
-    let mut healthy = sleeping_child();
-    let mut poison = sleeping_child();
-    let (kept_pid, healthy_pid, poison_pid) = (kept.id(), healthy.id(), poison.id());
+    let kept = sleeping_child();
+    let healthy = sleeping_child();
+    let poison = sleeping_child();
+    let (kept_pid, healthy_pid, poison_pid) = (kept.pid(), healthy.pid(), poison.pid());
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
     write_procs(&dir, &[kept_pid, healthy_pid, poison_pid]);
@@ -89439,10 +89536,6 @@ fn same_pass_isolation_admits_the_healthy_newcomer_and_holds_the_broken_one() {
         "{:?}",
         engine.plan.skipped
     );
-    for child in [&mut kept, &mut healthy, &mut poison] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// A held process is retried after its delay: a second isolation
@@ -89450,9 +89543,9 @@ fn same_pass_isolation_admits_the_healthy_newcomer_and_holds_the_broken_one() {
 /// breaking the pass it is admitted and the hold is removed.
 #[test]
 fn held_back_process_is_retried_and_admitted_once_healthy() {
-    let mut kept = sleeping_child();
-    let mut poison = sleeping_child();
-    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let kept = sleeping_child();
+    let poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.pid(), poison.pid());
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
     write_procs(&dir, &[kept_pid, poison_pid]);
@@ -89492,10 +89585,6 @@ fn held_back_process_is_retried_and_admitted_once_healthy() {
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.held_back_count_for_test(), 0, "the hold is removed");
     assert_eq!(admission_gaps(&engine).len(), 1, "the gap stays as history");
-    for child in [&mut kept, &mut poison] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// The no-newcomer baseline takes the same full rebuild the trials take:
@@ -89504,9 +89593,9 @@ fn held_back_process_is_retried_and_admitted_once_healthy() {
 /// unchanged-tick fast path vouching for a rebuild the trials cannot make.
 #[test]
 fn isolation_baseline_uses_the_full_rebuild() {
-    let mut kept = sleeping_child();
-    let mut healthy = sleeping_child();
-    let (kept_pid, healthy_pid) = (kept.id(), healthy.id());
+    let kept = sleeping_child();
+    let healthy = sleeping_child();
+    let (kept_pid, healthy_pid) = (kept.pid(), healthy.pid());
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     write_procs(&dir, &[kept_pid, healthy_pid]);
     engine.fail_full_candidate_rebuild_for_test = true;
@@ -89531,10 +89620,6 @@ fn isolation_baseline_uses_the_full_rebuild() {
         engine.plan.skipped
     );
     engine.fail_full_candidate_rebuild_for_test = false;
-    for child in [&mut kept, &mut healthy] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// Isolation trials are charged to the pass time budget: once it is
@@ -89542,12 +89627,12 @@ fn isolation_baseline_uses_the_full_rebuild() {
 /// gap (never held), and later passes resolve them.
 #[test]
 fn isolation_trials_stop_when_the_pass_budget_is_spent() {
-    let mut kept = sleeping_child();
-    let mut first = sleeping_child();
-    let mut second = sleeping_child();
-    let mut poison = sleeping_child();
-    let (kept_pid, poison_pid) = (kept.id(), poison.id());
-    let healthy = [first.id(), second.id()];
+    let kept = sleeping_child();
+    let first = sleeping_child();
+    let second = sleeping_child();
+    let poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.pid(), poison.pid());
+    let healthy = [first.pid(), second.pid()];
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
     engine.isolation_trial_budget_for_test = Some(1);
@@ -89583,10 +89668,6 @@ fn isolation_trials_stop_when_the_pass_budget_is_spent() {
     assert!(healthy.iter().all(|pid| pids.contains(pid)), "{pids:?}");
     assert!(!pids.contains(&poison_pid), "{pids:?}");
     assert!(engine.held_back_strikes_for_test(poison_pid).is_some());
-    for child in [&mut kept, &mut first, &mut second, &mut poison] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// A hold belongs to one process generation: a hold whose recorded start
@@ -89594,9 +89675,9 @@ fn isolation_trials_stop_when_the_pass_budget_is_spent() {
 /// enumeration.
 #[test]
 fn held_back_pid_reuse_does_not_inherit_the_hold() {
-    let mut kept = sleeping_child();
-    let mut poison = sleeping_child();
-    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let kept = sleeping_child();
+    let poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.pid(), poison.pid());
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
     write_procs(&dir, &[kept_pid, poison_pid]);
@@ -89611,10 +89692,6 @@ fn held_back_pid_reuse_does_not_inherit_the_hold() {
         engine.plan.skipped
     );
     assert_eq!(engine.held_back_count_for_test(), 0);
-    for child in [&mut kept, &mut poison] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// Above the view cap the process walk still reads every scope member,
@@ -89622,9 +89699,9 @@ fn held_back_pid_reuse_does_not_inherit_the_hold() {
 /// there too, not only under the cap.
 #[test]
 fn held_back_pid_reuse_is_detected_above_the_view_cap() {
-    let mut kept = sleeping_child();
-    let mut poison = sleeping_child();
-    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let kept = sleeping_child();
+    let poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.pid(), poison.pid());
     let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
     write_procs(&dir, &[kept_pid, poison_pid]);
@@ -89640,10 +89717,6 @@ fn held_back_pid_reuse_is_detected_above_the_view_cap() {
         "a reused pid drops its hold above the cap as well: {:?}",
         engine.plan.skipped
     );
-    for child in [&mut kept, &mut poison] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// Measurement (reported, not asserted): one full candidate rebuild over
@@ -89696,24 +89769,16 @@ fn full_candidate_rebuild_at_256_views_is_measured() {
 /// stays as history.
 #[test]
 fn held_back_process_is_forgotten_when_it_exits() {
-    let mut kept = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(kept.id());
-    let kept_pid = kept.id();
+    let kept = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let kept_pid = kept.pid();
     let (mut engine, dir) = engine_over_cgroup_naming(&[kept_pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let mut poison = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(poison.id());
-    let poison_pid = poison.id();
+    let poison = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let poison_pid = poison.pid();
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{kept_pid}\n{poison_pid}\n"),
@@ -89729,8 +89794,8 @@ fn held_back_process_is_forgotten_when_it_exits() {
         }
     }
     assert!(held, "the broken newcomer is held back");
-    poison.kill().unwrap();
-    poison.wait().unwrap();
+    poison.close();
+
     std::fs::write(dir.path().join("cgroup.procs"), format!("{kept_pid}\n")).unwrap();
     for _round in 0..3 {
         apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89741,8 +89806,6 @@ fn held_back_process_is_forgotten_when_it_exits() {
         "the exited hold is released"
     );
     assert_eq!(admission_gaps(&engine).len(), 1, "the gap stays as history");
-    let _ = kept.kill();
-    let _ = kept.wait();
 }
 
 /// The first two consecutive drops retain serviced requests for retry
@@ -89753,13 +89816,9 @@ fn held_back_process_is_forgotten_when_it_exits() {
 /// healthy round under load only costs extra iterations.
 #[test]
 fn third_consecutive_drop_completes_serviced_requests() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
@@ -89793,8 +89852,7 @@ fn third_consecutive_drop_completes_serviced_requests() {
     apply_ordinary_batch(&mut engine, &mut session, vec![])
         .expect("the capture continues after the escalation drop");
     assert_eq!(engine.views.len(), 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// A process whose data persistently breaks the tick candidate stops
@@ -89805,25 +89863,17 @@ fn third_consecutive_drop_completes_serviced_requests() {
 /// incidental healthy round under load only costs extra iterations.
 #[test]
 fn persistently_poisoned_tick_stops_blocking_newcomers() {
-    let mut poison = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(poison.id());
-    let poison_pid = poison.id();
+    let poison = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let poison_pid = poison.pid();
     let (mut engine, dir) = engine_over_cgroup_naming(&[poison_pid]);
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    let mut newcomer = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(newcomer.id());
-    let newcomer_pid = newcomer.id();
+    let newcomer = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let newcomer_pid = newcomer.pid();
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{poison_pid}\n{newcomer_pid}\n"),
@@ -89863,10 +89913,6 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
         pids.contains(&newcomer_pid),
         "the newcomer is admitted: {pids:?}"
     );
-    let _ = poison.kill();
-    let _ = poison.wait();
-    let _ = newcomer.kill();
-    let _ = newcomer.wait();
 }
 
 /// A dropped batch tail keeps committed provider modules, plan
@@ -90074,22 +90120,10 @@ fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
 /// and no capacity gap records (relief, not a stall).
 #[test]
 fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
-    let mut a = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let mut b = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let mut c = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    wait_sleep_child_parked(a.id());
-    wait_sleep_child_parked(b.id());
-    wait_sleep_child_parked(c.id());
-    let (mut engine, dir) = engine_over_cgroup_naming(&[a.id(), b.id()]);
+    let a = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let b = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let c = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let (mut engine, dir) = engine_over_cgroup_naming(&[a.pid(), b.pid()]);
     engine.max_scan_pids = 2;
     engine.frame_work_budget_ns = u64::MAX;
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
@@ -90100,13 +90134,13 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
         !engine.exploratory_evictable_views().is_empty(),
         "relief exists: a retained view is evictable"
     );
-    e06_write_listing(dir.path(), &[a.id(), b.id(), c.id()]);
-    engine.request_refresh(c.id(), crate::attach::monotonic_ns());
+    e06_write_listing(dir.path(), &[a.pid(), b.pid(), c.pid()]);
+    engine.request_refresh(c.pid(), crate::attach::monotonic_ns());
     for _ in 0..4 {
         refresh_inventory_once(&mut engine);
     }
     assert!(
-        engine.views.iter().any(|view| view.pid() == c.id()),
+        engine.views.iter().any(|view| view.pid() == c.pid()),
         "the waiter admits through the freed slot: {:?}",
         engine
             .views
@@ -90125,12 +90159,9 @@ fn capacity_with_evictable_view_admits_waiter_without_capacity_gap() {
         "relief records no capacity gap: {:?}",
         engine.counters.object_skips
     );
-    a.kill().unwrap();
-    b.kill().unwrap();
-    c.kill().unwrap();
-    a.wait().unwrap();
-    b.wait().unwrap();
-    c.wait().unwrap();
+    a.close();
+    b.close();
+    c.close();
 }
 
 /// Startup T1: the segment marker names the segment and its milliseconds,
@@ -98904,11 +98935,12 @@ fn needle_stmt_line(body: &str, stmt: &str) -> Option<usize> {
 /// exe-link-only (or no) wait fails here deterministically; the live-child
 /// race itself is far too rare to kill reliably in-suite. Covers the 6
 /// `wait_sleep_exec_row` sites, the 6 bare settled stops, the shared
-/// `stopped_member_with_row` helper, the 9 parked pre-discover sites, the
-/// 33 spawn-anchored parked groups, the 19 quantum pins, the 6 `sh`
-/// tree-kill sites, the seed READY handshake, the 12 fixture-lifetime
-/// bans, the teardown freshness clause, the static-sleeper spawner, and
-/// the alien census site; plus global bans on exe-link-only exe polls.
+/// `stopped_member_with_row` helper, the 8 parked pre-discover sites, the
+/// 7 spawn-anchored parked groups, the 28 constructor-ordered guard
+/// sites, the 19 quantum pins, the 6 `sh` tree-kill sites, the 51
+/// custody-presence rows, the seed READY handshake, the 12
+/// fixture-lifetime bans, the teardown freshness clause, and the alien
+/// census site; plus global bans on exe-link-only exe polls.
 #[test]
 fn stop_then_read_sites_settle_before_sigstop() {
     let source = include_str!("engine_tests.rs");
@@ -98984,8 +99016,9 @@ fn stop_then_read_sites_settle_before_sigstop() {
         needle_stmt_line(helper, "wait_sleep_child_settled(pid);").expect("helper settles");
     let stop = needle_stmt_line(helper, "stop_member_for_test(pid);").expect("helper stops");
     assert!(settle < stop, "helper: settle must precede the stop");
-    // The 9 parked pre-discover sites: the parked wait precedes the scan.
-    let parked_sites: [(&str, &str); 9] = [
+    // The 8 parked pre-discover sites: the parked wait precedes the scan.
+    // (`id_exhaustion` parks in its guard constructor; see `ctor_order`.)
+    let parked_sites: [(&str, &str); 8] = [
         (
             "initial_scan_zombie_member_is_silent_like_a_reaped_exit",
             "wait_sleep_child_parked(pid);",
@@ -99018,10 +99051,6 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "refresh_requests_survive_allocation_exhaustion",
             "wait_sleep_child_parked(child.id());",
         ),
-        (
-            "id_exhaustion_publishes_skip_instead_of_failing",
-            "wait_sleep_child_parked(child.id());",
-        ),
     ];
     for (name, stmt) in parked_sites {
         let body = needle_fn_body(source, name);
@@ -99037,17 +99066,18 @@ fn stop_then_read_sites_settle_before_sigstop() {
             .unwrap_or_else(|| panic!("{name}: no discover call"));
         assert!(settle < discover, "{name}: park must precede the scan");
     }
-    // Census/shape consumers: (test, (parked statement, spawn marker)
-    // pairs, scan anchor). Each park must sit strictly between its own
-    // spawn and the first scan that can consume that child: scans before
-    // the spawn cannot, so anchoring on the park alone would accept a
-    // park moved below the first consuming scan.
+    // Census/shape consumers with explicit park calls: (test, (parked
+    // statement, spawn marker) pairs, scan anchor). Each park must sit
+    // strictly between its own spawn and the first scan that can consume
+    // that child: scans before the spawn cannot, so anchoring on the
+    // park alone would accept a park moved below the first consuming
+    // scan. Guard-constructed sites live in `ctor_order` below instead.
     type ParkedGroup = (
         &'static str,
         &'static [(&'static str, &'static str)],
         &'static str,
     );
-    let parked_groups: [ParkedGroup; 33] = [
+    let parked_groups: [ParkedGroup; 7] = [
         (
             "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
             &[(
@@ -99055,218 +99085,6 @@ fn stop_then_read_sites_settle_before_sigstop() {
                 "let mut children = ChildrenGuard(",
             )],
             "Engine::discover(",
-        ),
-        (
-            "owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_skips_retained_prunes_exited_and_aged_members",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_backs_off_unproductive_members",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_rotation_reaches_the_middle_member",
-            &[
-                (
-                    "wait_sleep_child_parked(first_sleeper.id());",
-                    "let mut first_sleeper = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(second_sleeper.id());",
-                    "let mut second_sleeper = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_spent_budget_scans_exactly_one_member_per_run",
-            &[
-                (
-                    "wait_sleep_child_parked(first_sleeper.id());",
-                    "let mut first_sleeper = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(second_sleeper.id());",
-                    "let mut second_sleeper = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_prunes_members_that_gain_retained_views",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "dropped_apply_keeps_earlier_data_and_names_gap",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "dropped_first_candidate_keeps_earlier_data",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "dropped_final_candidate_keeps_earlier_data",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "healthy_twin_has_no_dropped_pass_gap",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "real_merge_ordinal_mismatch_drops_pass_with_gap",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "repeated_drops_publish_exactly_one_fixed_gap",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "drops_with_different_errors_share_the_one_fixed_gap",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "idle_tick_resets_the_consecutive_drop_chain",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "healthy_tick_resets_the_consecutive_drop_chain",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted",
-            &[
-                (
-                    "wait_sleep_child_parked(kept.id());",
-                    "let mut kept = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(poison.id());",
-                    "let mut poison = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(healthy.id());",
-                    "let mut healthy = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "held_back_process_is_forgotten_when_it_exits",
-            &[
-                (
-                    "wait_sleep_child_parked(kept.id());",
-                    "let mut kept = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(poison.id());",
-                    "let mut poison = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "third_consecutive_drop_completes_serviced_requests",
-            &[(
-                "wait_sleep_child_parked(child.id());",
-                "let mut child = std::process::Command::new(\"sleep\")",
-            )],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "persistently_poisoned_tick_stops_blocking_newcomers",
-            &[
-                (
-                    "wait_sleep_child_parked(poison.id());",
-                    "let mut poison = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(newcomer.id());",
-                    "let mut newcomer = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "apply_ordinary_batch(",
-        ),
-        (
-            "capacity_with_evictable_view_admits_waiter_without_capacity_gap",
-            &[
-                (
-                    "wait_sleep_child_parked(a.id());",
-                    "let mut a = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(b.id());",
-                    "let mut b = std::process::Command::new(\"sleep\")",
-                ),
-                (
-                    "wait_sleep_child_parked(c.id());",
-                    "let mut c = std::process::Command::new(\"sleep\")",
-                ),
-            ],
-            "refresh_inventory_once(",
         ),
         (
             "closed_tick_with_provider_free_newcomer_marks_no_additions_blocked",
@@ -99309,52 +99127,12 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "u07_tick(",
         ),
         (
-            "probationary_probe_completes_provider_free_newcomer_at_capacity",
-            &[(
-                "wait_sleep_child_parked(head_pid);",
-                "let mut head = std::process::Command::new(\"sleep\")",
-            )],
-            "refresh_inventory_once(",
-        ),
-        (
             "probationary_probe_refuses_without_a_complete_scan",
             &[(
                 "wait_sleep_child_parked(head_pid);",
                 "let head = SystemScopeChildGuard::new(",
             )],
             "refresh_inventory_once(",
-        ),
-        (
-            "owned_tree_watch_keeps_cheap_members_at_the_watch_cadence",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "watch_scans_over(",
-        ),
-        (
-            "owned_tree_watch_backs_off_expensive_members_over_the_same_window",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "watch_scans_over(",
-        ),
-        (
-            "owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"sleep\")",
-            )],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult",
-            &[(
-                "wait_sleep_child_parked(sleeper.id());",
-                "let mut sleeper = std::process::Command::new(\"unshare\")",
-            )],
-            "owned_tree_watch(",
         ),
     ];
     for (name, pairs, anchor) in parked_groups {
@@ -99408,16 +99186,531 @@ fn stop_then_read_sites_settle_before_sigstop() {
             assert!(settle < scan, "{name}: park must precede the first scan");
         }
     }
-    // Spawner helpers park before return; the maps-stability helper is
-    // gated on the exec (pre-exec maps are stable too).
+    // Guard-constructed scan sites: (test, constructor markers,
+    // scan anchor). Construction proves readiness atomically
+    // (spawn plus park), so each marker must precede the first scan
+    // that can consume that child. Markers are unambiguous
+    // (exactly-once) like the quad spawn markers above.
+    let ctor_order: [(&str, &[&str], &str); 28] = [
+        (
+            "owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_skips_retained_prunes_exited_and_aged_members",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_backs_off_unproductive_members",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_prunes_members_that_gain_retained_views",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_rotation_reaches_the_middle_member",
+            &[
+                "let first_sleeper = ParkedSleep::spawn_parked",
+                "let second_sleeper = ParkedSleep::spawn_parked",
+            ],
+            "owned_tree_watch(",
+        ),
+        (
+            "owned_tree_watch_spent_budget_scans_exactly_one_member_per_run",
+            &[
+                "let first_sleeper = ParkedSleep::spawn_parked",
+                "let second_sleeper = ParkedSleep::spawn_parked",
+            ],
+            "owned_tree_watch(",
+        ),
+        (
+            "dropped_apply_keeps_earlier_data_and_names_gap",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "dropped_first_candidate_keeps_earlier_data",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "dropped_final_candidate_keeps_earlier_data",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "healthy_twin_has_no_dropped_pass_gap",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "real_merge_ordinal_mismatch_drops_pass_with_gap",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "repeated_drops_publish_exactly_one_fixed_gap",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "drops_with_different_errors_share_the_one_fixed_gap",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "idle_tick_resets_the_consecutive_drop_chain",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "healthy_tick_resets_the_consecutive_drop_chain",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "third_consecutive_drop_completes_serviced_requests",
+            &["let child = ParkedSleep::spawn_parked"],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted",
+            &[
+                "let kept = ParkedSleep::spawn_parked",
+                "let poison = ParkedSleep::spawn_parked",
+                "let healthy = ParkedSleep::spawn_parked",
+            ],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "held_back_process_is_forgotten_when_it_exits",
+            &[
+                "let kept = ParkedSleep::spawn_parked",
+                "let poison = ParkedSleep::spawn_parked",
+            ],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "persistently_poisoned_tick_stops_blocking_newcomers",
+            &[
+                "let poison = ParkedSleep::spawn_parked",
+                "let newcomer = ParkedSleep::spawn_parked",
+            ],
+            "apply_ordinary_batch(",
+        ),
+        (
+            "capacity_with_evictable_view_admits_waiter_without_capacity_gap",
+            &[
+                "let a = ParkedSleep::spawn_parked",
+                "let b = ParkedSleep::spawn_parked",
+                "let c = ParkedSleep::spawn_parked",
+            ],
+            "refresh_inventory_once(",
+        ),
+        (
+            "owned_tree_watch_keeps_cheap_members_at_the_watch_cadence",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "watch_scans_over(",
+        ),
+        (
+            "owned_tree_watch_backs_off_expensive_members_over_the_same_window",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "watch_scans_over(",
+        ),
+        (
+            "owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult",
+            &["let sleeper = ParkedSleep::spawn_parked"],
+            "owned_tree_watch(",
+        ),
+        (
+            "id_exhaustion_publishes_skip_instead_of_failing",
+            &["ParkedSleep::spawn_parked"],
+            "Engine::discover(",
+        ),
+        (
+            "probationary_probe_completes_provider_free_newcomer_at_capacity",
+            &["let head = ParkedSleep::spawn_parked"],
+            "refresh_inventory_once(",
+        ),
+        (
+            "owned_tree_watch_exec_restarts_the_backoff_streak",
+            &["ParkedSleep::adopt_proven"],
+            "watch_scans_over(",
+        ),
+    ];
+    for (name, markers, anchor) in ctor_order {
+        let body = needle_fn_body(source, name);
+        for marker in markers {
+            let built: Vec<usize> = body
+                .lines()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    line.split_once("//")
+                        .map_or(line, |(code, _)| code)
+                        .contains(marker)
+                        .then_some(idx)
+                })
+                .collect();
+            assert_eq!(
+                built.len(),
+                1,
+                "{name}: constructor marker {marker:?} must occur exactly once"
+            );
+            let scan = body
+                .lines()
+                .enumerate()
+                .position(|(idx, line)| {
+                    idx > built[0]
+                        && line
+                            .split_once("//")
+                            .map_or(line, |(code, _)| code)
+                            .contains(anchor)
+                })
+                .unwrap_or_else(|| panic!("{name}: no {anchor} call after construction"));
+            assert!(
+                built[0] < scan,
+                "{name}: construction must precede the first scan"
+            );
+        }
+    }
+    // Spawner helpers delegate parking to the guard constructor: a
+    // helper that silently returned an unparked child would unpin every
+    // caller at once.
     for helper in ["spawn_sleep", "sleeping_child"] {
+        let body = needle_fn_body(source, helper);
         assert!(
-            needle_stmt_line(
-                needle_fn_body(source, helper),
-                "wait_sleep_child_parked(child.id());"
-            )
-            .is_some(),
-            "{helper}: no parked statement"
+            body.lines().any(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .contains("ParkedSleep::spawn_parked")
+            }),
+            "{helper}: no parking construction"
+        );
+    }
+    // Guard constructors stay proved: the sh guard waits for its
+    // grandchild inside `spawn_inner`, the direct guard parks inside
+    // `spawn_parked`. Deleting either wait leaves every other needle
+    // green while reintroducing the scan-after-spawn race, so these
+    // whole-statement pins kill that revert (M13/M16).
+    let sh_spawn = needle_fn_body(source, "spawn_inner");
+    assert!(
+        needle_stmt_line(sh_spawn, "wait_sh_wrapped_sleep_spawned(pid);").is_some(),
+        "sh guard: no grandchild wait in the constructor"
+    );
+    let sh_wait = needle_fn_body(source, "wait_sh_wrapped_sleep_spawned");
+    assert!(
+        needle_stmt_line(
+            sh_wait,
+            "panic!(\"sh member {pid} never spawned its sleep\");"
+        )
+        .is_some(),
+        "sh wait: no fail-loud bound"
+    );
+    let parked_spawn = needle_fn_body(source, "spawn_parked");
+    assert!(
+        needle_stmt_line(parked_spawn, "wait_sleep_child_parked(pid);").is_some(),
+        "direct guard: no park in the constructor"
+    );
+    // The sh guard records its grandchild set at construction and the
+    // `Drop` fallback kills the recorded set: deleting either line
+    // strands on the unlistable branch with every test still green.
+    for stmt in [
+        ".expect(\"ShWrappedSleep spawn records its grandchild\");",
+        "kill_sh_sleep_grandchildren(&self.grandchildren);",
+    ] {
+        assert!(
+            needle_stmt_line(source, stmt).is_some(),
+            "sh guard lost its recorded-set statement {stmt:?}"
+        );
+    }
+    // Custody presence per converted site: (test, constructor marker,
+    // exact occurrences). Reverting any site to a bare spawn deletes
+    // its marker and fails here; multi-child tests pin every child.
+    let guard_ctors: [(&str, &str, usize); 51] = [
+        (
+            "member_stop_clears_non_provider_files_and_resumes_at_once",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_clears_the_kernel_key_when_maps_show_another_device",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_leaves_an_overlay_inode_mismatch_unproven",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_leaves_a_process_outside_the_run_tree_untouched",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_intake_is_bounded_per_pass",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_never_proves_a_fuse_backed_file",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_resume_keeps_the_row_without_signal_authority",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_bound_never_signals_a_process_born_after_the_stop",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_unreadable_exit_state_never_abandons_a_held_member",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_unknown_stop_instant_is_doubt",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_member_stays_stopped_without_a_service_pass",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "member_stop_release_resumes_held_and_untaken_members",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "parked_sleep_has_a_stable_full_census",
+            "ParkedSleep::adopt_proven",
+            1,
+        ),
+        (
+            "stable_refresh_reuses_the_first_candidate_and_matches_the_full_twin",
+            "spawn_sleep()",
+            1,
+        ),
+        (
+            "changed_inputs_between_builds_disable_candidate_reuse",
+            "spawn_sleep()",
+            1,
+        ),
+        (
+            "between_builds_pinned_latch_disables_candidate_reuse",
+            "spawn_sleep()",
+            1,
+        ),
+        (
+            "candidate_reuse_matches_full_rebuild_over_random_delta_sequences",
+            "spawn_sleep()",
+            1,
+        ),
+        (
+            "same_pass_isolation_admits_the_healthy_newcomer_and_holds_the_broken_one",
+            "sleeping_child()",
+            3,
+        ),
+        (
+            "held_back_process_is_retried_and_admitted_once_healthy",
+            "sleeping_child()",
+            2,
+        ),
+        (
+            "isolation_baseline_uses_the_full_rebuild",
+            "sleeping_child()",
+            2,
+        ),
+        (
+            "isolation_trials_stop_when_the_pass_budget_is_spent",
+            "sleeping_child()",
+            4,
+        ),
+        (
+            "held_back_pid_reuse_does_not_inherit_the_hold",
+            "sleeping_child()",
+            2,
+        ),
+        (
+            "held_back_pid_reuse_is_detected_above_the_view_cap",
+            "sleeping_child()",
+            2,
+        ),
+        (
+            "member_stop_unpinnable_member_resumes_at_the_bound",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_unverified_member_resumes_at_the_bound",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_resume_signals_before_it_withdraws_the_row",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_failed_resume_signal_keeps_the_row",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_unreadable_maps_resume_files_the_first_use_row",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_unproven_stopping_file_resume_files_the_first_use_row",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_watchdog_loss_resumes_unpinnable_and_pending_members",
+            "stopped_member_with_row(&mut",
+            2,
+        ),
+        (
+            "member_stop_row_after_watchdog_loss_is_resumed",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_release_after_watchdog_loss_resumes_an_unreadable_member",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_release_after_watchdog_loss_resumes_an_unpinnable_member",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_release_without_a_grace_period_settles_and_rescans",
+            "stopped_member_with_row(&mut",
+            3,
+        ),
+        (
+            "member_stop_loss_release_without_a_grace_period_settles_each_member",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "member_stop_failed_deactivate_settles_each_member",
+            "stopped_member_with_row(&mut",
+            1,
+        ),
+        (
+            "closed_tick_with_provider_free_newcomer_marks_no_additions_blocked",
+            ".die_with_parent()",
+            1,
+        ),
+        (
+            "stopped_tick_with_provider_newcomer_marks_unobserved_calls",
+            ".die_with_parent()",
+            1,
+        ),
+        (
+            "stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls",
+            ".die_with_parent()",
+            2,
+        ),
+        (
+            "stopped_tick_without_newcomer_marks_no_unobserved_calls",
+            ".die_with_parent()",
+            1,
+        ),
+        (
+            "probationary_probe_refuses_without_a_complete_scan",
+            ".die_with_parent()",
+            1,
+        ),
+        (
+            "max_scan_pids_bounds_initial_scan_and_refresh",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "zero_cap_refresh_short_circuits_the_sweep_to_empty",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "ordinary_over_cap_refresh_performs_no_maps_sweep",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "reconcile_waiter_outside_slice_settles_within_one_sweep",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "reconcile_quantum_zero_defers_the_whole_slice",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "refresh_requests_survive_allocation_exhaustion",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
+            "ChildrenGuard",
+            3,
+        ),
+        (
+            "initial_scan_zombie_member_is_silent_like_a_reaped_exit",
+            "ChildrenGuard",
+            3,
+        ),
+    ];
+    for (name, marker, expected) in guard_ctors {
+        let body = needle_fn_body(source, name);
+        let found = body
+            .lines()
+            .filter(|line| {
+                line.split_once("//")
+                    .map_or(*line, |(code, _)| code)
+                    .contains(marker)
+            })
+            .count();
+        assert_eq!(
+            found, expected,
+            "{name}: custody marker {marker:?} occurs {found}x, want {expected}x"
         );
     }
     // Tests pinning exact per-tick outcomes pin the wall tick quantum, so
@@ -99567,7 +99860,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
     // kill that mutant.
     for stmt in [
         ".expect(\"ShWrappedSleep close lists its grandchild\");",
-        "child.kill().expect(\"kill wrapped shell\");",
+        ".expect(\"kill wrapped shell\");",
         "\"ShWrappedSleep close orphaned its sleep grandchild {pid}\"",
     ] {
         assert!(
@@ -99575,10 +99868,11 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "close lost its loud statement {stmt:?}"
         );
     }
-    // The peer wait proves off-CPU after stability: a descheduled
-    // mid-loader peer shows identical partial snapshots but reads `0`.
-    // The window-hit helper rejects stale hits: the kill starts the
-    // ~160 ms teardown window, so a late hit is near its end.
+    // The peer wait requires the runner's cooperative READY report
+    // (written past `dlopen`, so the loader is done); stability and
+    // wchan inferences are gone. The window-hit helper rejects stale
+    // hits: the kill starts the ~160 ms teardown window, so a late hit
+    // is near its end.
     // The window-hit acceptance pins the whole `&& fresh` condition:
     // deleting the freshness clause fails here.
     let window = needle_fn_body(source, "teardown_spawn_until_window_hit");
@@ -99867,12 +100161,9 @@ fn attaching_session() -> ScriptedSession {
 /// its neighbors) is cleared, so no later mapper stops on them.
 #[test]
 fn member_stop_clears_non_provider_files_and_resumes_at_once() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     let exe = wait_sleep_exec_row(pid);
@@ -99901,8 +100192,6 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
         engine.counters.object_skips.is_empty(),
         "no gap row for a non-provider"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// On overlayfs the hook keys the backing file (its own superblock
@@ -99911,12 +100200,9 @@ fn member_stop_clears_non_provider_files_and_resumes_at_once() {
 /// (The maps device is declared an overlay mount.)
 #[test]
 fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     let exe = wait_sleep_exec_row(pid);
@@ -99939,8 +100225,6 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
     );
     assert!(io.cleared.contains(&maps_key), "its maps key clears too");
     assert!(member_resumed_for_test(pid), "the member runs again");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Twin: the overlay's backing inode number differs from the one `maps`
@@ -99951,12 +100235,9 @@ fn member_stop_clears_the_kernel_key_when_maps_show_another_device() {
 /// unproven: its kernel key stays uncleared and the named row is filed.
 #[test]
 fn member_stop_leaves_an_overlay_inode_mismatch_unproven() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     let exe = wait_sleep_exec_row(pid);
@@ -99980,8 +100261,6 @@ fn member_stop_leaves_an_overlay_inode_mismatch_unproven() {
     assert_eq!(engine.member_stop_stats_for_test().unproven_resumes, 1);
     assert!(files_the_first_use_row(&engine));
     assert!(member_resumed_for_test(pid), "the member runs again");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A row whose tgid now names a process outside the run tree (the
@@ -99989,12 +100268,9 @@ fn member_stop_leaves_an_overlay_inode_mismatch_unproven() {
 /// reading, clearing or signalling that process.
 #[test]
 fn member_stop_leaves_a_process_outside_the_run_tree_untouched() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     let exe = wait_sleep_exec_row(pid);
@@ -100015,8 +100291,6 @@ fn member_stop_leaves_a_process_outside_the_run_tree_untouched() {
         states.values().all(|state| *state == b'T'),
         "the process is never signalled"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A held member's bound is enforced even while the pending table cannot
@@ -100054,12 +100328,9 @@ fn member_stop_bound_resumes_a_held_member_while_the_table_is_unreadable() {
 /// pin whose process cannot be re-proven keeps the row for a later pass.
 #[test]
 fn member_stop_resume_keeps_the_row_without_signal_authority() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     wait_sleep_child_settled(pid);
@@ -100086,21 +100357,15 @@ fn member_stop_resume_keeps_the_row_without_signal_authority() {
     assert!(Engine::resume_member_for_test(&mut io, &fallback));
     assert_eq!(io.withdrawn, vec![pid]);
     assert!(member_resumed_for_test(pid));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A stopped `sleep` with its pending row stamped after its birth on the
 /// hook's clock: the process its row names. Settled before the stop: the
 /// no-grace release paths read each member's maps before its resume, and
 /// SIGSTOP freezes the child wherever it lands.
-fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (std::process::Child, u32, u64) {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (ParkedSleep, u32, u64) {
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let pid = child.pid();
     wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let stop_ns = crate::attach::monotonic_ns().unwrap();
@@ -100145,7 +100410,7 @@ fn files_the_first_use_row(engine: &Engine) -> bool {
 #[test]
 fn member_stop_unpinnable_member_resumes_at_the_bound() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     engine.member_stops.pin_fail.insert(pid);
     let mut session = ScriptedSession::default();
@@ -100164,8 +100429,6 @@ fn member_stop_unpinnable_member_resumes_at_the_bound() {
     assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
     assert_eq!(engine.member_stop_stats_for_test().forced_resumes, 1);
     assert!(files_the_first_use_row(&engine), "the gap is named");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// The same bound for a member whose run-tree membership cannot be read:
@@ -100173,7 +100436,7 @@ fn member_stop_unpinnable_member_resumes_at_the_bound() {
 #[test]
 fn member_stop_unverified_member_resumes_at_the_bound() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     io.membership_errors.insert(pid);
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
@@ -100189,8 +100452,6 @@ fn member_stop_unverified_member_resumes_at_the_bound() {
     assert!(!io.rows.contains_key(&pid));
     assert_eq!(engine.member_stop_stats_for_test().forced_resumes, 1);
     assert!(files_the_first_use_row(&engine));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Twin: at the bound, a tgid whose process was born after the row's
@@ -100198,12 +100459,9 @@ fn member_stop_unverified_member_resumes_at_the_bound() {
 /// reused): its row is withdrawn and it is never signalled.
 #[test]
 fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     wait_sleep_child_settled(pid);
@@ -100232,8 +100490,6 @@ fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
     let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.forced_resumes, 0);
     assert_eq!(stats.not_members, 1);
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// The resume signal goes first; the row is withdrawn only after it was
@@ -100241,7 +100497,7 @@ fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
 #[test]
 fn member_stop_resume_signals_before_it_withdraws_the_row() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let (_child, pid, _) = stopped_member_with_row(&mut io);
     let pin = crate::process::PidPin::open(pid).unwrap();
     let events = io.events.clone();
     let mut send = |pin: &crate::process::PidPin| {
@@ -100253,8 +100509,6 @@ fn member_stop_resume_signals_before_it_withdraws_the_row() {
     ));
     assert_eq!(*io.events.borrow(), vec!["signal", "withdraw"]);
     assert!(member_resumed_for_test(pid));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Twin: a resume signal that fails for a live member keeps its row (a
@@ -100262,7 +100516,7 @@ fn member_stop_resume_signals_before_it_withdraws_the_row() {
 #[test]
 fn member_stop_failed_resume_signal_keeps_the_row() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let (_child, pid, _) = stopped_member_with_row(&mut io);
     let pin = crate::process::PidPin::open(pid).unwrap();
     let mut refuse = |_: &crate::process::PidPin| Err("scripted EPERM".to_string());
     assert!(!Engine::resume_member_with_for_test(
@@ -100273,8 +100527,6 @@ fn member_stop_failed_resume_signal_keeps_the_row() {
     assert!(io.rows.contains_key(&pid), "the row stays");
     assert!(io.withdrawn.is_empty());
     assert!(member_still_stopped_for_test(pid));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A stopped member moved out of the run cgroup (its process provably
@@ -100282,7 +100534,7 @@ fn member_stop_failed_resume_signal_keeps_the_row() {
 #[test]
 fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     io.non_members.insert(pid);
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
@@ -100296,8 +100548,6 @@ fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
         files_the_first_use_row(&engine),
         "its stopping file was never proven: the gap is named"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A stopped member whose maps cannot be read resumes (never wedged),
@@ -100306,7 +100556,7 @@ fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
 #[test]
 fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     engine.member_stops.maps_fail.insert(pid);
     let mut session = ScriptedSession::default();
@@ -100315,8 +100565,6 @@ fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
     assert!(!io.rows.contains_key(&pid));
     assert_eq!(engine.member_stop_stats_for_test().unreadable, 1);
     assert!(files_the_first_use_row(&engine), "the gap is named");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A stopped member whose stopping file is not proven (here: its row
@@ -100326,7 +100574,7 @@ fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
 #[test]
 fn member_stop_unproven_stopping_file_resume_files_the_first_use_row() {
     let mut io = ScriptedMemberStops::default();
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
@@ -100334,8 +100582,6 @@ fn member_stop_unproven_stopping_file_resume_files_the_first_use_row() {
     assert!(!io.rows.contains_key(&pid));
     assert_eq!(engine.member_stop_stats_for_test().unproven_resumes, 1);
     assert!(files_the_first_use_row(&engine), "the gap is named");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// The watchdog gone, a pending member that cannot be pinned is not
@@ -100345,8 +100591,8 @@ fn member_stop_unproven_stopping_file_resume_files_the_first_use_row() {
 #[test]
 fn member_stop_watchdog_loss_resumes_unpinnable_and_pending_members() {
     let mut io = ScriptedMemberStops::default();
-    let (mut unpinnable, unpinnable_pid, stop_ns) = stopped_member_with_row(&mut io);
-    let (mut pending, pending_pid, _) = stopped_member_with_row(&mut io);
+    let (_unpinnable, unpinnable_pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_pending, pending_pid, _) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     engine.member_stops.pin_fail.insert(unpinnable_pid);
     io.guard_lost = true;
@@ -100366,10 +100612,6 @@ fn member_stop_watchdog_loss_resumes_unpinnable_and_pending_members() {
     assert_eq!(stats.forced_resumes, 1, "{stats:?}");
     assert_eq!(stats.lost_guard_resumes, 1, "{stats:?}");
     assert!(files_the_first_use_row(&engine), "the gap is named");
-    for child in [&mut unpinnable, &mut pending] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// An `original_exited` read error is not a departure: the held member
@@ -100377,12 +100619,9 @@ fn member_stop_watchdog_loss_resumes_unpinnable_and_pending_members() {
 /// it.
 #[test]
 fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     wait_sleep_child_settled(pid);
@@ -100416,8 +100655,6 @@ fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
         Some(2 + super::member_stop::MEMBER_STOP_HOLD_NS),
     );
     assert!(member_resumed_for_test(pid), "the next pass resumes it");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// The hold bound counts from the kernel's stop, not from the pass that
@@ -100467,12 +100704,8 @@ fn member_stop_intake_is_bounded_per_pass() {
     let mut children = Vec::new();
     let mut io = ScriptedMemberStops::default();
     for stamp in [3u64, 1, 2] {
-        let child = std::process::Command::new("sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        let pid = child.id();
+        let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+        let pid = child.pid();
         // Settle the exec before stopping: SIGSTOP freezes the child wherever
         // it lands, and the exe link alone is not readiness.
         let exe = wait_sleep_exec_row(pid);
@@ -100493,16 +100726,15 @@ fn member_stop_intake_is_bounded_per_pass() {
     let newest = children
         .iter()
         .find(|(stamp, _)| *stamp == 3)
-        .map(|(_, child)| child.id())
+        .map(|(_, child)| child.pid())
         .unwrap();
     assert_eq!(io.rows.keys().copied().collect::<Vec<_>>(), vec![newest]);
     assert_eq!(io.withdrawn.len(), 2);
     engine.service_member_stops(&mut io, &mut session, Some(20));
     assert!(io.rows.is_empty(), "the next pass takes the rest");
-    for (_, child) in &mut children {
-        assert!(member_resumed_for_test(child.id()));
-        let _ = child.kill();
-        let _ = child.wait();
+    // The vec drop reaps every guard; the loop only asserts resumption.
+    for (_, child) in &children {
+        assert!(member_resumed_for_test(child.pid()));
     }
 }
 
@@ -102535,13 +102767,11 @@ fn member_stop_row_after_watchdog_loss_is_resumed() {
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(io.deactivated);
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
     assert!(member_resumed_for_test(pid), "the late member runs again");
     assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
     assert!(files_the_first_use_row(&engine), "its file is unproven");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Capture end after a lost watchdog: a stopped member whose run-tree
@@ -102558,7 +102788,7 @@ fn member_stop_release_after_watchdog_loss_resumes_an_unreadable_member() {
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(io.deactivated);
-    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, _stop_ns) = stopped_member_with_row(&mut io);
     io.membership_errors.insert(pid);
     engine.release_member_stops(&mut io);
     assert!(
@@ -102567,8 +102797,6 @@ fn member_stop_release_after_watchdog_loss_resumes_an_unreadable_member() {
     );
     assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
     assert!(files_the_first_use_row(&engine));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Twin: capture end after a lost watchdog with a member that cannot be
@@ -102584,7 +102812,7 @@ fn member_stop_release_after_watchdog_loss_resumes_an_unpinnable_member() {
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(10));
     assert!(io.deactivated);
-    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, _stop_ns) = stopped_member_with_row(&mut io);
     engine.member_stops.pin_fail.insert(pid);
     engine.release_member_stops(&mut io);
     assert!(
@@ -102595,8 +102823,6 @@ fn member_stop_release_after_watchdog_loss_resumes_an_unpinnable_member() {
     let stats = engine.member_stop_stats_for_test();
     assert_eq!(stats.forced_resumes, 1, "{stats:?}");
     assert!(files_the_first_use_row(&engine));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A held provider mapper that exits before its provider attaches must
@@ -102694,12 +102920,9 @@ fn member_stop_kernel_refusals_file_the_first_use_row_at_release() {
 /// named first-use gap is filed.
 #[test]
 fn member_stop_never_proves_a_fuse_backed_file() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     let exe = wait_sleep_exec_row(pid);
@@ -102715,8 +102938,6 @@ fn member_stop_never_proves_a_fuse_backed_file() {
     assert!(!io.rows.contains_key(&pid));
     assert_eq!(engine.member_stop_stats_for_test().fuse_resumes, 1);
     assert!(files_the_first_use_row(&engine), "the gap is named");
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A row whose process is gone (and so cannot be pinned) is withdrawn
@@ -102748,32 +102969,24 @@ fn member_stop_release_withdraws_a_gone_members_row() {
 /// member moved out of the tree rather than leaving it stopped.
 #[test]
 fn member_stop_unknown_stop_instant_is_doubt() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     wait_sleep_child_settled(pid);
     stop_member_for_test(pid);
     let pin = crate::process::PidPin::open(pid).unwrap();
     assert!(super::stopped_member_moved_out(&pin, 0));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Twin: without a service pass the stopped member stays stopped (the
 /// resume above is the service's, not the fixture's).
 #[test]
 fn member_stop_member_stays_stopped_without_a_service_pass() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let pid = child.pid();
     // Settle the exec before stopping: SIGSTOP freezes the child wherever
     // it lands, and the exe link alone is not readiness.
     wait_sleep_child_settled(pid);
@@ -102781,8 +102994,6 @@ fn member_stop_member_stays_stopped_without_a_service_pass() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     let states = crate::discovery::pause::read_task_states(pid).unwrap();
     assert!(states.values().all(|state| *state == b'T'));
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// A member stopped with a provider mapped stays stopped while the
@@ -103225,12 +103436,9 @@ fn member_stop_release_resumes_held_and_untaken_members() {
     let library = fixture._dir.path().join("seed-provider.so");
     stop_member_for_test(pid);
     let key = member_exec_key_for_test(pid, &library);
-    let mut other = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let other_pid = other.id();
+    let other = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    let other_pid = other.pid();
     wait_sleep_child_settled(other_pid);
     stop_member_for_test(other_pid);
     let mut io = ScriptedMemberStops::default();
@@ -103253,8 +103461,6 @@ fn member_stop_release_resumes_held_and_untaken_members() {
     assert!(io.rows.is_empty(), "every row is withdrawn");
     assert!(member_resumed_for_test(pid));
     assert!(member_resumed_for_test(other_pid));
-    let _ = other.kill();
-    let _ = other.wait();
 }
 
 /// When the event-driven apply can run, a provider mapper's whole hold
@@ -103317,13 +103523,10 @@ fn watch_scans_over(engine: &mut Engine, member: u32, runs: u64) -> u32 {
 /// cheap bound.
 #[test]
 fn owned_tree_watch_keeps_cheap_members_at_the_watch_cadence() {
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn sleeper");
-    let member = sleeper.id();
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let member = sleeper.pid();
+
     let (_dir, mut engine) = watch_engine_with_member(member);
     let scans = watch_scans_over(&mut engine, member, 30);
     assert!(
@@ -103339,8 +103542,7 @@ fn owned_tree_watch_keeps_cheap_members_at_the_watch_cadence() {
     let cost = engine.budget.attempted_io_bytes().saturating_sub(before);
     eprintln!("owned watch scan of a sleep member: {cost} attempted I/O bytes");
     assert!(cost > 0 && cost < OWNED_WATCH_CHEAP_SCAN_BYTES, "{cost}");
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Twin: the same member counted expensive backs off to a handful of
@@ -103348,13 +103550,10 @@ fn owned_tree_watch_keeps_cheap_members_at_the_watch_cadence() {
 /// which proved a 200 ms-late load only after a 250 ms delay).
 #[test]
 fn owned_tree_watch_backs_off_expensive_members_over_the_same_window() {
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn sleeper");
-    let member = sleeper.id();
-    wait_sleep_child_parked(sleeper.id());
+    let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+
+    let member = sleeper.pid();
+
     let (_dir, mut engine) = watch_engine_with_member(member);
     engine.owned_watch_cheap_scan_bytes = 0;
     let scans = watch_scans_over(&mut engine, member, 30);
@@ -103362,8 +103561,7 @@ fn owned_tree_watch_backs_off_expensive_members_over_the_same_window() {
         (4..=7).contains(&scans),
         "an expensive member backs off, got {scans} of 30"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// An exec restarts a backed-off member's streak: the new image is
@@ -103416,6 +103614,8 @@ fn owned_tree_watch_exec_restarts_the_backoff_streak() {
         }
     }
     assert_eq!(&ready, b"READY", "the member printed READY past startup");
+    // Custody from here on: a later panic must not strand the member.
+    let mut member = ParkedSleep::adopt_proven(member);
     let (_dir, mut engine) = watch_engine_with_member(pid);
     engine.owned_watch_cheap_scan_bytes = 0;
     watch_scans_over(&mut engine, pid, 10);
@@ -103423,7 +103623,13 @@ fn owned_tree_watch_exec_restarts_the_backoff_streak() {
     assert!(streak >= 3, "the shell backed off first: {streak}");
     let scans_before = engine.owned_watch_unproven[&pid].scans;
     let image_before = engine.owned_watch_unproven[&pid].image;
-    member.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    member
+        .inner_mut()
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"go\n")
+        .unwrap();
     for _ in 0..500 {
         if owned_watch_member_image(&engine.proc_root, pid) != image_before {
             break;
@@ -103441,8 +103647,7 @@ fn owned_tree_watch_exec_restarts_the_backoff_streak() {
         entry.unproductive, 1,
         "the streak restarted for the new image"
     );
-    member.kill().expect("kill member");
-    member.wait().expect("reap member");
+    member.close();
 }
 
 /// A mapping-heavy member (thousands of maps rows, like the 345 KB-maps
@@ -103554,21 +103759,19 @@ fn member_stop_releases_wait_for_in_flight_hooks_before_the_first_scan() {
 #[test]
 fn member_stop_release_without_a_grace_period_settles_and_rescans() {
     let mut healthy = ScriptedMemberStops::default();
-    let (mut child, pid, _) = stopped_member_with_row(&mut healthy);
+    let (_child, pid, _) = stopped_member_with_row(&mut healthy);
     let mut engine = member_stop_engine();
     engine.release_member_stops(&mut healthy);
     assert!(member_resumed_for_test(pid));
     assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 0);
-    let _ = child.kill();
-    let _ = child.wait();
 
     let mut io = ScriptedMemberStops {
         no_grace: true,
         ..Default::default()
     };
-    let (mut seen, seen_pid, _) = stopped_member_with_row(&mut io);
+    let (_seen, seen_pid, _) = stopped_member_with_row(&mut io);
     let mut other = ScriptedMemberStops::default();
-    let (mut late, late_pid, _) = stopped_member_with_row(&mut other);
+    let (_late, late_pid, _) = stopped_member_with_row(&mut other);
     io.late_rows.append(&mut other.rows);
     let mut engine = member_stop_engine();
     engine.release_member_stops(&mut io);
@@ -103580,10 +103783,6 @@ fn member_stop_release_without_a_grace_period_settles_and_rescans() {
     );
     assert!(io.rows.is_empty(), "{:?}", io.rows.keys());
     assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 2);
-    for child in [&mut seen, &mut late] {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
 
 /// The same at a watchdog loss: each pending member's maps are read
@@ -103595,14 +103794,12 @@ fn member_stop_loss_release_without_a_grace_period_settles_each_member() {
         guard_lost: true,
         ..Default::default()
     };
-    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let (_child, pid, stop_ns) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1));
     assert!(member_resumed_for_test(pid));
     assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 1);
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Scenario A: a provider mapper departs while held and the watchdog is
@@ -103759,13 +103956,11 @@ fn member_stop_failed_deactivate_settles_each_member() {
         fail_deactivate: true,
         ..Default::default()
     };
-    let (mut child, pid, _) = stopped_member_with_row(&mut io);
+    let (_child, pid, _) = stopped_member_with_row(&mut io);
     let mut engine = member_stop_engine();
     engine.release_member_stops(&mut io);
     assert!(member_resumed_for_test(pid));
     assert_eq!(engine.member_stop_stats_for_test().unsettled_reads, 1);
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Runs one member-stop pass over a stopped provider mapper with the

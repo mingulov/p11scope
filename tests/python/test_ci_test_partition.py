@@ -232,7 +232,11 @@ class SelfPinGuardTests(unittest.TestCase):
         self.assertIn("time/progress\n//! budget with a named gap", manifest)
         discovery_id = (ROOT / "src" / "discovery" / "identity.rs").read_text()
         self.assertIn("budget.check_deadline_now()", discovery_id)
-        self.assertIn("budget.allowed_capture_io(suffix.len())", discovery_id)
+        # Structural (not exact text): the identity hash charge calls
+        # allowed_capture_io against a byte-length, whatever the local
+        # binding is named (bytes/suffix/...). The ceiling error below
+        # proves the allowance is enforced, not just computed.
+        self.assertRegex(discovery_id, r"budget\.allowed_capture_io\(\w+\.len\(\)\)")
         self.assertIn("IO_CEILING_REASON", discovery_id)
         scan = (ROOT / "src" / "discovery" / "scan.rs").read_text()
         self.assertIn("pub(crate) const IO_CEILING_REASON", scan)

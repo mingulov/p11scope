@@ -782,7 +782,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             return [line.strip() for line in body.splitlines()
                     if line.strip() and not line.strip().startswith("#")]
         expected = array("DEFAULT_TESTS") + ["attach::tests::full_root_load_refusal_is_classified"]
-        self.assertEqual(cells, expected)
+        self.assertEqual(cells, expected,
+                         "campaign floor drifted from the runner: edit "
+                         "tests/privileged-campaign.json default_cells in runner order "
+                         "and set default_floor to the cell count")
         self.assertIn("privileged-inputs-default/selectors.txt", self.yml)
         self.assertIn("tests/privileged-campaign.json", self.yml)
         self.assertIn("dropped below the floor", self.yml)

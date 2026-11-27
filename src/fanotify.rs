@@ -1168,6 +1168,27 @@ impl FileLearner {
     /// capture continues and says so), whatever traffic older
     /// filesystems produce.
     pub(crate) fn begin_drain(&mut self) -> Result<(), LearnAbsent> {
+        self.begin_drain_with(drain_loop)
+    }
+
+    /// [`begin_drain`] with the drain body injected: production passes
+    /// [`drain_loop`]; the unprivileged handoff twin passes a recorder
+    /// and drives this real composition — take pending, split the
+    /// arming, spawn — with a dummy group, asserting the drain receives
+    /// the exact covered set, cursor, gap, and FIONREAD unit. Dropping
+    /// or zeroing any handoff field fails
+    /// `learn_begin_drain_handoff_reaches_drain`.
+    fn begin_drain_with(
+        &mut self,
+        drain: impl FnOnce(
+            OwnedFd,
+            SyncSender<LearnMsg>,
+            Arc<LearnShutdownState>,
+            RemarkState,
+            FionreadUnit,
+        ) + Send
+        + 'static,
+    ) -> Result<(), LearnAbsent> {
         if self.thread.is_some() {
             return Ok(());
         }
@@ -1180,7 +1201,7 @@ impl FileLearner {
         match std::thread::Builder::new()
             .name("p11scope-learn".to_string())
             .spawn(move || {
-                drain_loop(group, tx, worker_state, remark, fionread);
+                drain(group, tx, worker_state, remark, fionread);
                 let _ = done_tx.send(());
             }) {
             Ok(thread) => {
@@ -5563,6 +5584,77 @@ mod tests {
             },
             "the FIONREAD unit carries exactly"
         );
+    }
+
+    /// The begin-drain composition hands the pending arming to the
+    /// drain body exactly: a recorder drain receives the covered set,
+    /// cursor, gap, and FIONREAD unit the pending arming carried, and a
+    /// second call is a no-op. Zeroing any handoff field, or skipping
+    /// the split, fails this twin. (Unprivileged: dummy group fd, the
+    /// recorder thread is joined.)
+    #[test]
+    fn learn_begin_drain_handoff_reaches_drain() {
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let mut learner = super::FileLearner {
+            state: std::sync::Arc::new(super::LearnShutdownState::default()),
+            thread: None,
+            pending: Some(super::PendingArming {
+                group,
+                tx,
+                covered: covered.clone(),
+                initial_gap_owed: true,
+                remark_cursor: Some(std::path::PathBuf::from("/mnt/m4136")),
+                fionread_unit: 96,
+                fionread_exact: false,
+            }),
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        learner
+            .begin_drain_with(move |_group, _tx, _state, remark, fionread| {
+                seen_tx.send((remark, fionread)).unwrap();
+            })
+            .expect("drain begins");
+        assert!(learner.thread.is_some(), "the drain thread exists");
+        assert!(learner.pending.is_none(), "pending is consumed");
+        let (remark, fionread) = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the recorder drain ran");
+        assert_eq!(remark.covered, covered);
+        assert_eq!(
+            remark.cursor,
+            Some(std::path::PathBuf::from("/mnt/m4136")),
+            "the drain resumes where the startup stopped"
+        );
+        assert!(remark.gap_owed, "the startup gap carries into the drain");
+        assert_eq!(
+            fionread,
+            super::FionreadUnit {
+                bytes: 96,
+                exact: false
+            }
+        );
+        // Idempotent: a second begin runs no drain body.
+        learner
+            .begin_drain_with(|_, _, _, _, _| panic!("must not run again"))
+            .expect("second begin ok");
+        assert!(
+            !learner.shutdown_and_join_pumping(|| {}),
+            "a quiet recorder drain loses no tail"
+        );
+        // Nothing pending: begin is a no-op without spawning.
+        let mut empty = super::FileLearner {
+            state: std::sync::Arc::new(super::LearnShutdownState::default()),
+            thread: None,
+            pending: None,
+        };
+        empty
+            .begin_drain_with(|_, _, _, _, _| panic!("nothing pending"))
+            .expect("empty begin ok");
+        assert!(empty.thread.is_none());
     }
 
     /// The remark state adopts landed results exactly: the next covered

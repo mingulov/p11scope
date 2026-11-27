@@ -4340,9 +4340,9 @@ impl JournalAdapter {
         if raw.len() != JOURNAL_END_FULL_BYTES {
             return false;
         }
-        // Event (328) + continuity entry_ip (8): the entry stamp's
-        // first byte. Continuity is private helper data, so the
-        // validator takes the patched record.
+        // Event (328) + continuity first word (8): the entry
+        // stamp's first byte. Continuity is private helper data, so
+        // the validator takes the patched record.
         const STAMP_AT: usize = JOURNAL_COMMON_BYTES + 328 + 8;
         let mut patched = [0u8; JOURNAL_END_FULL_BYTES];
         patched.copy_from_slice(raw);

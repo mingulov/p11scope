@@ -109372,3 +109372,95 @@ fn refresh_refusals_past_a_full_queue_burn_no_work_budget() {
         "one hundred thousand refusals burned no budget: discovery still admits work"
     );
 }
+
+/// S1: two retired views with unreadable interface names stay distinct
+/// through the carrier into the selection inventory. The names cannot
+/// tell the rows apart (both unknown), so only the carried file keys
+/// keep them distinct: same-file rows would legitimately merge into
+/// one carrier surface, but different files must ride as two rows
+/// with two different selection identities and both admitted.
+#[test]
+fn s1_two_retired_views_with_unreadable_names_stay_distinct() {
+    let mut older = overlay_module(overlay_key(89));
+    older.view = ProcessViewId(1);
+    older.interfaces.push(ScannedInterface {
+        index: 0,
+        name_class: "unreadable",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    });
+    let mut newer = overlay_module(overlay_key(90));
+    newer.view = ProcessViewId(2);
+    newer.interfaces.push(ScannedInterface {
+        index: 0,
+        name_class: "unreadable",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table: Some(0),
+    });
+    let mut pins = overlay_pins(&[
+        (overlay_key(89), OVERLAY_SHA, 1),
+        (overlay_key(90), OVERLAY_SHA, 1),
+    ]);
+    record_scan_ownership(&mut pins, ProcessViewId(1), overlay_key(89), OVERLAY_PATH);
+    record_scan_ownership(&mut pins, ProcessViewId(2), overlay_key(90), OVERLAY_PATH);
+    // Retire both views: the carrier re-views and merges by file key,
+    // so the two files must ride as two rows.
+    let mut raws = vec![older, newer];
+    let removed: BTreeSet<ProcessViewId> =
+        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]);
+    let live: BTreeSet<ProcessViewId> = BTreeSet::new();
+    normalize_carried_modules(&mut raws, &pins, &removed, &live, false);
+    assert_eq!(raws.len(), 2, "both files ride the carrier");
+    assert!(
+        raws.iter().all(|row| row.view == Engine::CARRIED_VIEW_ID),
+        "both rows are carried"
+    );
+    // Selection identities stay distinct: the unreadable names cannot
+    // conflate the two files' evidence.
+    let mut facts = CaptureFacts::default();
+    facts.begin_stage().unwrap();
+    let bases: Vec<InventorySurfaceBase> = raws
+        .iter()
+        .map(|row| {
+            let id = pins
+                .id_for_scanned(row, row.key, &row.path)
+                .expect("each carried row binds through its own custody");
+            let provider = pins
+                .owned_timing_key(id)
+                .expect("the bound pin has a timing key");
+            let interface = &row.interfaces[0];
+            assert!(
+                matches!(
+                    private_selection_name(interface, row.view),
+                    PrivateSelectionName::Unreadable(_, _)
+                ),
+                "the hard case: names unknown"
+            );
+            InventorySurfaceBase {
+                provider,
+                table_file_offset: row.tables[0].file_offset.unwrap(),
+                kind: InventorySurfaceKind::Interface,
+                name: private_selection_name(interface, row.view),
+                version: inventory_version_class(row.tables[0].version),
+                flags: interface.flags,
+                manifest_identity: None,
+            }
+        })
+        .collect();
+    let keys = canonical_inventory_keys(bases);
+    assert_eq!(keys.len(), 2, "two selection keys built");
+    assert_ne!(
+        keys[0], keys[1],
+        "the two retired views' identities stay distinct"
+    );
+    let admitted = admit_inventory_keys(facts.visible_history_mut(), keys);
+    assert_eq!(
+        admitted.len(),
+        2,
+        "both views' identities are distinct inventory evidence"
+    );
+}

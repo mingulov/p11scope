@@ -639,6 +639,8 @@ else:
                        "Binary: /usr/bin/p11scope", "missing CAP_BPF", "setcap",
                        "cmp /usr/bin/p11scope", 'check-capture-evidence.py" clean-metrics',
                        "check-count-multiset.py", "softhsm2-util --init-token",
+                       "set -- p11scope_*.deb", "set -- p11scope-*.rpm",
+                       'test "$#" -eq 1',
                        "p11scope-discover --version", "apt-get remove",
                        "fedora:44", "dnf install", "dnf remove"):
             self.assertIn(marker, bodies, f"install test must {marker}")

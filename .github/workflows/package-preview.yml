@@ -250,7 +250,10 @@ jobs:
           set -euo pipefail
           cd install-test
           sha256sum --check SHA256SUMS
-          sudo apt-get install -y ./p11scope_*.deb
+          set -- p11scope_*.deb
+          test "$#" -eq 1
+          test -f "$1"
+          sudo apt-get install -y ./"$1"
           p11scope --version
           set +e
           sudo p11scope doctor >doctor.txt 2>&1
@@ -324,7 +327,10 @@ jobs:
             set -euo pipefail
             cd /work
             sha256sum --check SHA256SUMS
-            dnf install -y ./p11scope-*.rpm
+            set -- p11scope-*.rpm
+            test "$#" -eq 1
+            test -f "$1"
+            dnf install -y ./"$1"
             p11scope --version
             set +e
             p11scope doctor >/tmp/doctor.txt 2>&1

@@ -106174,6 +106174,29 @@ fn owned_tree_watch_exec_restarts_the_backoff_streak() {
     member.close();
 }
 
+/// Program-analysis edge cases for the custody gate (helpers live
+/// beside `custody_statement`; placed here, below every pinned line,
+/// so this test never shifts the exemption/split coordinates).
+#[test]
+fn custody_program_analysis_covers_rare_argument_shapes() {
+    use CustodyProgram::{Family, Unresolved};
+    // Turbofish.
+    assert_eq!(
+        custody_program("Command::new::<PathBuf>(p)", ""),
+        (Unresolved("p".to_string()), "p".to_string())
+    );
+    // Worst case across several `new`s in one statement.
+    assert_eq!(
+        custody_program("a(Command::new(\"gcc\")); b(Command::new(\"sleep\"))", ""),
+        (Family("sleep".to_string()), "sleep".to_string())
+    );
+    // Reference to a literal.
+    assert_eq!(
+        custody_program("Command::new(&\"sleep\")", ""),
+        (Family("sleep".to_string()), "sleep".to_string())
+    );
+}
+
 /// A mapping-heavy member (thousands of maps rows, like the 345 KB-maps
 /// shape) costs more than the cheap bound per scan and still backs off
 /// under the default bound: only small members keep the cadence.

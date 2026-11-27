@@ -39533,7 +39533,7 @@ fn key_operation_absorbable_fault_counts_absorb_without_minting() {
     );
     // The claimed abandonment dooms on the first seal: absorb, then doom.
     assert_eq!(
-        waited.err().expect("the fault seal dooms").gap,
+        waited.expect_err("the fault seal dooms").gap,
         JournalGap::DomainTainted,
         "the staged doom lands typed and fenceless"
     );
@@ -39614,7 +39614,7 @@ fn key_operation_absorbable_fault_keeps_quarantine_typed() {
         "the post-collection move absorbs as a reread"
     );
     assert_eq!(
-        refused.err().expect("the tainted seal refuses").gap,
+        refused.expect_err("the tainted seal refuses").gap,
         JournalGap::ImageTainted,
         "the tainted image fails the seal closed after the absorb"
     );
@@ -39705,7 +39705,7 @@ fn key_operation_absorbable_fault_with_staged_doom_delivers_typed() {
         "absorbing voids nothing"
     );
     // The claimed abandonment dooms on the first seal: absorb, then doom.
-    let doom = waited.err().expect("the fault seal dooms");
+    let doom = waited.expect_err("the fault seal dooms");
     assert_eq!(
         doom.gap,
         JournalGap::DomainTainted,
@@ -39754,7 +39754,7 @@ fn key_operation_absorbable_fault_counts_distinct_moves_reread_then_chain() {
     );
     let waited = scene.seal_with_fault(7, 9);
     assert_eq!(
-        waited.err().expect("the advanced move absorbs").gap,
+        waited.expect_err("the advanced move absorbs").gap,
         JournalGap::BoundNotReady,
         "nothing left to convert waits"
     );

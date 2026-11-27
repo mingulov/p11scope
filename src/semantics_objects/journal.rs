@@ -2784,7 +2784,7 @@ impl<'a> SealPools<'a> {
     pub(crate) fn steps(&mut self) -> &mut usize {
         match &mut self.steps {
             SealSteps::Shared => &mut *self.scan,
-            SealSteps::Split(steps) => &mut **steps,
+            SealSteps::Split(steps) => steps,
         }
     }
 }

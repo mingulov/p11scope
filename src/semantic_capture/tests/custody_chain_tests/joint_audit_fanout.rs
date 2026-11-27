@@ -21560,9 +21560,8 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
     // re-arms at re-completion.
     let mut rescan_polls = 0usize;
     let mut max_binding = 0usize;
-    let mut done_poll = None;
     let mut first_collect_poll = None;
-    loop {
+    let done_poll = loop {
         assert!(
             drain_polls + rescan_polls < bound,
             "the rescan lands within its derived bound (polls={} bound={bound} drain={drain_units} bindings={nbindings} targets={ntargets})",
@@ -21587,8 +21586,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
                 (0, None, 0),
                 "re-completion resets the cursors"
             );
-            done_poll = Some(rescan_polls);
-            break;
+            break rescan_polls;
         }
         assert!(
             (binding, after, entry) != (before.3, before.4, before.5),
@@ -21598,7 +21596,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             fixture.native.collect_calls, collect_before,
             "no collection starts before the rescan re-completes"
         );
-    }
+    };
     assert!(
         max_binding >= nbindings,
         "the rescan walked past the admitted index {nbindings} (max {max_binding})"
@@ -21630,9 +21628,8 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
     // after re-completion, never before.
     if let Some(collect_poll) = first_collect_poll {
         assert!(
-            collect_poll >= done_poll.expect("re-completed"),
-            "collection waits for re-completion (collect {collect_poll} done {})",
-            done_poll.unwrap_or(0),
+            collect_poll >= done_poll,
+            "collection waits for re-completion (collect {collect_poll} done {done_poll})",
         );
     }
 }
@@ -44556,8 +44553,6 @@ fn joint_failure_absorbed_move_delivers_trivially_ready() {
     );
     // Delivery reads no fault cell, so the absorb count below is the
     // seal's alone: exactly one reread absorb, no void.
-    drop(births);
-    drop(ports);
     let voids_after = fixture
         .scene
         .real

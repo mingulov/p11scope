@@ -71,10 +71,11 @@ def typed_sidecar_signature(path_text):
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None, "typed signature sidecar is missing or invalid JSON"
-    value, _load_problems = checker_module().strict_json(text, str(path))
-    if value is None:
+    checker = checker_module()
+    value, _load_problems = checker.strict_json(text, str(path))
+    if value is checker.PARSE_FAILED:
         return None, "typed signature sidecar is missing or invalid JSON"
-    problems = checker_module().signature_problems(value)
+    problems = checker.signature_problems(value)
     if problems:
         return None, "typed signature sidecar is not a typed signature: " + "; ".join(problems)
     return value, None
@@ -116,8 +117,9 @@ def main(argv):
         print(f"privileged-lib-results: cannot read ignored-test registry: {error}", file=sys.stderr)
         return 1
     registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")
-    if registry is None:
-        print(f"privileged-lib-results: cannot read ignored-test registry: {registry_problems[0]}", file=sys.stderr)
+    if registry_problems or type(registry) is not dict:
+        detail = registry_problems[0] if registry_problems else "registry must be a JSON object"
+        print(f"privileged-lib-results: cannot read ignored-test registry: {detail}", file=sys.stderr)
         return 1
     files = {}
     ambiguous = set()

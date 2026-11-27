@@ -381,6 +381,15 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid JSON", result.stderr)
 
+    def test_null_and_scalar_rows_are_rejected_typed(self):
+        good = {"cell": "good", "pass": True, "qualification": "qualified", "detail": "d"}
+        for line in ("null", "0", "[]"):
+            with self.subTest(line=line):
+                result = run_checker([json.dumps(good), line], "--require", "good")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("row is not an object", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_duplicate_cells_fail(self):
         result = run_checker([row("a", True), row("a", True)])
         self.assertNotEqual(result.returncode, 0)
@@ -648,6 +657,15 @@ class TypedCellResultsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing or invalid JSON", result.stderr)
 
+    def test_null_and_scalar_sidecars_are_rejected_typed(self):
+        for content in ("null\n", '"s"\n'):
+            with self.subTest(content=content):
+                result, _document = run_typed_checker(
+                    [row("a", False)], "--require", "a", sidecars={"a": content})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not a typed signature", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_duplicate_registry_keys_map_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             temp = Path(tmp)
@@ -662,6 +680,19 @@ class TypedCellResultsTests(unittest.TestCase):
                 encoding="utf-8")
             module = load_script(temp / "scripts/ci/check-cell-results.py",
                                  "cell_checker_registry_dup")
+            self.assertEqual(module.ignored_test_files(), {})
+
+    def test_null_registry_maps_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "tests").mkdir()
+            (temp / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
+            module = load_script(temp / "scripts/ci/check-cell-results.py",
+                                 "cell_checker_registry_null")
             self.assertEqual(module.ignored_test_files(), {})
 
     def test_passing_cell_with_failure_sidecar_is_a_protocol_violation(self):

@@ -273,6 +273,16 @@ class StaticValidationTests(unittest.TestCase):
     def test_signature_cell_must_equal_the_row_cell(self):
         self.assert_bad_row(row(signature={"cell": "OTHER", "branch": "B"}), "signature cell must equal")
 
+    def test_nonstring_signature_branch_is_refused_typed(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(signature={"cell": "X", "branch": []})])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("signature branch must be a typed token string", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
         self.assert_bad_row(row(runner="privileged-lib"), "refused until")
 
@@ -785,6 +795,34 @@ class ResultDocumentTests(unittest.TestCase):
                            "signature": {"detail": "a raw log line"}}])
         self.assert_bad_results(doc, "free-text/log matching")
 
+    def test_nonstring_result_state_is_refused_typed(self):
+        doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}])
+        doc["results"][0]["state"] = []
+        f = self.make_f()
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("state is not in the closed terminal-state vocabulary", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_unhashable_result_keys_stay_typed(self):
+        for side in ("selection", "results"):
+            with self.subTest(side=side):
+                good = {"path": "tests/python/test_sample.py", "test": "Sample.test_x",
+                        "invocation": []}
+                bad = {"path": [], "test": "Sample.test_x", "invocation": []}
+                selection = [bad if side == "selection" else good]
+                result_row = dict(bad if side == "results" else good)
+                result_row.update({"state": "failed",
+                                   "signature": {"cell": "X", "branch": "B"}})
+                doc = {"schema": "p11scope/known-failing-results/v1",
+                       "runner": "python-suite", "host": "github", "complete": True,
+                       "selection": selection, "results": [result_row]}
+                f = self.make_f()
+                result = f.run_checker("--results", str(f.results_file(doc)))
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("path must be a clean repository-relative POSIX path", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_row_whose_cell_the_stream_never_selects_stays_red(self):
         f = fixture(self)
         f.registry()
@@ -901,6 +939,56 @@ class StaticWiringTests(unittest.TestCase):
                         "static ledger check must precede typed judgment")
         self.assertEqual(set(steps[static[0]]), {"run"},
                          "static checker step must carry no guard keys (an if: could disable it)")
+
+
+class StrictNullAdmissionTests(unittest.TestCase):
+    SCALARS = ("null", "0", "[]")
+
+    def test_null_and_scalar_lists_are_rejected(self):
+        for text in self.SCALARS:
+            with self.subTest(text=text):
+                f = fixture(self)
+                target = f.root / "null-known-failing.json"
+                target.write_text(text + "\n", encoding="utf-8")
+                result = f.run_checker("--list", str(target))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("top level must be an object", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_null_and_scalar_registry_is_rejected(self):
+        for text in self.SCALARS:
+            with self.subTest(text=text):
+                f = fixture(self)
+                (f.root / "docs/known-limitations.md").write_text(
+                    "# Known limitations\n\n## Known limitations in 0.7.2\n\n"
+                    "<!-- p11scope-known-issues-v1\n" + text + "\n-->\n",
+                    encoding="utf-8")
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("top level must have exactly schema and issues", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_null_and_scalar_ignored_registry_is_rejected(self):
+        for text in self.SCALARS:
+            with self.subTest(text=text):
+                f = fixture(self)
+                (f.root / "tests/ignored-tests.json").write_text(text + "\n", encoding="utf-8")
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be an object with a sites list", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_null_and_scalar_result_documents_are_rejected(self):
+        for text in self.SCALARS:
+            with self.subTest(text=text):
+                f = fixture(self)
+                target = f.root / "results.json"
+                target.write_text(text + "\n", encoding="utf-8")
+                result = f.run_checker("--results", str(target))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("top level must have exactly schema/runner/host/complete/selection/results",
+                              result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
 
 class ProducerTests(unittest.TestCase):
@@ -1208,6 +1296,34 @@ class FragmentAdmissionTests(unittest.TestCase):
         problems, process = self.merge_text(self.TEMPLATE % "1")
         self.assertEqual(problems, [])
         self.assertEqual(process["state"], "passed")
+
+    def test_null_and_scalar_fragments_are_fragment_invalid(self):
+        for text in ("null", "0", "[]"):
+            with self.subTest(text=text):
+                runner = load_script(ROOT / "scripts/run-python-suites.py",
+                                     "python_suite_runner_null_doc")
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    fragment = temp / "fragment.json"
+                    fragment.write_text(text + "\n", encoding="utf-8")
+                    output = temp / "merged.json"
+                    problems = runner.merge_typed_fragments(
+                        [(fragment, "test_sample.py", [], 0)], output, "github")
+                    document = json.loads(output.read_text(encoding="utf-8"))
+                    rows = {item["test"]: item for item in document["results"]}
+                    self.assertTrue(problems)
+                    self.assertEqual(rows["<suite-process>"]["state"], "failed")
+                    self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                                     "fragment_invalid")
+
+    def test_nonstring_suite_event_state_is_fragment_invalid(self):
+        for literal in ("[]", "{}", "1", "null", "true"):
+            with self.subTest(literal=literal):
+                problems, rows = self.merge_event_text(literal, 0)
+                self.assertTrue(problems)
+                self.assertEqual(rows["<suite-process>"]["state"], "failed")
+                self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                                 "fragment_invalid")
 
     EVENT_TEMPLATE = (
         '{"schema": "p11scope/python-suite-fragment/v1", '
@@ -1556,6 +1672,50 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("missing or invalid JSON", result.stderr)
 
+    def test_converter_rejects_null_and_scalar_sidecars_typed(self):
+        for content in ("null\n", '"s"\n'):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    test_name = "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64"
+                    selection = temp / "selection.txt"
+                    verdicts = temp / "verdicts.tsv"
+                    sidecar = temp / "sidecar.json"
+                    output = temp / "out.json"
+                    selection.write_text(test_name + "\n")
+                    sidecar.write_text(content, encoding="utf-8")
+                    verdicts.write_text(test_name + "\tFAIL\t" + str(sidecar) + "\n")
+                    converter = ROOT / "scripts/ci/privileged-lib-results.py"
+                    result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("not a typed signature", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_rejects_null_and_scalar_registry_typed(self):
+        for content in ("null\n", "[]\n"):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    (temp / "scripts/ci").mkdir(parents=True)
+                    (temp / "tests").mkdir()
+                    shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                                 temp / "scripts/ci/privileged-lib-results.py")
+                    shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                                 temp / "scripts/check-known-failing.py")
+                    (temp / "tests/ignored-tests.json").write_text(content, encoding="utf-8")
+                    selection = temp / "selection.txt"
+                    verdicts = temp / "verdicts.tsv"
+                    output = temp / "out.json"
+                    selection.write_text("X\n")
+                    verdicts.write_text("X\tPASS\n")
+                    converter = temp / "scripts/ci/privileged-lib-results.py"
+                    result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("cannot read ignored-test registry", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
     def test_converter_refuses_duplicate_key_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
@@ -1836,6 +1996,46 @@ class ProducerMutationSweepTests(unittest.TestCase):
                         bool(problems) and rows["<suite-process>"]["state"] == "failed")
             self.record(results, name, clause_outcomes["original"], clause_outcomes["mutant"])
 
+        # Suite-event states must be exact strings before set membership:
+        # unhashable states are typed fragment_invalid, never a crash.
+        state_str_mutant = self.mutate_source(ROOT / "scripts/run-python-suites.py",
+                                              'and type(event.get("state")) is str\n'
+                                              '                    and event.get("state") in SUITE_EVENT_STATES',
+                                              'and event.get("state") in SUITE_EVENT_STATES')
+        outcomes = {}
+        for label, source in (("original", runner_source), ("mutant", state_str_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                             temp / "check-known-failing.py")
+                module = load_script(script, f"runner_state_str_{label}")
+                fragment = temp / "fragment.json"
+                write_json(fragment, {
+                    "schema": "p11scope/python-suite-fragment/v1",
+                    "path": "tests/python/test_sample.py", "invocation": [],
+                    "process_exit": 0, "complete": True,
+                    "selection": [{"test": "Sample.test_pass"}],
+                    "results": [{"test": "Sample.test_pass", "state": "passed",
+                                 "signature": None}],
+                    "suite_events": [{"event": "tearDownModule", "state": [],
+                                      "signature": {"branch": "error"}}],
+                })
+                output = temp / "merged.json"
+                try:
+                    problems = module.merge_typed_fragments(
+                        [(fragment, "test_sample.py", [], 0)], output, "github")
+                    rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                    ok = bool(problems) and rows["<suite-process>"]["state"] == "failed"
+                except TypeError:
+                    ok = False
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-event-state-str", original_ok, mutant_ok)
+
         # Python module terminal events must reach the typed fragment.
         typed_source = (ROOT / "scripts/typed-python-suite.py").read_text(encoding="utf-8")
         typed_mutant = self.mutate_source(ROOT / "scripts/typed-python-suite.py",
@@ -1972,7 +2172,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
         # The cell registry read is strict: a duplicate-key registry maps
         # nothing instead of collapsing to one mapping.
         cell_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
-                                         "registry, _problems = known_failing_checker_module().strict_json(text, str(registry_path))",
+                                         "registry, _problems = checker.strict_json(text, str(registry_path))",
                                          "registry = json.loads(text)")
         outcomes = {}
         for label, source in (("original", cell_source), ("mutant", cell_mutant)):
@@ -1989,6 +2189,28 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 module = load_script(script, f"cell_registry_{label}")
                 outcomes[label] = module.ignored_test_files() == {}
         self.record(results, "cell-registry-dup-keys", outcomes["original"], outcomes["mutant"])
+
+        # A null cell row must be a typed row-shape refusal: restoring the
+        # None-sentinel check silently skips it and greens the run.
+        row_null_mutant = self.mutate_source(ROOT / "scripts/ci/check-cell-results.py",
+                                             "if row is checker.PARSE_FAILED:",
+                                             "if row is None:")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", row_null_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                rows_path = temp / "results.jsonl"
+                rows_path.write_text(json.dumps({"cell": "good", "pass": True, "detail": "d",
+                                                 "qualification": "qualified"}) + "\nnull\n", encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "good"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0
+        self.record(results, "cell-row-null", outcomes["original"], outcomes["mutant"])
 
         # Privileged sidecars must drive the failed-row signature and remain
         # strictly typed.
@@ -2040,7 +2262,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
         dup_sidecar = '{"cell":"X","branch":"x","branch":"y"}\n'
         sidecar_mutant = self.mutate_source(
             ROOT / "scripts/ci/privileged-lib-results.py",
-            "value, _load_problems = checker_module().strict_json(text, str(path))",
+            "value, _load_problems = checker.strict_json(text, str(path))",
             "value = json.loads(text)")
         original_run, _doc = privileged_behavior(privileged_source, dup_sidecar)
         mutant_run, _doc = privileged_behavior(sidecar_mutant, dup_sidecar)
@@ -2051,8 +2273,11 @@ class ProducerMutationSweepTests(unittest.TestCase):
         # fails instead of collapsing to one mapping.
         registry_mutant = self.mutate_source(
             ROOT / "scripts/ci/privileged-lib-results.py",
-            'registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")',
-            "registry = json.loads(text)")
+            'registry, registry_problems = checker_module().strict_json(text, "ignored-test registry")\n'
+            "    if registry_problems or type(registry) is not dict:",
+            "registry = json.loads(text)\n"
+            "    registry_problems = []\n"
+            "    if type(registry) is not dict:")
         outcomes = {}
         for label, source in (("original", privileged_source), ("mutant", registry_mutant)):
             with tempfile.TemporaryDirectory() as temporary:
@@ -2415,7 +2640,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 39
+        total = 41
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")
@@ -2436,7 +2661,7 @@ class MutationSweepTests(unittest.TestCase):
             "required-provenance": ('if not isinstance(raw["reason"], str) or not raw["reason"].strip() or any(\n            ord(character) < 32 or ord(character) == 127 for character in raw["reason"]):', 'if False:'),
             "result-pass-null": ('if raw["signature"] is not None:', 'if False:'),
             "workflow-runner": ('if invocation["runner"] is None or not valid_runner(invocation["runner"]):', 'if False:'),
-            "duplicate-result": ('if key in results:\n            problems.append', 'if False:\n            problems.append'),
+            "duplicate-result": ('            if key in results:\n                problems.append', '            if False:\n                problems.append'),
             "signature-branch-required": ('if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:', 'if False:'),
             "host-limited-refused": ("if limited:\n            problems.append", "if False:\n            problems.append"),
             "release-needs-registry": ('if (root / "docs/releases/v0.7.2.md").is_file() and not registry_present:', 'if False:'),
@@ -2445,11 +2670,18 @@ class MutationSweepTests(unittest.TestCase):
             "privileged-lib-refused": ('if raw["runner"] == "privileged-lib":', 'if False:'),
             "runner-vocabulary": ('if not valid_runner(raw["runner"]):', 'if False:'),
             "results-discovery-skip": ('discover_executables=args.results is None', 'discover_executables=True'),
-            "generic-branch-refused": ('if isinstance(raw.get("signature"), dict) and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:', 'if False:'),
+            "generic-branch-refused": ('if isinstance(raw.get("signature"), dict) and type(raw["signature"].get("branch")) is str \\\n            and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:', 'if False:'),
             "target-release-expiry": ('if (root / "docs/releases" / f"v{row[\'target\']}.md").is_file():', 'if False:'),
             "bogus-host-refused": ('if not isinstance(host, str) or host not in HOSTS:', 'if False:'),
             "cell-judge-runner": ('if invocation.get("runner") != row["runner"]:', 'if False:'),
             "unparsable-checker-mention": ('if ("check-cell-results.py" in executable_script\n                            or "run-cell-script.sh" in executable_script):', 'if False:'),
+            "list-null-refused": ('data, problems = strict_json(text, str(path))\n    if data is PARSE_FAILED:\n        return [], problems',
+                                  'data, problems = strict_json(text, str(path))\n    if data is None:\n        return [], problems'),
+            "registry-null-refused": ('data, problems = strict_json(section[start:end].strip(), "known-issue registry")\n    if data is PARSE_FAILED:',
+                                      'data, problems = strict_json(section[start:end].strip(), "known-issue registry")\n    if data is None:'),
+            "ignored-null-refused": ('data, problems = strict_json(text, str(path))\n    if data is PARSE_FAILED:\n        return problems',
+                                     'data, problems = strict_json(text, str(path))\n    if data is None:\n        return problems'),
+            "signature-branch-string": ('if isinstance(raw.get("signature"), dict) and "branch" in raw["signature"] \\\n            and type(raw["signature"].get("branch")) is not str:', 'if False:'),
         }
         green_to_red = {"results-discovery-skip"}
 
@@ -2611,6 +2843,23 @@ class MutationSweepTests(unittest.TestCase):
                     "jobs:\n  test:\n    steps:\n      - run: |\n"
                     "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl --require x\n",
                     encoding="utf-8")
+                return None
+            if name == "list-null-refused":
+                (f.root / "tests/known-failing.json").write_text("null\n", encoding="utf-8")
+                return None
+            if name == "registry-null-refused":
+                (f.root / "docs/known-limitations.md").write_text(
+                    "# Known limitations\n\n## Known limitations in 0.7.2\n\n"
+                    "<!-- p11scope-known-issues-v1\nnull\n-->\n",
+                    encoding="utf-8")
+                return None
+            if name == "ignored-null-refused":
+                (f.root / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
+                return None
+            if name == "signature-branch-string":
+                f.registry()
+                f.python_suite()
+                f.rows([row(signature={"cell": "X", "branch": []})])
                 return None
             raise AssertionError(name)
 

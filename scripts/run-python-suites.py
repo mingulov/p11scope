@@ -550,6 +550,7 @@ def merge_typed_fragments(fragment_specs, output, host):
         for event in fragment["suite_events"]:
             if (type(event) is dict and set(event) == {"event", "state", "signature"}
                     and type(event.get("event")) is str and event["event"]
+                    and type(event.get("state")) is str
                     and event.get("state") in SUITE_EVENT_STATES
                     and (event.get("signature") is None
                          or type(event.get("signature")) is dict)):

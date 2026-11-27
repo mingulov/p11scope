@@ -297,8 +297,12 @@ def ignored_test_files():
         text = registry_path.read_text(encoding="utf-8")
     except OSError:
         return {}
-    registry, _problems = known_failing_checker_module().strict_json(text, str(registry_path))
-    if registry is None:
+    checker = known_failing_checker_module()
+    registry, _problems = checker.strict_json(text, str(registry_path))
+    if registry is checker.PARSE_FAILED or registry is None:
+        # Unparseable and null registries both map nothing; a null tracked
+        # registry is still rejected loudly by the checker's own
+        # static validation of the same file.
         return {}
     files = {}
     ambiguous = set()
@@ -337,7 +341,7 @@ def cell_sidecar_signature(result_dir, cell):
         return None, f"typed failure record for {cell} is missing or invalid JSON"
     checker = known_failing_checker_module()
     value, _load_problems = checker.strict_json(text, str(path))
-    if value is None:
+    if value is checker.PARSE_FAILED:
         return None, f"typed failure record for {cell} is missing or invalid JSON"
     problems = checker.signature_problems(value)
     if isinstance(value, dict) and "branch" not in value:

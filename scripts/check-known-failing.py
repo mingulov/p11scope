@@ -139,12 +139,30 @@ def reject_json_constant(value):
     raise ValueError(f"non-strict JSON constant {value}")
 
 
+class _ParseFailed:
+    """Unique strict-JSON parse-failure sentinel (never a valid value)."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "PARSE_FAILED"
+
+
+PARSE_FAILED = _ParseFailed()
+
+
 def strict_json(text, label):
+    """Parse typed JSON, rejecting duplicate keys and non-strict constants.
+
+    Returns (PARSE_FAILED, [problem]) when parsing fails and (value, [])
+    when it succeeds — including (None, []) for a valid JSON null, which
+    must reach schema validation instead of being mistaken for failure.
+    """
     try:
         return json.loads(text, object_pairs_hook=object_no_duplicates,
                           parse_constant=reject_json_constant), []
     except (json.JSONDecodeError, DuplicateKeyError, ValueError) as exc:
-        return None, [f"{label}: invalid JSON: {exc}"]
+        return PARSE_FAILED, [f"{label}: invalid JSON: {exc}"]
 
 
 def valid_runner(value):
@@ -246,7 +264,11 @@ def validate_row(raw, index):
     problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
     if isinstance(raw["signature"], dict) and "branch" not in raw["signature"]:
         problems.append(f"{label}: signature lacks a typed branch")
-    if isinstance(raw.get("signature"), dict) and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:
+    if isinstance(raw.get("signature"), dict) and "branch" in raw["signature"] \
+            and type(raw["signature"].get("branch")) is not str:
+        problems.append(f"{label}: signature branch must be a typed token string")
+    if isinstance(raw.get("signature"), dict) and type(raw["signature"].get("branch")) is str \
+            and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:
         problems.append(f"{label}: signature branch {raw['signature']['branch']!r} is a generic producer state or scope token; "
                         "rows need a test-raised typed branch")
     if isinstance(raw["signature"], dict) and "cell" in raw["signature"] and raw["signature"]["cell"] != raw["cell"]:
@@ -302,7 +324,7 @@ def load_list(path):
     except OSError as exc:
         return [], [f"{path}: cannot read known-failing list: {exc}"]
     data, problems = strict_json(text, str(path))
-    if data is None:
+    if data is PARSE_FAILED:
         return [], problems
     if not isinstance(data, dict):
         return [], problems + [f"{path}: top level must be an object"]
@@ -350,7 +372,7 @@ def load_issue_registry(root):
     if end < 0:
         return True, {}, ["known-issue registry: block is not closed"]
     data, problems = strict_json(section[start:end].strip(), "known-issue registry")
-    if data is None:
+    if data is PARSE_FAILED:
         return True, {}, problems
     if not isinstance(data, dict) or set(data) != {"schema", "issues"}:
         problems.append("known-issue registry: top level must have exactly schema and issues")
@@ -795,7 +817,7 @@ def validate_ignored_known_failing(root, rows):
     except OSError as exc:
         return [f"{path}: cannot read ignored-test registry: {exc}"]
     data, problems = strict_json(text, str(path))
-    if data is None:
+    if data is PARSE_FAILED:
         return problems
     if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
         return problems + [f"{path}: ignored-test registry must be an object with a sites list"]
@@ -893,7 +915,7 @@ def validate_result_document(path):
     except OSError as exc:
         return None, [f"results: cannot read {path}: {exc}"]
     data, problems = strict_json(text, f"results {path}")
-    if data is None:
+    if data is PARSE_FAILED:
         return None, problems
     if not isinstance(data, dict) or set(data) != RESULT_TOP_FIELDS:
         problems.append("results: top level must have exactly schema/runner/host/complete/selection/results")
@@ -926,10 +948,11 @@ def validate_result_document(path):
         if not isinstance(raw["test"], str) or not raw["test"]:
             problems.append(f"{label}: test must be a nonempty exact test or cell id")
         validate_invocation_value(raw["invocation"], label, problems)
-        key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
-        if key in selection:
-            problems.append(f"{label}: duplicate selected test {raw['test']}")
-        selection[key] = raw
+        if type(raw["path"]) is str and type(raw["test"]) is str:
+            key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
+            if key in selection:
+                problems.append(f"{label}: duplicate selected test {raw['test']}")
+            selection[key] = raw
 
     results = {}
     for index, raw in enumerate(raw_results, 1):
@@ -942,17 +965,18 @@ def validate_result_document(path):
         if not isinstance(raw["test"], str) or not raw["test"]:
             problems.append(f"{label}: test must be a nonempty exact test or cell id")
         validate_invocation_value(raw["invocation"], label, problems)
-        if raw["state"] not in RESULT_STATES:
+        if type(raw["state"]) is not str or raw["state"] not in RESULT_STATES:
             problems.append(f"{label}: state is not in the closed terminal-state vocabulary")
         if raw["state"] == "passed":
             if raw["signature"] is not None:
                 problems.append(f"{label}: a passing result must carry a null signature")
         else:
             problems.extend(f"{label}: {problem}" for problem in signature_problems(raw["signature"]))
-        key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
-        if key in results:
-            problems.append(f"{label}: duplicate result for {raw['test']}")
-        results[key] = raw
+        if type(raw["path"]) is str and type(raw["test"]) is str:
+            key = (raw["path"], raw["test"], tuple(raw["invocation"]) if valid_invocation(raw["invocation"]) else ())
+            if key in results:
+                problems.append(f"{label}: duplicate result for {raw['test']}")
+            results[key] = raw
 
     missing_results = sorted(set(selection) - set(results))
     missing_selection = sorted(set(results) - set(selection))

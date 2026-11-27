@@ -696,7 +696,7 @@ fn n1_dashboard_tail_drains_before_semantic_cleanup() {
                 crate::attach::BackendSelection::Auto,
                 None,
                 &|| true,
-                &|| {},
+                &|| false,
                 true,
                 &mut WriterStdout(&mut stdout),
                 &terminal,

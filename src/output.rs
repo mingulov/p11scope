@@ -1968,39 +1968,58 @@ fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File,
     }
 }
 
-/// Opens the recovery dir through the production parent chain. Only an
+/// Opens the recovery dir through the production parent chain. An
 /// absent or unwritable parent moves to the next root (`$TMPDIR`, then
-/// `/tmp`); once a writable parent is selected, the exact per-euid base
-/// keeps its squatter-resistant sibling fallback on that same parent.
-/// The warning names every parent skipped and its reason before naming
-/// the parent actually used. A single-root chain (a caller-supplied or
-/// test base, never production) attempts its root directly: with no
-/// next root the preflight could only replace the sibling attempt's
-/// error — which names the base and the failed fallback — with its
-/// own verdict.
+/// `/tmp`), and so does a failed base/sibling attempt on a writable
+/// parent (a full recovery volume falls through to the next root
+/// instead of losing the capture); once a root succeeds, the exact
+/// per-euid base keeps its squatter-resistant sibling fallback on that
+/// same parent. The warning names every parent skipped and its reason
+/// before naming the parent actually used. A single-root chain (a
+/// caller-supplied or test base, never production) attempts its root
+/// directly: with no next root the preflight could only replace the
+/// sibling attempt's error — which names the base and the failed
+/// fallback — with its own verdict.
 fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
     let chain = recovery_base_chain(base);
     if chain.len() == 1 {
         return open_recovered_dir_or_sibling_fallback(&chain[0].0);
     }
+    open_recovered_chain(&chain, open_recovered_dir_or_sibling_fallback)
+}
+
+/// Walks a multi-root recovery chain with an injectable attempt, so a
+/// writable-but-failing root (a full volume) falls through to the next
+/// root with a named reason instead of ending the chain.
+fn open_recovered_chain(
+    chain: &[(PathBuf, &'static str)],
+    attempt: impl Fn(&Path) -> Result<(std::fs::File, PathBuf), String>,
+) -> Result<(std::fs::File, PathBuf), String> {
     let mut skipped = Vec::new();
     for (index, (candidate, label)) in chain.iter().enumerate() {
         if let Some(reason) = recovery_parent_unusable(candidate) {
             skipped.push(format!("{label} unavailable ({reason})"));
             continue;
         }
-        let result = open_recovered_dir_or_sibling_fallback(candidate);
-        if index != 0 && result.is_ok() {
-            let parent = candidate
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .display();
-            let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
-                "p11scope: warning: {}; using {parent} instead",
-                skipped.join("; ")
-            )));
+        match attempt(candidate) {
+            Ok(opened) => {
+                if index != 0 {
+                    let parent = candidate
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .display();
+                    let _ =
+                        crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
+                            "p11scope: warning: {}; using {parent} instead",
+                            skipped.join("; ")
+                        )));
+                }
+                return Ok(opened);
+            }
+            Err(error) => {
+                skipped.push(format!("{label} failed ({error})"));
+            }
         }
-        return result;
     }
     Err(format!(
         "no writable recovery parent: {}",
@@ -4972,6 +4991,63 @@ mod tests {
                 (Path::new("/tmp").join(&leaf), "/tmp")
             ]
         );
+    }
+
+    /// A failed base/sibling attempt on a writable parent (a full
+    /// recovery volume) falls through to the next chain root instead of
+    /// ending the chain: the first root is attempted, then the second
+    /// root's opened file is returned.
+    #[test]
+    fn chain_advances_past_a_failed_root_with_a_named_reason() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let sentinel = second.path().join("sentinel");
+        std::fs::write(&sentinel, b"recovered").unwrap();
+        let opened = open_recovered_chain(&chain, |candidate| {
+            attempts.borrow_mut().push(candidate.to_path_buf());
+            if candidate.starts_with(first.path()) {
+                return Err("No space left on device (os error 28)".to_string());
+            }
+            let file = std::fs::File::open(&sentinel).unwrap();
+            Ok((file, sentinel.clone()))
+        })
+        .expect("the second root succeeds");
+        assert_eq!(opened.1, sentinel);
+        assert_eq!(
+            *attempts.borrow(),
+            vec![chain[0].0.clone(), chain[1].0.clone()]
+        );
+    }
+
+    /// When every chain root fails, the error names each root and its
+    /// own reason instead of reporting only the last attempt.
+    #[test]
+    fn chain_failure_names_every_failed_root() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let error = open_recovered_chain(&chain, |candidate| {
+            Err::<(std::fs::File, PathBuf), String>(format!(
+                "No space left on device ({})",
+                candidate.display()
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            error.starts_with("no writable recovery parent: "),
+            "{error}"
+        );
+        assert!(error.contains("/var/tmp failed ("), "{error}");
+        assert!(error.contains("$TMPDIR failed ("), "{error}");
+        assert!(error.contains("No space left on device"), "{error}");
     }
 
     /// Item 4 twin: the parent preflight names an absent parent and an

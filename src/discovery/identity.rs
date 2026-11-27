@@ -12294,9 +12294,7 @@ impl PinOutcome {
                 WaitCause::HandleExhaustion,
                 format!("{gap_reason} (map_files fallback: {detail})"),
             ),
-            PinMapFilesRefusal::Unproven(detail)
-                if mountinfo_detail_is_park_refusal(&detail) =>
-            {
+            PinMapFilesRefusal::Unproven(detail) if mountinfo_detail_is_park_refusal(&detail) => {
                 Self::wait(
                     WaitCause::ParkRefused,
                     format!("{gap_reason} (map_files fallback: {detail})"),
@@ -23258,7 +23256,10 @@ mod tests {
             "synthetic stop nobody latches".to_string(),
             // The refusal sentence embedded mid-text never classifies:
             // matching is prefix-anchored, never substring.
-            format!("prefix {}", crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON),
+            format!(
+                "prefix {}",
+                crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON
+            ),
             wrapped(&format!(
                 "prefix {}",
                 crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON

@@ -22047,9 +22047,14 @@ int main(int argc, char **argv) {
         );
         let mut resume = roomy();
         reader.requests.clear();
-        let step =
-            read_mountinfo_resumable_with(&mut reader, &mut resume, 20_000, |_| None, &mut progress)
-                .unwrap();
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut resume,
+            20_000,
+            |_| None,
+            &mut progress,
+        )
+        .unwrap();
         assert_eq!(reader.requests, vec![20_000], "the resume reads only EOF");
         assert_eq!(
             step,
@@ -22117,9 +22122,14 @@ int main(int argc, char **argv) {
         );
         let mut resume = roomy();
         reader.requests.clear();
-        let step =
-            read_mountinfo_resumable_with(&mut reader, &mut resume, 10_000, |_| None, &mut progress)
-                .unwrap();
+        let step = read_mountinfo_resumable_with(
+            &mut reader,
+            &mut resume,
+            10_000,
+            |_| None,
+            &mut progress,
+        )
+        .unwrap();
         assert_eq!(
             step,
             MountinfoStep::Complete(String::from_utf8(table).unwrap()),

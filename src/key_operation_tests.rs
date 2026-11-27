@@ -39569,10 +39569,7 @@ fn key_operation_absorbable_fault_rebinds_live_key_without_minting() {
     let mut scene = JointScene::new();
     let call = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
     let admitted = admit_call_input(&mut scene, &call);
-    let proof = scene
-        .adapter
-        .attest_key(&admitted)
-        .expect("call attests");
+    let proof = scene.adapter.attest_key(&admitted).expect("call attests");
     ingest_call(&mut scene, &call, admitted.h0_ordinal());
     let voids_before = scene.adapter.joint_void_diagnosis();
     scene
@@ -39677,10 +39674,9 @@ fn key_operation_absorbable_fault_with_staged_doom_delivers_typed() {
         .remove(&admitted.h0_ordinal())
         .expect("paired BEGIN");
     fresh.scene.ingest(&doom_begin);
-    fresh.scene.ingest_ordinary(ordinary_for(
-        &doom_begin,
-        CkRv::SESSION_HANDLE_INVALID.0,
-    ));
+    fresh
+        .scene
+        .ingest_ordinary(ordinary_for(&doom_begin, CkRv::SESSION_HANDLE_INVALID.0));
     let record =
         decode_journal_record(&doom_begin, &fresh.scene.descriptors).expect("paired BEGIN decodes");
     let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {

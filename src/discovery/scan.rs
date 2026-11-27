@@ -8927,7 +8927,11 @@ impl ScanMemory for File {
 /// default and the scripted live-probe arm both delegate here — so tests
 /// drive every arm without a live empty-table target.
 fn mountinfo_read_is_empty(read: &Result<((), &str), String>) -> bool {
-    matches!(read, Ok(((), text)) if text.is_empty())
+    matches!(
+        read,
+        // Narrow by construction: only an Ok read with empty text exempts.
+        Ok(((), text)) if text.is_empty()
+    )
 }
 
 pub(crate) trait ScanIo {

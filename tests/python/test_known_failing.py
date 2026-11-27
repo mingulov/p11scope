@@ -1214,6 +1214,38 @@ class RegistryReadStateTests(unittest.TestCase):
             self.assertEqual(len(problems), 1)
             self.assertIn("cannot read ignored-test registry", problems[0])
 
+    def test_undecodable_list_is_typed_problem(self):
+        checker = self.load_checker("list_undecodable")
+        with tempfile.TemporaryDirectory() as temporary:
+            bad = Path(temporary) / "known-failing.json"
+            bad.write_bytes(b'{"rows": [\xff]}\n')
+            rows, problems = checker.load_list(bad)
+            self.assertEqual(rows, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot read known-failing list", problems[0])
+
+    def test_undecodable_issue_registry_is_present_but_broken(self):
+        checker = self.load_checker("issue_undecodable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "docs").mkdir()
+            (root / "docs/known-limitations.md").write_bytes(b'# t\xff\n')
+            present, registry, problems = checker.load_issue_registry(root)
+            self.assertTrue(present)
+            self.assertEqual(registry, {})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("known-issue registry: cannot read", problems[0])
+
+    def test_undecodable_ignored_registry_cross_check_is_typed(self):
+        checker = self.load_checker("validator_undecodable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            (root / "tests/ignored-tests.json").write_bytes(b'{"sites": [\xff]}\n')
+            problems = checker.validate_ignored_known_failing(root, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot read ignored-test registry", problems[0])
+
 
 class ProducerTests(unittest.TestCase):
     def test_typed_python_wrapper_records_outer_selection_and_terminal_states(self):

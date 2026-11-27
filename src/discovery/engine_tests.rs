@@ -93627,6 +93627,65 @@ fn terminal_learned_note_for_a_distinct_file_keeps_its_row() {
     );
 }
 
+/// Forward-only fold: two notes resolving to one planned object (the
+/// same file pre-armed through two overlay spellings) fold once — the
+/// first note wins the row, the second never clobbers it.
+#[test]
+fn terminal_learned_note_fold_never_clobbers_an_attached_note() {
+    use crate::discovery::identity::test_fixture::{
+        SHA, backing_file, overlay, reback, remap_to_key, split_prearm_pin,
+    };
+    let (mut engine, _, fd_key, maps_key) = split_terminal_state();
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let second_fd_key = overlay(43);
+    let mut second = split_prearm_pin(second_fd_key, maps_key, SHA, 1);
+    reback(&mut second, &file);
+    remap_to_key(&mut second, fd_key);
+    assert!(engine.pinned.absorb(second).is_empty());
+    let mut first = split_note();
+    first.exe = Some("/usr/bin/first-loader".to_string());
+    let mut second_note = split_note();
+    second_note.exe = Some("/usr/bin/second-loader".to_string());
+    engine.learned_notes.insert(fd_key, first);
+    engine.learned_notes.insert(second_fd_key, second_note);
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one file stays one row under two notes"
+    );
+    assert_eq!(
+        engine.discovery.modules[0]
+            .first_loaded_by
+            .as_ref()
+            .and_then(|note| note.exe.clone()),
+        Some("/usr/bin/first-loader".to_string()),
+        "the first note wins; the second never clobbers it"
+    );
+}
+
+/// Representation twin: a note resolving to a planned-but-unprojected
+/// object still publishes — the file is otherwise unnamed, so the
+/// record is representation, not duplication.
+#[test]
+fn terminal_learned_note_for_an_unprojected_object_still_publishes() {
+    let (mut engine, _, fd_key, _) = split_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = Vec::new();
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "an unrepresented file keeps its record"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the record carries the note"
+    );
+}
+
 /// The per-capture learned-file cap names its excess once: the 33rd file
 /// is refused loudly, the first 32 are unaffected.
 #[test]

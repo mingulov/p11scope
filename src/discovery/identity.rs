@@ -14601,6 +14601,20 @@ pub(crate) mod test_fixture {
         pins
     }
 
+    /// Re-points every entry's mount-resolved mapping at `key` in the
+    /// forged split mount: two pre-arm spellings of one file resolving
+    /// in one mount, so only the filed key separates them.
+    pub(crate) fn remap_to_key(pins: &mut PinnedObjects, key: ObjectKey) {
+        for entry in pins.by_id.values_mut() {
+            entry.mapping = MappingFileKey {
+                mount_id: SPLIT_MOUNT_ID,
+                device_major: key.device.major,
+                device_minor: key.device.minor,
+                inode: key.inode,
+            };
+        }
+    }
+
     /// A scripted self-mapping probe: `overlay`/`btrfs` answer the
     /// filesystem questions and `key` answers the kernel-rendered maps key,
     /// counting consultations. Real overlayfs/btrfs splits are unmountable
@@ -20528,6 +20542,76 @@ mod tests {
         );
     }
 
+    /// Key-filter twin: identical opened-file identity (through
+    /// honestly-unknown mount ids) but a maps key that misses the
+    /// proved rendering — the key filter must refuse the join, so the
+    /// note keeps its own row.
+    #[test]
+    fn split_note_with_identity_but_key_miss_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, split_prearm_pin};
+        use p11scope_manifest::identity::MappingFileKey;
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        for entry in pins.by_id.values_mut() {
+            entry.mapping.mount_id = 0;
+            entry.probed_maps_key = None;
+        }
+        let mut stray = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut stray, &file);
+        for entry in stray.by_id.values_mut() {
+            entry.mapping = MappingFileKey {
+                mount_id: 0,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            };
+            entry.probed_maps_key = Some(overlay(22));
+        }
+        let (_, entry) = stray.by_id.pop_first().unwrap();
+        let raw = entry.raw.clone();
+        let stray_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(stray_id, entry);
+        pins.raw_to_id.insert(raw, stray_id);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a proved rendering that misses the target key never resolves"
+        );
+    }
+
+    /// An unproven pin never resolves even to an fd-keyed planned
+    /// target it is otherwise identical to: without the pin-time
+    /// proof there is no split to cross (fail closed). Exact matching
+    /// catches this shape in production before the resolver runs; the
+    /// resolver still refuses it alone.
+    #[test]
+    fn split_note_without_proof_never_resolves_to_an_fd_keyed_target() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let fd_id = pins
+            .pinned()
+            .find(|pin| pin.key == fd_key)
+            .expect("the fd object")
+            .id;
+        pins.by_id
+            .get_mut(&fd_id)
+            .expect("fd entry")
+            .probed_maps_key = None;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[fd_id]),
+            None,
+            "an unproven pin never resolves, whatever the target"
+        );
+    }
+
     /// A note key under proven collision never resolves: the key is
     /// poisoned (two proven entries contradicted under it), so the
     /// note keeps its own row even beside a valid pin and target.
@@ -20550,6 +20634,26 @@ mod tests {
             pins.resolve_split_note_target(fd_key, &[scan_id]),
             None,
             "a poisoned key never resolves"
+        );
+    }
+
+    /// The rejection guard itself: a rejected note key with live
+    /// entries still filed under it (a planning-scratch routing mark
+    /// surviving onto a live set) never resolves, even though a pin
+    /// and a target would otherwise match.
+    #[test]
+    fn split_note_with_rejected_key_but_live_entries_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        pins.rejected_keys.insert(fd_key);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a rejected key never resolves while entries live under it"
         );
     }
 

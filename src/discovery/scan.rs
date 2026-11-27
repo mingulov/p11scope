@@ -742,7 +742,11 @@ fn scan_mountinfo_segment(
         // on a copy: a stop inside the stride checks below parks with the
         // validator exactly at the cursor, so the resume re-validates the
         // boundary byte from the right state instead of double-stepping a
-        // split multibyte sequence.
+        // split multibyte sequence. Probing computes the step without
+        // committing it: validation is uncharged work, so looking at the
+        // boundary byte before its stride pays or polls changes no
+        // accounting — only committed bytes (cursor, counters, charges)
+        // define the stop position the tests pin.
         let mut probe = progress.encoding;
         if !probe.next(byte) {
             return Break(Err(format!(
@@ -764,9 +768,11 @@ fn scan_mountinfo_segment(
             progress.lines_charged += MOUNTINFO_STRIDE;
             progress.pending_lines = 0;
             progress.byte_stride_used = 0;
-            if let Some(reason) = budget.stopped_reason() {
-                return Break(stop(reason));
-            }
+            // No stopped_reason poll here: a successful spend proves
+            // nothing is latched (`charge_work` fails when a stop is
+            // already set, and the budget is `&mut`-borrowed so no
+            // other thread can latch behind us). Only the deadline
+            // closure below observes fresh state.
             if let Some(reason) = deadline(budget) {
                 return Break(stop(reason));
             }
@@ -776,9 +782,8 @@ fn scan_mountinfo_segment(
                 return Break(stop(reason));
             }
             progress.byte_stride_used = 0;
-            if let Some(reason) = budget.stopped_reason() {
-                return Break(stop(reason));
-            }
+            // Same: the successful spend proves the latch clear; only
+            // the deadline observes fresh state.
             if let Some(reason) = deadline(budget) {
                 return Break(stop(reason));
             }

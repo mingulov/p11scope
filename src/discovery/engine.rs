@@ -8493,9 +8493,11 @@ fn scan_and_pin_with_proof(
     }
     // The scan's mount-table park, if newly retained, debits here beside
     // the pins: the slot persists across passes, so the next admission
-    // decision must see it the same tick. Unconditional (even when the
-    // pins waited whole): named waited views retain their parks, and an
-    // unnamed drop corrects at the next snapshot — conservative like the
+    // decision must see it the same tick. This covers every return where
+    // the view can persist, including waited-whole named views (which
+    // retain their parks); the pinning-error return above skips it, but
+    // both reserve callers drop the view there, so the park is dropped
+    // with it and the next snapshot corrects — conservative like the
     // pidfd debit, which never refunds either.
     if let Some(tick) = reserve.as_mut() {
         tick.note_mount_table_park(mount_parked_before, view.has_parked_mount_table());

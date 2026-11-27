@@ -21193,12 +21193,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn repeat_fault_observation_absorb_counts_again() {
-        // Repeat absorbs count every observation: a second seal observing
-        // an already-absorbed fault era absorbs silently (no void, no
-        // re-trip) and still counts its own absorb bucket. The repeat
-        // observes a stale bracket against the pinned baseline, so it
-        // counts the chain site like the void split does.
+    fn repeat_fault_observation_absorb_counts_once() {
+        // An absorb counts a distinct fault move once (ruling R-C): a
+        // second seal observing an already-absorbed fault era absorbs
+        // silently (no void, no re-trip) and counts nothing new —
+        // neither reread nor chain — even though it observes a stale
+        // bracket against the pinned baseline.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
@@ -21269,8 +21269,8 @@ pub(crate) mod tests {
             "the first absorb stays counted"
         );
         assert_eq!(
-            after.audit_fault_absorbed_chain, 1,
-            "the stale-bracket repeat counts the chain site"
+            after.audit_fault_absorbed_chain, 0,
+            "the stale-bracket repeat counts nothing new"
         );
         assert_eq!(scene.adapter.last_audit_failure, tripped);
     }

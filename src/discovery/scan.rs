@@ -75,41 +75,6 @@ const MAX_MAPS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MAP_ENTRIES: usize = 1_048_576;
 const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
-/// Mount-table lines charged per credit (INV-2): one positive credit is
-/// one bounded step of at most 64 leaf units, with a stop poll between
-/// strides.
-const MOUNTINFO_STRIDE: usize = 64;
-/// Mount-table bytes scanned per byte credit (INV-2 companion): at most
-/// 8 KiB scanned per credit, with a stop poll between strides, so a
-/// 1 MiB chunk without newlines cannot scan unbounded for one line
-/// credit. 8 KiB matches the member-stop per-read poll precedent;
-/// normal 64-line strides (~2-4 KiB) never hit it.
-const MOUNTINFO_BYTE_STRIDE: usize = 8 * 1024;
-
-#[cfg(test)]
-thread_local! {
-    static READER_NEWLINES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static READER_BYTES_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Newline terminators the mount-table reader actually scanned (test seam).
-#[cfg(test)]
-pub(crate) fn reader_newlines_scanned_for_test() -> u64 {
-    READER_NEWLINES_SCANNED.with(std::cell::Cell::get)
-}
-
-/// Bytes the mount-table reader actually scanned for newlines (test seam).
-#[cfg(test)]
-pub(crate) fn reader_bytes_scanned_for_test() -> u64 {
-    READER_BYTES_SCANNED.with(std::cell::Cell::get)
-}
-
-/// Reset the reader scan counters (test seam).
-#[cfg(test)]
-pub(crate) fn reset_reader_scan_counters_for_test() {
-    READER_NEWLINES_SCANNED.with(|counter| counter.set(0));
-    READER_BYTES_SCANNED.with(|counter| counter.set(0));
-}
 /// One operation's proof allowance on every pass: the pin-time
 /// self-mapping probe reads through `allowed_io`, so its proof range
 /// is this per-operation leg, never the ordinary maps scanner's byte
@@ -22991,8 +22956,8 @@ int main(int argc, char **argv) {
             _: &ProcessView,
             _: &Path,
             _: &mut CaptureWorkBudget,
-        ) -> Vec<PathBuf> {
-            self.candidates.clone()
+        ) -> Result<Vec<PathBuf>, String> {
+            Ok(self.candidates.clone())
         }
 
         fn open_lower_candidate(

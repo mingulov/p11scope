@@ -17974,8 +17974,13 @@ mod tests {
             crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
             11
         );
-        let error = identity_of_in_mountinfo_with_reread(&file, stale, || Err(refused.clone()))
-            .expect_err("a refused re-read must report the refusal");
+        let error = identity_of_in_mountinfo_with_reread(
+            &file,
+            stale,
+            &mut CaptureWorkBudget::default(),
+            |_| Err(refused.clone()),
+        )
+        .expect_err("a refused re-read must report the refusal");
         assert_eq!(
             error, refused,
             "a pool refusal preempts the unverified missing-mount claim"
@@ -18009,10 +18014,15 @@ mod tests {
                 crate::discovery::scan::mount_table_read_reason(7, stop),
             ] {
                 let rereads = RefCell::new(0usize);
-                let outcome = identity_of_in_mountinfo_with_reread(&file, stale, || {
-                    *rereads.borrow_mut() += 1;
-                    Err(error.clone())
-                })
+                let outcome = identity_of_in_mountinfo_with_reread(
+                    &file,
+                    stale,
+                    &mut CaptureWorkBudget::default(),
+                    |_| {
+                        *rereads.borrow_mut() += 1;
+                        Err(error.clone())
+                    },
+                )
                 .expect_err("a stopped re-read fails");
                 assert_eq!(*rereads.borrow(), 1, "the table is re-read exactly once");
                 assert_eq!(
@@ -18036,7 +18046,8 @@ mod tests {
             "fixture assumes the fd's mount row is absent from the stale table"
         );
         let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
-        let first = identity_of_in_mountinfo(&file, stale);
+        let first =
+            identity_of_in_mountinfo(&file, stale, &mut CaptureWorkBudget::default());
         assert!(
             matches!(&first, Err(error) if is_missing_mount_id_error(error)),
             "premise: the first resolution misses the mount"

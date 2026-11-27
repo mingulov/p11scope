@@ -9695,3 +9695,177 @@ fn demotion_retirement_round6_fold_gate_pending_adjudication_blocks_fold() {
         "the folded edges land in the departed aggregate"
     );
 }
+
+/// Recovery-path staging consults the fold-loss latch exactly like
+/// every other producer: the evicted key gaps through recovery with
+/// no growth staged, the arm advances the watermark past the
+/// disclosed read, and the next advance stages normally with no
+/// second gap.
+#[test]
+fn recovery_staging_gaps_latched_revival_then_stages_growth() {
+    let mut scene = Scene::shared();
+    scene.observe(false, true, 300);
+    scene.count(8);
+    scene.horizons();
+    scene.count(10);
+    scene.horizons();
+    let key = *scene
+        .native
+        .scene
+        .coordinator
+        .recoveries
+        .keys()
+        .next()
+        .expect("the ceremony leaves a recovery");
+    assert_eq!(key.exec, 1, "the recovery keys the ceremony pair");
+    let watermark = scene.native.scene.coordinator.recoveries[&key].watermark;
+    let fence_anchor = scene.native.scene.coordinator.recoveries[&key]
+        .fence
+        .expect("ceremony leaves a fence")
+        .anchor_ns;
+    // Evict the ceremony key's fold so only its own revival trips the
+    // latch; fillers keep the tiny cap honest.
+    scene.native.scene.coordinator.set_pair_prune_cap_for_test(2);
+    for ticket in [90u64, 91] {
+        scene.native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: DomainCookie::scripted(scene.native.domain, ticket),
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 9,
+                base_since: 100,
+                pruned_since: 100,
+                pid: 7,
+            },
+        );
+    }
+    for (pass, exec) in [1u64, 2, 3].iter().enumerate() {
+        scene.native.scene.coordinator.pair_targets.insert(
+            PairKey {
+                image: key.image,
+                exec: *exec,
+                object: key.object,
+            },
+            PairTarget::Dropped {
+                base: watermark,
+                base_since: 100,
+                pid: 7,
+            },
+        );
+        scene
+            .native
+            .scene
+            .coordinator
+            .prune_departed_native_state(100 + EXEC_STATE_GRACE_NS + pass as u64);
+    }
+    assert_eq!(
+        scene
+            .native
+            .scene
+            .coordinator
+            .pair_fold_memory_overflow_for_test(),
+        1,
+        "the ceremony key's fold drops with a counted overflow"
+    );
+    assert!(
+        scene.native.scene.coordinator.pair_fold_lost.contains(&key),
+        "the evicted ceremony key latches"
+    );
+    // Suspend the evicted key with a fresh held read, then reconcile:
+    // no Pending or Bound target exists, so only the recovery site
+    // can stage it.
+    scene.native.scene.coordinator.pair_targets.insert(
+        key,
+        PairTarget::Suspended {
+            caller: scene.caller,
+            endpoint: scene.native.scene.delta.endpoints[0].id,
+            base: watermark,
+            base_since: fence_anchor,
+        },
+    );
+    let edge_before = edge_count(&scene.native, scene.caller, "a.so")
+        + edge_count(&scene.native, scene.caller, "b.so");
+    let gaps_before = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "revived folded count")
+        .count();
+    // A Suspended target is neither Pending nor Bound, so retry and
+    // re-root cannot stage this key and no bind runs: only the
+    // recovery site below can.
+    assert!(
+        matches!(
+            scene.native.scene.coordinator.pair_targets.get(&key),
+            Some(PairTarget::Suspended { .. })
+        ),
+        "only a suspended target exists at staging time"
+    );
+    scene.native.counts_read(Vec::new(), vec![(41, 1, 0, 12)]);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    let gaps: Vec<String> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "revived folded count")
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        gaps_before + 1,
+        "exactly one new latch gap via recovery: {gaps:?}"
+    );
+    assert_eq!(
+        gaps[gaps.len() - 1],
+        "the pair revived past a counted fold for absolute count range (0, 12] (12 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded",
+        "the recovery gap names the outer-bound window"
+    );
+    assert!(
+        !scene.native.scene.coordinator.pair_fold_lost.contains(&key),
+        "the fired latch leaves the exact set"
+    );
+    assert_eq!(
+        edge_count(&scene.native, scene.caller, "a.so")
+            + edge_count(&scene.native, scene.caller, "b.so"),
+        edge_before,
+        "a refused revival stages no growth onto any edge"
+    );
+    assert_eq!(
+        scene.native.scene.coordinator.recoveries[&key].watermark,
+        12,
+        "the arm advances the watermark past the disclosed read"
+    );
+    // Advance past the consumed latch: normal growth stages through
+    // the same site with no further gap.
+    scene.native.counts_read(Vec::new(), vec![(41, 1, 0, 15)]);
+    scene.native.scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        edge_count(&scene.native, scene.caller, "a.so")
+            + edge_count(&scene.native, scene.caller, "b.so"),
+        edge_before + 3,
+        "growth past the rebase stages exactly once"
+    );
+    let gaps_after: Vec<String> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "revived folded count")
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert_eq!(
+        gaps_after.len(),
+        gaps.len(),
+        "the advance files no second gap"
+    );
+}

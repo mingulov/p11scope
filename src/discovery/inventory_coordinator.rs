@@ -4357,9 +4357,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// The stall-gap reason over the typed counts, with singular
-    /// forms for the common single-handoff stall.
+    /// forms for the common single-handoff stall. The no-worker
+    /// clause appears only when a spawn actually failed, so
+    /// busy-only stalls keep their established wording.
     fn reclaim_stall_reason(counts: crate::inventory::ReclaimCounts) -> String {
-        format!(
+        let mut reason = format!(
             "{} {} found the reclaim worker busy; {} {} held (a file close is blocked, e.g. \
              on a stopped FUSE daemon)",
             counts.worker_busy,
@@ -4374,7 +4376,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             } else {
                 "transients"
             },
-        )
+        );
+        if counts.unavailable > 0 {
+            reason.push_str(&format!(
+                "; {} {} retained custody without a running worker",
+                counts.unavailable,
+                if counts.unavailable == 1 {
+                    "service"
+                } else {
+                    "services"
+                },
+            ));
+        }
+        reason
     }
 
     /// Latch the lane's journal linkage from its drain producers at
@@ -19687,7 +19701,7 @@ pub(crate) mod tests {
                 worker_busy: 1,
                 held: 1,
                 handed: hands,
-                inline: 0,
+                unavailable: 0,
             },
             "the typed counts name the stall"
         );
@@ -19726,23 +19740,35 @@ pub(crate) mod tests {
     #[test]
     fn reclaim_stall_reason_pluralizes_counts() {
         use crate::inventory::ReclaimCounts;
-        let reason = |worker_busy: u64, held: usize| {
+        let reason = |worker_busy: u64, held: usize, unavailable: u64| {
             InventoryCoordinator::<OsProcessSource>::reclaim_stall_reason(ReclaimCounts {
                 worker_busy,
                 held,
                 handed: 0,
-                inline: 0,
+                unavailable,
             })
         };
         assert_eq!(
-            reason(1, 1),
+            reason(1, 1, 0),
             "1 handoff found the reclaim worker busy; 1 transient held (a file close is \
              blocked, e.g. on a stopped FUSE daemon)"
         );
         assert_eq!(
-            reason(3, 2),
+            reason(3, 2, 0),
             "3 handoffs found the reclaim worker busy; 2 transients held (a file close is \
              blocked, e.g. on a stopped FUSE daemon)"
+        );
+        assert_eq!(
+            reason(0, 2, 1),
+            "0 handoffs found the reclaim worker busy; 2 transients held (a file close is \
+             blocked, e.g. on a stopped FUSE daemon); 1 service retained custody without a \
+             running worker"
+        );
+        assert_eq!(
+            reason(1, 3, 2),
+            "1 handoff found the reclaim worker busy; 3 transients held (a file close is \
+             blocked, e.g. on a stopped FUSE daemon); 2 services retained custody without a \
+             running worker"
         );
     }
 

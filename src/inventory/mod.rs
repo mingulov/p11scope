@@ -1498,21 +1498,21 @@ const RECLAIM_QUEUE_DEPTH: usize = 2;
 /// Typed counts of the pass-heap reclaim (D3). `worker_busy` counts
 /// the services that found the worker busy (monotonic, saturating);
 /// `held` is the custody waiting now for the next pass's handoff;
-/// `handed` counts values the worker took; `inline` counts values
-/// dropped on the calling thread because no worker could start (the
-/// pre-worker fallback).
+/// `handed` counts values the worker took; `unavailable` counts the
+/// services that retained custody because no worker was running
+/// (spawn failed); the next pass retries the spawn. No value is
+/// ever dropped on the calling thread.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReclaimCounts {
     pub(crate) worker_busy: u64,
     pub(crate) held: usize,
     pub(crate) handed: u64,
-    pub(crate) inline: u64,
+    pub(crate) unavailable: u64,
 }
 
 enum ReclaimWorker {
     NotStarted,
     Running(std::sync::mpsc::SyncSender<ReclaimItem>),
-    Unavailable,
 }
 
 /// Pass-heap reclaim off the main loop (D3): one long-lived worker
@@ -1539,6 +1539,11 @@ pub(crate) struct PassReclaim {
     /// wait for this to catch up with `handed`; production never
     /// waits).
     completed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Fault injection (tests only): the next N worker-spawn
+    /// attempts fail, so twins can prove the no-worker path
+    /// retains custody instead of dropping inline.
+    #[cfg(test)]
+    spawn_failures_remaining: u32,
 }
 
 impl Default for PassReclaim {
@@ -1554,11 +1559,31 @@ impl PassReclaim {
             custody: std::sync::Mutex::new(std::collections::VecDeque::new()),
             counts: ReclaimCounts::default(),
             completed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            spawn_failures_remaining: 0,
         }
     }
 
+    /// Tests only: fail the next `n` worker-spawn attempts.
+    #[cfg(test)]
+    fn fail_next_spawns(&mut self, n: u32) {
+        self.spawn_failures_remaining =
+            self.spawn_failures_remaining.saturating_add(n);
+    }
+
+    /// Tests only: consume one injected spawn failure.
+    fn injected_spawn_failure(&mut self) -> bool {
+        #[cfg(test)]
+        if self.spawn_failures_remaining > 0 {
+            self.spawn_failures_remaining -= 1;
+            return true;
+        }
+        false
+    }
+
     /// Hand `value` to the reclaim worker without waiting. Earlier
-    /// custody goes first; a busy worker keeps the rest here.
+    /// custody goes first; a busy worker, or no running worker at
+    /// all, keeps the rest here for the next pass.
     pub(crate) fn hand_off<T: Send + 'static>(&mut self, value: T) {
         self.custody_mut().push_back(Box::new(value));
         self.service();
@@ -1571,16 +1596,23 @@ impl PassReclaim {
     }
 
     /// Retry the custody: one non-blocking handoff attempt per held
-    /// value, in order, stopping at the first refusal (counted once).
+    /// value, in order, stopping at the first refusal (counted
+    /// once). When no worker is running, the values stay in
+    /// custody: dropping them here could close file descriptors on
+    /// the calling thread.
     pub(crate) fn service(&mut self) {
         let mut pending = std::mem::take(self.custody_mut());
         while let Some(item) = pending.pop_front() {
             let Some(sender) = self.sender() else {
-                // No worker thread could start: drop here, exactly
-                // the pre-worker behavior.
-                drop(item);
-                self.counts.inline = self.counts.inline.saturating_add(1);
-                continue;
+                // No worker is running (spawn failed): retain the
+                // value and the rest, count the stall once, and let
+                // the next pass retry the spawn. Nothing drops here:
+                // these values can close file descriptors, and a
+                // blocked close must not stop the calling thread.
+                pending.push_front(item);
+                self.counts.unavailable =
+                    self.counts.unavailable.saturating_add(1);
+                break;
             };
             match sender.try_send(item) {
                 Ok(()) => self.counts.handed = self.counts.handed.saturating_add(1),
@@ -1591,10 +1623,12 @@ impl PassReclaim {
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(item)) => {
                     // Defensive; unreachable while the sender is owned
-                    // here. If it ever fires, the value and the rest
-                    // drop inline through the empty-sender arm above.
-                    self.worker = ReclaimWorker::Unavailable;
+                    // here (the worker survives panicking drops). If
+                    // it ever fires, retain the value and respawn on
+                    // the next service instead of dropping inline.
+                    self.worker = ReclaimWorker::NotStarted;
                     pending.push_front(item);
+                    break;
                 }
             }
         }
@@ -1634,7 +1668,7 @@ impl PassReclaim {
     }
 
     fn sender(&mut self) -> Option<&std::sync::mpsc::SyncSender<ReclaimItem>> {
-        if matches!(self.worker, ReclaimWorker::NotStarted) {
+        if matches!(self.worker, ReclaimWorker::NotStarted) && !self.injected_spawn_failure() {
             let (sender, receiver) =
                 std::sync::mpsc::sync_channel::<ReclaimItem>(RECLAIM_QUEUE_DEPTH);
             let completed = std::sync::Arc::clone(&self.completed);
@@ -1646,12 +1680,14 @@ impl PassReclaim {
                 // exits once every sender is gone and its queue is
                 // empty.
                 Ok(_detached) => ReclaimWorker::Running(sender),
-                Err(_) => ReclaimWorker::Unavailable,
+                // No latch: the worker stays NotStarted, so the next
+                // service retries the spawn.
+                Err(_) => ReclaimWorker::NotStarted,
             };
         }
         match &self.worker {
             ReclaimWorker::Running(sender) => Some(sender),
-            ReclaimWorker::NotStarted | ReclaimWorker::Unavailable => None,
+            ReclaimWorker::NotStarted => None,
         }
     }
 }
@@ -1830,13 +1866,13 @@ mod pass_reclaim_tests {
                     worker_busy: 0,
                     held: 0,
                     handed: 1 + depth,
-                    inline: 0,
+                    unavailable: 0,
                 },
                 busy: ReclaimCounts {
                     worker_busy: 1,
                     held: 1,
                     handed: 1 + depth,
-                    inline: 0,
+                    unavailable: 0,
                 },
             }
         );
@@ -1864,12 +1900,58 @@ mod pass_reclaim_tests {
                 worker_busy: attempts,
                 held: 0,
                 handed: 2 + depth,
-                inline: 0,
+                unavailable: 0,
             }
         );
         assert!(
             wait_until(|| dropped.load(Ordering::SeqCst) == 2 + RECLAIM_QUEUE_DEPTH),
             "every value is reclaimed"
+        );
+    }
+
+    /// Spawn failure retains custody: nothing drops on the calling
+    /// thread even when the drop would block, and the handoff
+    /// returns promptly.
+    #[test]
+    fn spawn_failure_retains_custody_and_returns_promptly() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (stuck, entered_rx, release_tx) = blocking(&dropped);
+        let mut reclaim = PassReclaim::new();
+        reclaim.fail_next_spawns(u32::MAX);
+        let start = Instant::now();
+        reclaim.hand_off(stuck);
+        assert!(
+            start.elapsed() < WATCHDOG,
+            "the handoff returns without waiting on the blocked drop"
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing drops inline");
+        assert_eq!(reclaim.counts().held, 1, "the transient stays in custody");
+        assert_eq!(reclaim.counts().unavailable, 1, "the stall counts once");
+        assert_eq!(reclaim.counts().handed, 0);
+        drop(entered_rx);
+        drop(release_tx);
+    }
+
+    /// The next pass retries the spawn: one failure retains, then
+    /// the worker starts and drains the retained custody.
+    #[test]
+    fn spawn_failure_recovers_on_the_next_pass() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut reclaim = PassReclaim::new();
+        reclaim.fail_next_spawns(1);
+        reclaim.hand_off(Tracked(Arc::clone(&dropped)));
+        assert_eq!(reclaim.counts().held, 1, "the first pass retains");
+        assert_eq!(reclaim.counts().unavailable, 1);
+        reclaim.hand_off(Tracked(Arc::clone(&dropped)));
+        assert!(
+            wait_until(|| dropped.load(Ordering::SeqCst) == 2),
+            "the retry hands the retained custody off"
+        );
+        assert_eq!(reclaim.counts().held, 0);
+        assert_eq!(
+            reclaim.counts().unavailable,
+            1,
+            "the retry stalls no further"
         );
     }
 
@@ -1955,7 +2037,7 @@ mod pass_reclaim_tests {
         );
         reclaim.hand_off(Tracked(Arc::clone(&dropped)));
         assert!(wait_until(|| dropped.load(Ordering::SeqCst) == 2));
-        assert_eq!(reclaim.counts().inline, 0);
+        assert_eq!(reclaim.counts().unavailable, 0);
     }
 }
 

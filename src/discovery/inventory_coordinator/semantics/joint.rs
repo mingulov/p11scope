@@ -460,12 +460,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Seal and delivery take separate port scopes (ports are
             // re-created per scope elsewhere too) so the seal outcome
             // records its diagnostic before any refusal propagates.
+            // The credited entries fund each call's barrier scan from
+            // its own 64-unit slice (INV-2 credit) while every step
+            // (advance, effect, visit) draws from this shared action
+            // pool exactly as before per-row metering; an unfinished
+            // scan resumes on the next call's slice.
             let outcome = {
                 let mut ports = self
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
                 let held = frame.as_mut().expect("same original service frame");
-                held.seal_next_bounded(&mut ports, &mut births, &fault, remaining)
+                held.seal_next_credited(&mut ports, &mut births, &fault, remaining)
             };
             self.seal_diagnosis.record(&outcome);
             outcome.map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
@@ -477,7 +482,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // Stack-local: the ports borrow the coordinator while the
                 // slice records, so the run total folds in after they drop.
                 let mut deliver = DeliverDiagnosis::default();
-                held.deliver_next_bounded(&mut ports, remaining, &mut deliver)
+                held.deliver_next_credited(&mut ports, remaining, &mut deliver)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
                 self.seal_diagnosis.deliver.absorb(&deliver);
             }

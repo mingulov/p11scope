@@ -9209,9 +9209,9 @@ fn joint_machine_real_future_consumer_keeps_original_until_q2_end() {
         drive_machine_seal_polls(&mut fixture, rows, 1, "first Future advance", |fixture| {
             fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1))
         });
-    assert!(
-        polls > 1,
-        "the charged barrier scan yields instead of deciding in one poll"
+    assert_eq!(
+        polls, 1,
+        "one 64-unit credit decides the small scene's seal in one poll"
     );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
@@ -9251,9 +9251,9 @@ fn joint_machine_real_future_consumer_progress_resets_running_stall_bound() {
         "stall-reset Future advance",
         |fixture| fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1)),
     );
-    assert!(
-        polls > 1,
-        "the charged barrier scan yields instead of deciding in one poll"
+    assert_eq!(
+        polls, 1,
+        "one 64-unit credit decides the small scene's seal in one poll"
     );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
@@ -14517,9 +14517,9 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
         "held-behind-running Future advance",
         |fixture| fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1)),
     );
-    assert!(
-        polls > 1,
-        "the charged barrier scan yields instead of deciding in one poll"
+    assert_eq!(
+        polls, 1,
+        "one 64-unit credit decides the small scene's seal in one poll"
     );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
@@ -14693,6 +14693,66 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
         "the post-void audit frame took the void"
     );
     assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// Machine-level seal-yield twin: with past one 64-unit credit of
+/// staged rows the first service cannot finish the barrier scan, so
+/// the seal yields and resumes across polls (per-poll progress is
+/// proved inside the driver) until the same (1, 1, 1) lands.
+#[test]
+fn joint_machine_seal_scan_yields_past_one_credit_and_resumes() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let pid = std::process::id();
+    // A (file 0) stays running: only its BEGIN lands. B (file 1) is a
+    // complete call from the same process.
+    let (begin_a, _end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.reach_phase("Audited");
+    // 97 retained rows on another image (above every cut, barring
+    // nothing): the scan must visit every one before deciding.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(
+        rows > 64,
+        "the staging table holds past one credit of rows: {rows}"
+    );
+    let (polls, progress) = drive_machine_seal_polls(
+        &mut fixture,
+        rows,
+        1,
+        "over-credit Future advance",
+        |fixture| fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1)),
+    );
+    assert!(
+        polls > 1,
+        "the over-credit scan yields instead of deciding in one poll"
+    );
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((1, 1, 1)),
+        "the resumed seal waits behind the running call"
+    );
+    assert_eq!(progress, Ok(JointServiceProgress::Pending));
 }
 
 /// The stranded staged disposal with a long surviving bucket is
@@ -21676,26 +21736,7 @@ fn watchdog_same_quantum_healthy_stage_survives_rearm() {
         );
     // A is unfinished (Future, awaiting input) and B is Pending;
     // neither retried nor parked, so the posed failure alone proves
-    // A stuck while B stays clean. The charged barrier scan yields
-    // across polls; drive A's advance within its derived bound.
-    let diagnosis = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .adapter()
-        .seal_stage_diagnosis();
-    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
-    let (_polls, _outcome) = drive_machine_seal_polls(&mut fixture, rows, 1, ROW, |fixture| {
-        fixture
-            .machine
-            .frame_consumer_states_for_test()
-            .iter()
-            .map(|(_, state, _, _)| *state)
-            .collect::<Vec<_>>()
-            == ["Future", "Pending"]
-    });
+    // A stuck while B stays clean.
     let states = fixture.machine.frame_consumer_states_for_test();
     assert_eq!(
         states
@@ -46587,3 +46628,4 @@ fn joint_disposed_terminal_check_is_metered() {
         "one delivery per paid unit, then the advance"
     );
 }
+

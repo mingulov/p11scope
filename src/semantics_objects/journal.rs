@@ -2739,6 +2739,56 @@ pub(crate) enum SealAttempt {
     Yielded,
 }
 
+/// Row-scale units per seal credit (INV-2): one machine seal or
+/// delivery call funds its barrier scan from a fresh slice of this
+/// many units while its steps draw from the shared action pool. Never
+/// raise this: an unfinished scan resumes on the next call's slice.
+pub(crate) const SEAL_CREDIT_UNITS: usize = 64;
+
+/// Split seal budgets: row-scale barrier-scan work vs step-scale
+/// advance/delivery work. Machine calls split the two (each call
+/// funds its scan from a fresh [`SEAL_CREDIT_UNITS`] slice while
+/// steps draw from the shared action pool, so a small seal still
+/// decides in one service); direct unit calls share one pool for
+/// both (the lane's per-row charge model).
+pub(crate) struct SealPools<'a> {
+    scan: &'a mut usize,
+    steps: SealSteps<'a>,
+}
+
+/// Step pool: shared with the scan pool, or a pool of its own.
+pub(crate) enum SealSteps<'a> {
+    Shared,
+    Split(&'a mut usize),
+}
+
+impl<'a> SealPools<'a> {
+    pub(crate) fn shared(pool: &'a mut usize) -> Self {
+        Self {
+            scan: pool,
+            steps: SealSteps::Shared,
+        }
+    }
+
+    pub(crate) fn split(scan: &'a mut usize, steps: &'a mut usize) -> Self {
+        Self {
+            scan,
+            steps: SealSteps::Split(steps),
+        }
+    }
+
+    pub(crate) fn scan(&mut self) -> &mut usize {
+        self.scan
+    }
+
+    pub(crate) fn steps(&mut self) -> &mut usize {
+        match &mut self.steps {
+            SealSteps::Shared => &mut *self.scan,
+            SealSteps::Split(steps) => &mut **steps,
+        }
+    }
+}
+
 /// Resumable scoped-recovery phases in order.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::semantics_objects) enum ScopedRecoveryPhase {
@@ -11074,6 +11124,7 @@ impl JournalAdapter {
             self.audit_collected(model, audit, fault)?;
             let mut barrier = SealBarrierState::default();
             let mut budget = usize::MAX;
+            let mut pools = SealPools::shared(&mut budget);
             match self.seal_domain_inner(
                 model,
                 audit,
@@ -11082,7 +11133,7 @@ impl JournalAdapter {
                 births,
                 None,
                 &mut barrier,
-                &mut budget,
+                &mut pools,
             ) {
                 SealAttempt::Decided(outcome) => outcome,
                 SealAttempt::Yielded => {
@@ -11096,9 +11147,10 @@ impl JournalAdapter {
     /// Per-domain conversion under the frame's already adjudicated collection.
     /// The opaque input can only be minted by that frame. A fresh fault read
     /// may add a later broad loss; it never takes or re-audits H3/counters.
-    /// The barrier scan charges `budget` (the frame's shared slice) per
-    /// examined row and resumes from `barrier` across retries; a yielded
-    /// scan decides nothing and keeps `None` as this attempt's wait.
+    /// The barrier scan charges the pools' scan slice per examined row
+    /// and resumes from `barrier` across retries; a yielded scan decides
+    /// nothing and keeps `None` as this attempt's wait. The decision
+    /// credit gate reads the step pool.
     #[allow(clippy::too_many_arguments)]
     fn seal_in_audit(
         &mut self,
@@ -11108,7 +11160,7 @@ impl JournalAdapter {
         fault: &impl FaultEpoch,
         replay: ReplayPreparation,
         barrier: &mut SealBarrierState,
-        budget: &mut usize,
+        pools: &mut SealPools,
     ) -> SealAttempt {
         let (audit, bootstrap, frontier) = input.into_parts();
         self.seal_wait.set(SealWait::None);
@@ -11150,7 +11202,7 @@ impl JournalAdapter {
                 births,
                 Some(replay),
                 barrier,
-                budget,
+                pools,
             )
         })();
         match attempt {
@@ -11179,7 +11231,7 @@ impl JournalAdapter {
         births: &mut impl BirthEvidenceSource,
         replay: Option<ReplayPreparation>,
         barrier: &mut SealBarrierState,
-        budget: &mut usize,
+        pools: &mut SealPools,
     ) -> SealAttempt {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
@@ -11342,7 +11394,7 @@ impl JournalAdapter {
         match self.scan_seal_inputs(
             barrier,
             frontier,
-            budget,
+            pools.scan(),
             key,
             bootstrap.birth_cut(),
             audit,
@@ -11397,18 +11449,18 @@ impl JournalAdapter {
         // live set, conversion and pruning) is paid row by row first,
         // resuming across polls under the same stamp.
         let owed = self.seal_decision_cost(&decision, image);
-        if !self.prepay_seal_decision(scan, owed, budget) {
+        if !self.prepay_seal_decision(scan, owed, pools.scan()) {
             return SealAttempt::Yielded;
         }
-        // The scan spent from the shared slice; re-bound the inline
-        // allowance to what remains so a later doom or void never spends
-        // past the service budget.
-        self.inline_credit = (*budget).min(SCOPED_RECOVERY_SLICE);
-        if *budget == 0 {
-            // The last row or prepaid unit spent the last credit: the
-            // finished scan stays cached, but applying the decision and
-            // its Future settlement need a paid decision credit of their
-            // own. Yield so the same frame resumes with fresh budget
+        // The scan spent from its own slice; re-bound the inline
+        // allowance to what remains of the step pool so a later doom
+        // or void never spends past the service budget.
+        self.inline_credit = (*pools.steps()).min(SCOPED_RECOVERY_SLICE);
+        if *pools.steps() == 0 {
+            // The last step spent the last credit: the finished scan
+            // stays cached, but applying the decision and its Future
+            // settlement need a paid decision credit of their own.
+            // Yield so the same frame resumes with fresh budget
             // (re-running entry, fault and birth checks) instead of
             // settling at zero.
             return SealAttempt::Yielded;
@@ -39143,6 +39195,7 @@ pub(crate) mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(bootstrap));
+        let mut pools = SealPools::shared(budget);
         scene.adapter.seal_domain_inner(
             &mut scene.model,
             audit,
@@ -39151,7 +39204,7 @@ pub(crate) mod tests {
             &mut births,
             None,
             barrier,
-            budget,
+            &mut pools,
         )
     }
 

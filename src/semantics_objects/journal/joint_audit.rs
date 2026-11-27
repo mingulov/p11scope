@@ -2360,11 +2360,38 @@ impl IngestedJointQuantum {
         fault: &impl FaultEpoch,
         remaining: &mut usize,
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut pools = super::SealPools::shared(remaining);
+        self.seal_next_inner(ports, births, fault, &mut pools)
+    }
+
+    /// Machine seal call: the barrier scan draws from a fresh
+    /// [`super::SEAL_CREDIT_UNITS`] slice while every step draws from
+    /// the shared action pool, so a small seal still decides in one
+    /// service; an unfinished scan resumes on the next call's slice.
+    pub(crate) fn seal_next_credited(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        births: &mut impl JointBirthEvidenceSource,
+        fault: &impl FaultEpoch,
+        steps: &mut usize,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut scan = super::SEAL_CREDIT_UNITS;
+        let mut pools = super::SealPools::split(&mut scan, steps);
+        self.seal_next_inner(ports, births, fault, &mut pools)
+    }
+
+    fn seal_next_inner(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        births: &mut impl JointBirthEvidenceSource,
+        fault: &impl FaultEpoch,
+        pools: &mut super::SealPools,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         self.preflight(ports)?;
         if !self.bound {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        if *remaining == 0 {
+        if *pools.steps() == 0 {
             return Ok(self.progress());
         }
         // Deferred rejection work first: no original is read, sealed past
@@ -2372,7 +2399,7 @@ impl IngestedJointQuantum {
         if self.awaits_rejection() {
             let (_, owner, _, _, _) = ports.split();
             let (adapter, model) = owner.parts();
-            if !self.complete_rejections(adapter, model, remaining) {
+            if !self.complete_rejections(adapter, model, pools.steps()) {
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
             self.reconcile_provisional(ports)?;
@@ -2383,7 +2410,7 @@ impl IngestedJointQuantum {
                     parked.outcome,
                     parked.storage,
                     parked.bytes,
-                    remaining,
+                    pools.steps(),
                 ));
             }
         }
@@ -2458,9 +2485,9 @@ impl IngestedJointQuantum {
         };
         let mark = adapter.rejection_mark();
         // A refusal decided by this seal runs its inline rejection work
-        // from this same service budget, never past it. The barrier
-        // scan charges the same slice per examined row before it.
-        adapter.bound_inline_credit(*remaining);
+        // from the step pool, never past it. The barrier scan charges
+        // the scan slice per examined row before it.
+        adapter.bound_inline_credit(*pools.steps());
         let attempt = adapter.seal_in_audit(
             model,
             input,
@@ -2468,10 +2495,11 @@ impl IngestedJointQuantum {
             fault,
             replay,
             &mut self.seal_barrier,
-            remaining,
+            pools,
         );
         let spent = adapter.take_inline_spent();
-        *remaining = remaining.saturating_sub(spent);
+        let steps = pools.steps();
+        *steps = steps.saturating_sub(spent);
         let outcome = match attempt {
             super::SealAttempt::Yielded => {
                 // The barrier scan spent its slice and saved its
@@ -2504,7 +2532,7 @@ impl IngestedJointQuantum {
                 storage,
                 bytes,
             });
-            if !self.complete_rejections(adapter, model, remaining) {
+            if !self.complete_rejections(adapter, model, pools.steps()) {
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
             let parked = self.parked.take().expect("filled parked seal");
@@ -2514,10 +2542,17 @@ impl IngestedJointQuantum {
                 parked.outcome,
                 parked.storage,
                 parked.bytes,
-                remaining,
+                pools.steps(),
             ));
         }
-        Ok(self.settle_outcome(ports, index, outcome, storage, bytes, remaining))
+        Ok(self.settle_outcome(
+            ports,
+            index,
+            outcome,
+            storage,
+            bytes,
+            pools.steps(),
+        ))
     }
 
     /// Settle one selected seal outcome (filled): a broad failure
@@ -2635,6 +2670,31 @@ impl IngestedJointQuantum {
         remaining: &mut usize,
         diagnosis: &mut DeliverDiagnosis,
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut pools = super::SealPools::shared(remaining);
+        self.deliver_next_inner(ports, &mut pools, diagnosis)
+    }
+
+    /// Machine delivery call: the disposed-frame terminal scan draws
+    /// from a fresh [`super::SEAL_CREDIT_UNITS`] slice while every
+    /// effect draws from the shared action pool; an unfinished scan
+    /// resumes on the next call's slice.
+    pub(crate) fn deliver_next_credited(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        steps: &mut usize,
+        diagnosis: &mut DeliverDiagnosis,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
+        let mut scan = super::SEAL_CREDIT_UNITS;
+        let mut pools = super::SealPools::split(&mut scan, steps);
+        self.deliver_next_inner(ports, &mut pools, diagnosis)
+    }
+
+    fn deliver_next_inner(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        pools: &mut super::SealPools,
+        diagnosis: &mut DeliverDiagnosis,
+    ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         self.preflight(ports)?;
         if !self.bound {
             return Err(RawQuantumRefusal::DispositionMismatch);
@@ -2644,7 +2704,7 @@ impl IngestedJointQuantum {
             // its deferred work runs first, from this same budget.
             let (_, owner, _, _, _) = ports.split();
             let (adapter, model) = owner.parts();
-            if !self.complete_rejections(adapter, model, remaining) {
+            if !self.complete_rejections(adapter, model, pools.steps()) {
                 diagnosis.note_other();
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
@@ -2657,7 +2717,7 @@ impl IngestedJointQuantum {
                     parked.outcome,
                     parked.storage,
                     parked.bytes,
-                    remaining,
+                    pools.steps(),
                 ));
             }
         }
@@ -2682,7 +2742,7 @@ impl IngestedJointQuantum {
             let active = self.active.as_mut().expect("selected actual result");
             let seal = active.outcome.as_ref().expect("positive original result");
             let mut batch = SealBatchDelivery::new(seal, &mut active.replay);
-            let entry_zero = *remaining == 0;
+            let entry_zero = *pools.steps() == 0;
             let entry_exhausted = batch.effects_complete();
             let (registry, owner, _, _, _) = ports.split();
             let (adapter, model) = owner.parts();
@@ -2691,7 +2751,7 @@ impl IngestedJointQuantum {
                 &mut batch,
                 model,
                 adapter.ledger_mut(),
-                remaining,
+                pools.steps(),
             );
             diagnosis.record(&outcome, entry_zero, entry_exhausted);
             return match outcome {
@@ -2718,7 +2778,7 @@ impl IngestedJointQuantum {
             target.bootstrap().domain(),
         ) else {
             if matches!(self.ingress, FrameIngress::Disposed(_)) && self.failure.is_none() {
-                if *remaining == 0 {
+                if *pools.steps() == 0 {
                     diagnosis.note_other();
                     return Ok(QuantumSealProgress::DeliveryReady);
                 }
@@ -2728,21 +2788,22 @@ impl IngestedJointQuantum {
                     return Ok(QuantumSealProgress::LocalPending);
                 }
                 // The terminal check is the seal's paid scan (one unit per
-                // staged row and identity, resuming under an identical
-                // stamp); the advance below takes its own credit after it.
+                // staged row and identity from the scan slice, resuming
+                // under an identical stamp); the advance below takes its
+                // own step after it.
                 let Some(awaits) = owner.adapter().awaits_future_terminal_bounded(
                     &mut self.seal_barrier,
                     target.bootstrap(),
                     self.frontier,
                     &self.audit,
-                    remaining,
+                    pools.scan(),
                 ) else {
                     diagnosis.note_other();
                     return Ok(QuantumSealProgress::DeliveryReady);
                 };
-                if *remaining == 0 {
+                if *pools.steps() == 0 {
                     // The finished scan stays cached: the next service
-                    // advances with a paid credit and zero new visits.
+                    // advances with a paid step and zero new visits.
                     diagnosis.note_other();
                     return Ok(QuantumSealProgress::DeliveryReady);
                 }
@@ -2755,7 +2816,7 @@ impl IngestedJointQuantum {
                     // head is being consumed and no positive result is minted.
                     ConsumerState::Delivered
                 };
-                *remaining -= 1;
+                *pools.steps() -= 1;
                 self.advance_consumer(state);
                 diagnosis.note_other();
                 return Ok(self.progress());
@@ -2769,9 +2830,9 @@ impl IngestedJointQuantum {
                     .failure
                     .as_ref()
                     .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
-                && *remaining != 0
+                && *pools.steps() != 0
             {
-                *remaining -= 1;
+                *pools.steps() -= 1;
                 self.advance_pending_visit();
                 diagnosis.note_other();
                 return Ok(QuantumSealProgress::DeliveryReady);
@@ -2806,7 +2867,7 @@ impl IngestedJointQuantum {
             && (h3_clean_floor || audited.fence().is_some());
         // A retry replays this visit from the start next time, so what it
         // spends here is refunded below: it delivers nothing.
-        let before = *remaining;
+        let before = *pools.steps();
         // A parked consumer degrades instead of retrying: force the
         // fallback its feed would take under a fenced void. The flag
         // only alters retry deliveries: a genuine fallback or
@@ -2842,7 +2903,7 @@ impl IngestedJointQuantum {
                 &target,
                 registry,
                 model,
-                remaining,
+                pools.steps(),
             )?
         } else {
             registry.deliver_joint_failure(
@@ -2850,7 +2911,7 @@ impl IngestedJointQuantum {
                 &mut batch,
                 model,
                 adapter.ledger_mut(),
-                remaining,
+                pools.steps(),
             )
         };
         // The delivered failure's gap, copied out before the outcome
@@ -3007,7 +3068,7 @@ impl IngestedJointQuantum {
                 self.consumers[index].stuck_streak =
                     self.consumers[index].stuck_streak.saturating_add(1);
                 self.consumers[index].last_stuck_gap = Some(stuck_gap);
-                *remaining = before;
+                *pools.steps() = before;
                 diagnosis.note_failure_retried();
                 Ok(QuantumSealProgress::LocalPending)
             }
@@ -3018,12 +3079,12 @@ impl IngestedJointQuantum {
                         .as_ref()
                         .is_some_and(|failure| failure.gap == JournalGap::H3Pending)
                     && batch.effects_complete()
-                    && *remaining != 0
+                    && *pools.steps() != 0
                 {
                     // This target's negative spans are done, but its H8/H9
                     // history stays Pending. Charge the visit, then allow
                     // later affected consumers their original spans too.
-                    *remaining -= 1;
+                    *pools.steps() -= 1;
                     self.advance_pending_visit();
                     diagnosis.note_failure_progress();
                     Ok(QuantumSealProgress::DeliveryReady)
@@ -3051,7 +3112,7 @@ impl IngestedJointQuantum {
                 Ok(QuantumSealProgress::LocalPending)
             }
             FailureBatchProgress::Yielded => {
-                if failure_yielded_is_progress(before, *remaining) {
+                if failure_yielded_is_progress(before, *pools.steps()) {
                     // Spent budget on this delivery, so its persistent
                     // cursor advanced (effect spans, loss invalidation,
                     // census, or one staged head disposed/replayed with

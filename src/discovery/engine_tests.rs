@@ -13055,17 +13055,6 @@ fn maps_snapshots_stable(previous: &str, current: &str) -> bool {
     !current.is_empty() && previous == current
 }
 
-/// True when a `wchan` read proves the task off-CPU: unreadable (restricted
-/// kernels keep legacy stability-only behavior) or any wait symbol —
-/// anything but `0`, which means running or runnable. Split out so the
-/// peer off-CPU gate has a deterministic unit test.
-fn wchan_means_blocked(wchan: Option<&str>) -> bool {
-    match wchan {
-        None => true,
-        Some(wchan) => wchan.trim() != "0",
-    }
-}
-
 /// Spins of polling before a parked wait gives up loudly. Counted in
 /// loop passes, not wall time, so a descheduled test thread cannot trip
 /// it; startup resolves in a handful of wakeups.
@@ -13136,19 +13125,6 @@ fn parked_fallback_needs_two_identical_nonempty_snapshots() {
     assert!(!maps_snapshots_stable("a\n", ""));
     // Any difference: the loader is still mapping.
     assert!(!maps_snapshots_stable("a\n", "a\nb\n"));
-}
-
-#[test]
-fn off_cpu_gate_treats_only_zero_as_running() {
-    // Wait symbols (pause, nanosleep variants, faults): blocked.
-    assert!(wchan_means_blocked(Some("__do_sys_pause")));
-    assert!(wchan_means_blocked(Some("hrtimer_nanosleep\n")));
-    assert!(wchan_means_blocked(Some("do_wait")));
-    // Unreadable (restricted kernels): cannot disprove, keep legacy.
-    assert!(wchan_means_blocked(None));
-    // `0` means running or runnable: never settled.
-    assert!(!wchan_means_blocked(Some("0")));
-    assert!(!wchan_means_blocked(Some("0\n")));
 }
 
 #[test]
@@ -20880,14 +20856,28 @@ impl LoadedSeedProvider {
     fn spawn_peer(&mut self) -> u32 {
         let runner = self._dir.path().join("seed-runner");
         let library = self._dir.path().join("seed-provider.so");
+        // Unlinked first: a respawn reusing the slot must never read
+        // the dead peer's report.
+        let ready = self
+            ._dir
+            .path()
+            .join(format!("peer-{}.ready", self.peers.len()));
+        let _ = std::fs::remove_file(&ready);
         let child = std::process::Command::new(&runner)
             .arg(&library)
+            .arg(&ready)
             .die_with_parent()
             .spawn()
             .unwrap();
         let pid = child.id();
         self.peers.push(child);
-        wait_loaded_seed_peer(self.peers.last_mut().unwrap(), &runner, &library, |_| {});
+        wait_loaded_seed_peer(
+            self.peers.last_mut().unwrap(),
+            &runner,
+            &library,
+            &ready,
+            |_| {},
+        );
         pid
     }
 
@@ -20904,10 +20894,17 @@ impl LoadedSeedProvider {
     }
 }
 
+/// Wait for a seed peer's cooperative READY report: the runner writes
+/// it past `dlopen`, so every loader mapping is complete and final (the
+/// pause loop never maps again) — no stability inference, no wchan
+/// proxy. `ready` is the argv[2] report path, unlinked before spawn.
+/// Exits and deadlines fail loudly; afterwards both executable images
+/// are verified one-shot.
 fn wait_loaded_seed_peer(
     child: &mut std::process::Child,
     runner: &Path,
     library: &Path,
+    ready: &Path,
     mut after_probe: impl FnMut(&mut std::process::Child),
 ) {
     let runner = std::fs::canonicalize(runner).unwrap();
@@ -20915,65 +20912,33 @@ fn wait_loaded_seed_peer(
     let pid = child.id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let image = std::fs::read_link(format!("/proc/{pid}/exe"));
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"));
-        let runner_mapped = maps
-            .as_ref()
-            .is_ok_and(|maps| maps_have_executable_image(maps, &runner));
-        let provider_mapped = maps
-            .as_ref()
-            .is_ok_and(|maps| maps_have_executable_image(maps, &library));
-        // The peer promises the same loaded state as the primary fixture.
-        // Exe alone can switch before executable segments appear, and a
-        // different initialized image (such as a launcher) is not this peer.
-        // Presence alone is not enough: a scan that beats the settling maps
-        // charges a transient extra line, so exact cross-peer work assertions
-        // flake under load. Require the full maps text to hold still across
-        // consecutive polls before the peer counts as ready.
-        if image.as_ref().is_ok_and(|image| image == &runner) && runner_mapped && provider_mapped {
-            let mut stable = 0;
-            let mut previous = maps.unwrap_or_default();
-            while stable < 2 {
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "seed peer {pid} exited while its maps settled"
-                );
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "seed peer {pid} maps never settled: {previous:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                let current =
-                    std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
-                if current == previous {
-                    stable += 1;
-                } else {
-                    stable = 0;
-                    previous = current;
-                }
-            }
-            // Off-CPU proof: stability alone can freeze a descheduled
-            // mid-loader peer (identical partial snapshots). A runnable
-            // task reads wchan `0`, so only a blocked peer with stable
-            // maps counts as settled.
-            let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan"));
-            if wchan_means_blocked(wchan.as_deref().ok()) {
-                return;
-            }
+        // The runner flushes the 6-byte report in one write: readers see
+        // missing, empty, then exactly READY — never a torn prefix.
+        if std::fs::read_to_string(ready).is_ok_and(|report| report == "READY\n") {
+            break;
         }
         after_probe(child);
         assert!(
             child.try_wait().unwrap().is_none(),
-            "seed peer {pid} exited before mapping {runner:?} and {library:?}"
+            "seed peer {pid} exited before reporting READY"
         );
-        // Test the final predicate after the last sleep before rejecting the
-        // deadline, just as the existing exec-settling helper does.
         assert!(
             std::time::Instant::now() < deadline,
-            "seed peer {pid} never became ready: exe={image:?}, runner executable={runner_mapped}, provider executable={provider_mapped}"
+            "seed peer {pid} never reported READY"
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    // One-shot sanity: a READY report proves past-dlopen, so both
+    // executable images must be present; anything else is a
+    // template/runner mismatch, failed loudly.
+    let image = std::fs::read_link(format!("/proc/{pid}/exe"));
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+    assert!(
+        image.is_ok_and(|image| image == runner)
+            && maps_have_executable_image(&maps, &runner)
+            && maps_have_executable_image(&maps, &library),
+        "seed peer {pid} reported READY without its runner and provider mapped"
+    );
 }
 
 #[test]
@@ -20984,6 +20949,11 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
     let (fixture, _primary, _module, _pins) = loaded_seed_provider();
     let runner = fixture._dir.path().join("seed-runner");
     let library = fixture._dir.path().join("seed-provider.so");
+    // The launcher forwards "$@" through the exec, so the runner still
+    // reports READY past its own dlopen (lowercase 'ready' on stdout is
+    // the launcher's own pre-exec acknowledgement, a separate channel).
+    let ready = fixture._dir.path().join("launcher.ready");
+    let _ = std::fs::remove_file(&ready);
     let child = Command::new("sh")
         .args([
             "-c",
@@ -20992,6 +20962,7 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
         ])
         .arg(&runner)
         .arg(&library)
+        .arg(&ready)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .die_with_parent()
@@ -21006,7 +20977,7 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
     let before = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     assert_ne!(before, runner, "launcher exec'd before release");
     let mut probes = 0;
-    wait_loaded_seed_peer(&mut held.0, &runner, &library, |child| {
+    wait_loaded_seed_peer(&mut held.0, &runner, &library, &ready, |child| {
         probes += 1;
         if probes == 2 {
             // The first real probe must keep the peer held. Release only on
@@ -21023,6 +20994,32 @@ fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
     assert!(maps_have_executable_image(&maps, &library));
     let view = ProcessView::open(ProcessViewId(1), pid).unwrap();
     assert!(view.still_the_same());
+}
+
+/// A seed peer that can never report fails its wait loudly: with an
+/// unwritable report path the runner exits 4 instead of printing READY,
+/// and the wait must panic rather than hang or pass vacuously.
+#[test]
+fn seed_handshake_reports_a_peer_that_cannot_report() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let runner = fixture._dir.path().join("seed-runner");
+    let library = fixture._dir.path().join("seed-provider.so");
+    let ready = fixture._dir.path().join("no-such-dir").join("peer.ready");
+    let mut child = std::process::Command::new(&runner)
+        .arg(&library)
+        .arg(&ready)
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_loaded_seed_peer(&mut child, &runner, &library, &ready, |_| {});
+    }));
+    assert!(
+        loud.is_err(),
+        "an unreported peer must fail the wait loudly"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn loaded_seed_provider() -> (
@@ -21118,11 +21115,20 @@ int C_GetInterface(const char *name, void *version, void **out, unsigned long fl
         &runner_source,
         r#"
 #include <dlfcn.h>
+#include <stdio.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) return 3;
+    /* Cooperative readiness: with argv[2] the runner reports past-dlopen
+       itself, so the waiter never infers loader completion from stable
+       maps. Fail closed (no silent runner) when the report cannot land. */
+    if (argc == 3) {
+        FILE *ready = fopen(argv[2], "w");
+        if (ready == NULL) return 4;
+        if (fputs("READY\n", ready) < 0 || fclose(ready) != 0) return 4;
+    }
     /* The test owns this child's lifetime (the fixture guard kills it):
        never expire on wall time. A sleep here lets a slow instrumented
        runner outlive its provider and flakes live-process assertions. */
@@ -23004,23 +23010,17 @@ fn owned_tree_watch_backs_off_unproductive_members() {
 /// whole files. Only the member is watched: the test runner's own maps
 /// churn (allocator mmaps) would force re-examination and make the
 /// counts nondeterministic. The member is `sh` (three mappings on every
-/// host); killing it orphans the `sleep` grandchild, which exits on its
-/// own 30 s bound. The consult is forced on: production gates it on
-/// overlayfs / 9p mounts, which lib tests never see.
+/// host); the guard reaps the `sleep` grandchild with the shell, so no
+/// orphan pollutes system-wide enumerations. The consult is forced on:
+/// production gates it on overlayfs / 9p mounts, which lib tests never
+/// see.
 #[test]
 fn owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "sleep 600"])
-        .spawn()
-        .expect("spawn shell");
-    assert!(
-        wait_member_maps_settled(sleeper.id()),
-        "the member exec'd and settled before tracking"
-    );
+    let sleeper = ShWrappedSleep::spawn();
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23064,8 +23064,7 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes() {
         "the unchanged repeat reuses proven facts (maps-only bytes): second-run bytes={io_second}"
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// The cheap repeat performs no provider metadata reads: a hit opens
@@ -23079,10 +23078,7 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
         .arg("600")
         .spawn()
         .expect("spawn sleeper");
-    assert!(
-        wait_member_maps_settled(sleeper.id()),
-        "the member exec'd and settled before tracking"
-    );
+    wait_sleep_child_parked(sleeper.id());
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{}\n", sleeper.id()),
@@ -23163,16 +23159,14 @@ fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
         copied.is_file() && copied.len() > 100_000,
         "the preloaded copy is a real file: {copied:?}"
     );
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "LD_PRELOAD= sleep 600"])
-        .env("LD_PRELOAD", &copy)
-        .spawn()
-        .expect("spawn preloaded shell");
-    // The member may not have exec'd yet when first read (its pre-exec
-    // maps are its parent's); poll boundedly for the preloaded mapping.
+    // The guard returns only after the sleep grandchild exists, so the
+    // shell is exec'd and settled before the preload poll below.
+    let sleeper = ShWrappedSleep::spawn_preloaded(copy.as_path());
+    // The guard already settled the member; this poll asserts the
+    // preload mapping is really present (non-vacuous below).
     let mut preloaded = false;
     for _ in 0..100 {
-        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.pid()))
             .expect("read sleeper maps");
         if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
             preloaded = true;
@@ -23184,10 +23178,9 @@ fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
         preloaded,
         "the sleeper maps the preloaded copy (non-vacuous preload)"
     );
-    wait_sh_wrapped_sleep_spawned(sleeper.id());
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23217,7 +23210,7 @@ fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
         "the changed file is re-read (not served stale): second-run bytes={io_second}"
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
-    kill_sh_wrapped_sleep(&mut sleeper);
+    sleeper.close();
 }
 
 /// Manifest getter targets always take the full path: a member with a
@@ -23232,18 +23225,11 @@ fn owned_tree_watch_repeat_after_file_overwrite_rereads_the_file() {
 fn owned_tree_watch_repeat_getter_match_takes_full_path() {
     use std::os::unix::fs::MetadataExt as _;
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "sleep 600"])
-        .spawn()
-        .expect("spawn shell");
-    assert!(
-        wait_member_maps_settled(sleeper.id()),
-        "the member exec'd and settled before tracking"
-    );
-    let exe = std::fs::metadata(format!("/proc/{}/exe", sleeper.id())).expect("stat shell exe");
+    let sleeper = ShWrappedSleep::spawn();
+    let exe = std::fs::metadata(format!("/proc/{}/exe", sleeper.pid())).expect("stat shell exe");
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23292,7 +23278,7 @@ fn owned_tree_watch_repeat_getter_match_takes_full_path() {
         count_second.get()
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
-    kill_sh_wrapped_sleep(&mut sleeper);
+    sleeper.close();
 }
 
 /// Pre-open consult gate: overlayfs (any mode) or 9p read-only mounts.
@@ -23392,17 +23378,10 @@ fn preopen_key_separates_mount_namespaces() {
 #[test]
 fn owned_tree_watch_repeat_counts_its_hits() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "sleep 600"])
-        .spawn()
-        .expect("spawn shell");
-    assert!(
-        wait_member_maps_settled(sleeper.id()),
-        "the member exec'd and settled before tracking"
-    );
+    let sleeper = ShWrappedSleep::spawn();
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23428,55 +23407,154 @@ fn owned_tree_watch_repeat_counts_its_hits() {
         "the unchanged repeat hits all three mappings"
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
-/// Poll boundedly until a spawned member's maps stabilize (two identical
-/// consecutive reads): a scan that catches the member pre-exec would read
-/// its parent's mappings instead. Gated on the exec first: pre-exec maps
-/// are stable too (they are this test binary's), so stability alone is
-/// not readiness. Returns false on timeout (the caller fails loudly,
-/// never vacuously).
-fn wait_member_maps_settled(pid: u32) -> bool {
-    let this_image = std::env::current_exe().unwrap();
-    let mut previous = String::new();
-    for _ in 0..100 {
-        let execed =
-            std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image != this_image);
-        match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
-            Ok(maps) if execed && maps == previous && !maps.is_empty() => return true,
-            Ok(maps) => previous = maps,
-            Err(_) => {}
+/// Pids listed in a shell member's `children` file: the live sleep
+/// grandchild. Fails loudly when the list is unreadable or unparsable —
+/// an unknown grandchild set must never silently pass as empty.
+/// (Pid reuse cannot intervene: the grandchild is a `sleep 600` that
+/// cannot exit on its own in the microseconds between this read and the
+/// SIGKILL below; ESRCH on the kill itself is ignored.)
+fn sh_wrapped_sleep_grandchildren(pid: u32) -> Result<Vec<i32>, String> {
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .map_err(|error| format!("sh member {pid} children unreadable: {error}"))?;
+    children
+        .split_whitespace()
+        .map(|text| {
+            text.parse::<i32>()
+                .map_err(|_| format!("sh member {pid} has an unparsable child {text:?}"))
+        })
+        .collect::<Result<Vec<i32>, String>>()
+        .and_then(|grandchildren| {
+            if grandchildren.iter().all(|pid| *pid > 0) {
+                Ok(grandchildren)
+            } else {
+                Err(format!(
+                    "sh member {pid} has a non-pid child {grandchildren:?}"
+                ))
+            }
+        })
+}
+
+/// SIGKILL every pid in `grandchildren`, ignoring delivery errors: the
+/// `close` path verifies death afterwards, the `Drop` path is already
+/// best-effort.
+fn kill_sh_sleep_grandchildren(grandchildren: &[i32]) {
+    for pid in grandchildren {
+        // SAFETY: SIGKILL to a just-listed own-descendant pid.
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    false
 }
 
-/// Reap an `sh -c` wrapped sleeper and its sleep grandchild: killing
-/// the shell orphans the grandchild to init, where a 600 s sleep would
-/// linger and pollute system-wide enumerations for other tests.
-fn kill_sh_wrapped_sleep(sleeper: &mut std::process::Child) {
-    let grandchildren = std::fs::read_to_string(format!(
-        "/proc/{}/task/{}/children",
-        sleeper.id(),
-        sleeper.id()
-    ))
-    .unwrap_or_default();
-    let _ = sleeper.kill();
-    for pid in grandchildren.split_whitespace() {
-        if let Ok(pid) = pid.parse::<i32>() {
-            // SAFETY: best-effort SIGKILL, return ignored like `let _`.
-            // The grandchild is a `sleep 600` that cannot exit on its own
-            // in the microseconds between the children read and this
-            // kill, so pid reuse cannot intervene; ESRCH is ignored.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
+/// An `sh -c "sleep 600"` fixture member that reaps its whole tree.
+/// Spawning returns only after the sleep grandchild exists (so the shell
+/// is exec'd and settled, and pre-scan maps reads are stable); `close`
+/// SIGKILLs shell and grandchild and verifies both gone, loudly; `Drop`
+/// repeats that best-effort so a mid-test panic cannot strand a 600 s
+/// orphan visible to system-wide enumerations.
+struct ShWrappedSleep {
+    pid: u32,
+    child: Option<std::process::Child>,
+}
+
+impl ShWrappedSleep {
+    fn spawn() -> Self {
+        Self::spawn_inner(None)
+    }
+
+    fn spawn_preloaded(provider: &std::path::Path) -> Self {
+        Self::spawn_inner(Some(provider))
+    }
+
+    fn spawn_inner(preload: Option<&std::path::Path>) -> Self {
+        let mut command = std::process::Command::new("sh");
+        match preload {
+            None => {
+                command.args(["-c", "sleep 600"]);
+            }
+            Some(provider) => {
+                command
+                    .args(["-c", "LD_PRELOAD= sleep 600"])
+                    .env("LD_PRELOAD", provider);
             }
         }
+        let child = command.die_with_parent().spawn().expect("spawn shell");
+        let pid = child.id();
+        wait_sh_wrapped_sleep_spawned(pid);
+        Self {
+            pid,
+            child: Some(child),
+        }
     }
-    let _ = sleeper.wait();
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn close(mut self) {
+        let mut child = self.child.take().expect("ShWrappedSleep closed twice");
+        let grandchildren = sh_wrapped_sleep_grandchildren(self.pid)
+            .expect("ShWrappedSleep close lists its grandchild");
+        child.kill().expect("kill wrapped shell");
+        kill_sh_sleep_grandchildren(&grandchildren);
+        child.wait().expect("reap wrapped shell");
+        // SIGKILL lands asynchronously and init reaps on its own
+        // schedule: poll for disappearance, then fail loudly on a
+        // survivor (never silently orphan it).
+        for pid in grandchildren {
+            let mut gone = false;
+            for _ in 0..500 {
+                if crate::process::process_proven_exited(pid as u32) {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                gone,
+                "ShWrappedSleep close orphaned its sleep grandchild {pid}"
+            );
+        }
+    }
+}
+
+impl Drop for ShWrappedSleep {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            match sh_wrapped_sleep_grandchildren(self.pid) {
+                Ok(grandchildren) => kill_sh_sleep_grandchildren(&grandchildren),
+                Err(reason) => eprintln!("ShWrappedSleep drop cannot list grandchildren: {reason}"),
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The grandchild lister fails closed: a childless sleeper lists empty
+/// (no phantom kills), an unreadable list is an error (never silent
+/// empty), and the guard's loud `close` pins its exact statements in
+/// the order needle below.
+#[test]
+fn sh_wrapped_sleep_grandchildren_list_fails_closed() {
+    let mut plain = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn childless sleeper");
+    let listed = sh_wrapped_sleep_grandchildren(plain.id());
+    assert_eq!(listed, Ok(Vec::new()), "a childless sleeper lists empty");
+    plain.kill().expect("kill childless sleeper");
+    plain.wait().expect("reap childless sleeper");
+    // `u32::MAX` exceeds every pid_max: deterministically unreadable,
+    // with no pid-reuse window at all.
+    let missing = sh_wrapped_sleep_grandchildren(u32::MAX);
+    assert!(
+        missing.is_err(),
+        "an unreadable children list must fail closed, got {missing:?}"
+    );
 }
 
 /// Readiness for `sh -c` wrapped sleepers past a preload-presence poll:
@@ -23526,14 +23604,12 @@ fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
     let provider = dir.path().join("hook-provider.so");
     build_fixture_so_with_bootstrap(&provider, "HOOK-0001");
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "LD_PRELOAD= sleep 600"])
-        .env("LD_PRELOAD", &provider)
-        .spawn()
-        .expect("spawn preloaded shell");
+    // The guard returns only after the sleep grandchild exists, so the
+    // shell is exec'd and settled before the preload poll below.
+    let sleeper = ShWrappedSleep::spawn_preloaded(provider.as_path());
     let mut preloaded = false;
     for _ in 0..100 {
-        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.pid()))
             .expect("read sleeper maps");
         if maps.lines().any(|line| line.contains("hook-provider.so")) {
             preloaded = true;
@@ -23545,10 +23621,9 @@ fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
         preloaded,
         "the sleeper maps the hook-bearing provider (non-vacuous preload)"
     );
-    wait_sh_wrapped_sleep_spawned(sleeper.id());
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23577,7 +23652,7 @@ fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
     // Seed a hook-bearing hit for the provider's key: the maps identity
     // from its mapping line plus the target pin, under the current
     // namespace (the member shares it).
-    let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.pid()))
         .expect("read member maps for provider key");
     let mut provider_key = None;
     for line in maps.lines() {
@@ -23654,7 +23729,7 @@ fn owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves() {
         count_first.get(),
         count_second.get()
     );
-    kill_sh_wrapped_sleep(&mut sleeper);
+    sleeper.close();
 }
 
 /// Foreign mount namespaces never consult even when forced: the
@@ -23668,10 +23743,9 @@ fn owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult() {
         .args(["-U", "-m", "--propagation", "unchanged", "sleep", "600"])
         .spawn()
         .expect("spawn unshared sleeper (needs unshare(1) and user namespaces)");
-    assert!(
-        wait_member_maps_settled(sleeper.id()),
-        "the member exec'd and settled before tracking"
-    );
+    // `unshare` without `--fork` execs in place: the member pid ends up
+    // a parked `sleep`, so the parked proof covers it.
+    wait_sleep_child_parked(sleeper.id());
     let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("read observer mount ns");
     let member_ns =
         std::fs::read_link(format!("/proc/{}/ns/mnt", sleeper.id())).expect("read member mount ns");
@@ -23748,14 +23822,12 @@ fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
     .expect("a system loader to rename with");
     let copy = dir.path().join("preload-libc.so.6");
     std::fs::copy(&libc, &copy).expect("copy libc for preloading");
-    let mut sleeper = std::process::Command::new("sh")
-        .args(["-c", "LD_PRELOAD= sleep 600"])
-        .env("LD_PRELOAD", &copy)
-        .spawn()
-        .expect("spawn preloaded shell");
+    // The guard returns only after the sleep grandchild exists, so the
+    // shell is exec'd and settled before the preload poll below.
+    let sleeper = ShWrappedSleep::spawn_preloaded(copy.as_path());
     let mut preloaded = false;
     for _ in 0..100 {
-        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.id()))
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleeper.pid()))
             .expect("read sleeper maps");
         if maps.lines().any(|line| line.contains("preload-libc.so.6")) {
             preloaded = true;
@@ -23767,10 +23839,9 @@ fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
         preloaded,
         "the sleeper maps the preloaded copy (non-vacuous preload)"
     );
-    wait_sh_wrapped_sleep_spawned(sleeper.id());
     std::fs::write(
         dir.path().join("cgroup.procs"),
-        format!("{}\n", sleeper.id()),
+        format!("{}\n", sleeper.pid()),
     )
     .expect("write cgroup.procs");
     let mut engine = Engine::empty();
@@ -23805,7 +23876,7 @@ fn owned_tree_watch_repeat_after_file_replace_by_rename_misses() {
         2 * hits_after_second - 1,
         "the renamed group misses while the rest hit: second={hits_after_second} third={hits_after_third}"
     );
-    kill_sh_wrapped_sleep(&mut sleeper);
+    sleeper.close();
 }
 
 /// Rotation reaches every member, not just the extremes: with three
@@ -33892,7 +33963,7 @@ impl Drop for HeldChild {
 fn spawn_held_sleep_child() -> HeldChild {
     let program = std::ffi::CString::new("sleep").unwrap();
     let arg0 = std::ffi::CString::new("sleep").unwrap();
-    let arg1 = std::ffi::CString::new("30").unwrap();
+    let arg1 = std::ffi::CString::new("600").unwrap();
     let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
     let mut ready = [0 as libc::c_int; 2];
     let mut release = [0 as libc::c_int; 2];
@@ -34009,7 +34080,7 @@ fn spawn_held_sleep_child() -> HeldChild {
 
 /// A forked-but-never-exec'd child that inherits every fd (astra A4):
 /// models a concurrent test's `SwapChild` outliving the release. Killed
-/// and reaped on drop; exits on its own after 60 s if drop never runs.
+/// and reaped on drop; exits on its own after 600 s if drop never runs.
 struct FdInheritor {
     pid: libc::pid_t,
 }
@@ -34059,7 +34130,7 @@ impl FdInheritor {
                 }
                 libc::close(ready[1]);
                 let delay = libc::timespec {
-                    tv_sec: 60,
+                    tv_sec: 600,
                     tv_nsec: 0,
                 };
                 libc::nanosleep(&delay, std::ptr::null_mut());
@@ -34110,8 +34181,21 @@ impl Drop for FdInheritor {
     }
 }
 
+/// Prove a reaped fd-inheriting child's death cause from its wait
+/// status: disappearance alone is vacuous (a 600 s sleep that expired
+/// naturally while the test thread stalled also disappears), so only a
+/// parent-death SIGKILL passes. Panics with a named reason otherwise.
+fn assert_fd_inheritor_killed_by_parent_death(status: i32) {
+    // The wait-status macros are safe to call.
+    let by_signal = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+    assert!(
+        by_signal,
+        "fd-inheritor death cause vacuous: the child was not SIGKILLed by its parent-death arm (status {status})"
+    );
+}
+
 /// A forked fd-inheriting child must die with its spawner: without the
-/// parent-death arm it sleeps its whole 60 s once its spawner is gone.
+/// parent-death arm it sleeps its whole 600 s once its spawner is gone.
 /// A helper thread plays the spawner; only the arm can kill the
 /// forgotten child.
 #[test]
@@ -34127,12 +34211,57 @@ fn fd_inheritor_dies_with_spawning_thread() {
     })
     .join()
     .expect("the spawner thread joins");
-    let survivors =
-        crate::fixture_guard::poll_descendants_gone(&recorded, std::time::Duration::from_secs(2));
+    // Reap the forgotten child here instead of polling for
+    // disappearance: the reap status proves HOW it died, while the
+    // shared poll reaps and discards that evidence.
+    let pid = recorded[0].0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut status = 0;
+    let mut reaped = false;
+    while !reaped && std::time::Instant::now() < deadline {
+        // SAFETY: reaps only our own forgotten child; `WNOHANG` never
+        // blocks.
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if waited == pid as libc::pid_t {
+            reaped = true;
+        } else if waited < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+        {
+            panic!(
+                "fd-inheritor reap failed: waitpid({pid}) returned {waited} ({})",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     crate::fixture_guard::cleanup_descendants(&recorded);
     assert!(
-        survivors.is_empty(),
+        reaped,
         "the fd-inheriting child {recorded:?} outlived its spawner"
+    );
+    assert_fd_inheritor_killed_by_parent_death(status);
+}
+
+/// The death-cause proof fails loudly on a natural exit: a child that
+/// `_exit(0)`s on its own must trip the vacuous-cause panic, never pass.
+#[test]
+fn fd_inheritor_cause_proof_rejects_a_natural_exit() {
+    // SAFETY: fork in a multithreaded binary; the child only exits.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "probe fork failed");
+    if pid == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    // Reap the probe to capture a genuine natural-exit status, then the
+    // proof must reject it loudly.
+    let mut status = 0;
+    // SAFETY: blocking reap of our own probe child.
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(waited, pid, "the probe child reaps");
+    let loud = std::panic::catch_unwind(|| assert_fd_inheritor_killed_by_parent_death(status));
+    assert!(
+        loud.is_err(),
+        "a naturally-exited child must fail the death-cause proof"
     );
 }
 
@@ -98774,10 +98903,12 @@ fn needle_stmt_line(body: &str, stmt: &str) -> Option<usize> {
 /// source order, matched as whole statements. Reverting any site to an
 /// exe-link-only (or no) wait fails here deterministically; the live-child
 /// race itself is far too rare to kill reliably in-suite. Covers the 6
-/// `wait_sleep_exec_row` sites, the 5 bare settled stops, the shared
+/// `wait_sleep_exec_row` sites, the 6 bare settled stops, the shared
 /// `stopped_member_with_row` helper, the 9 parked pre-discover sites, the
-/// static-sleeper spawner, and the alien census site; plus global bans on
-/// exe-link-only exe polls.
+/// 33 spawn-anchored parked groups, the 19 quantum pins, the 6 `sh`
+/// tree-kill sites, the seed READY handshake, the 12 fixture-lifetime
+/// bans, the teardown freshness clause, the static-sleeper spawner, and
+/// the alien census site; plus global bans on exe-link-only exe polls.
 #[test]
 fn stop_then_read_sites_settle_before_sigstop() {
     let source = include_str!("engine_tests.rs");
@@ -98803,22 +98934,47 @@ fn stop_then_read_sites_settle_before_sigstop() {
         assert!(settle < stop, "{name}: settle must precede the stop");
     }
     let bare_sites = [
-        "member_stop_resume_keeps_the_row_without_signal_authority",
-        "member_stop_bound_never_signals_a_process_born_after_the_stop",
-        "member_stop_unreadable_exit_state_never_abandons_a_held_member",
-        "member_stop_unknown_stop_instant_is_doubt",
-        "member_stop_member_stays_stopped_without_a_service_pass",
+        (
+            "member_stop_resume_keeps_the_row_without_signal_authority",
+            "wait_sleep_child_settled(pid);",
+            "stop_member_for_test(pid);",
+        ),
+        (
+            "member_stop_bound_never_signals_a_process_born_after_the_stop",
+            "wait_sleep_child_settled(pid);",
+            "stop_member_for_test(pid);",
+        ),
+        (
+            "member_stop_unreadable_exit_state_never_abandons_a_held_member",
+            "wait_sleep_child_settled(pid);",
+            "stop_member_for_test(pid);",
+        ),
+        (
+            "member_stop_unknown_stop_instant_is_doubt",
+            "wait_sleep_child_settled(pid);",
+            "stop_member_for_test(pid);",
+        ),
+        (
+            "member_stop_member_stays_stopped_without_a_service_pass",
+            "wait_sleep_child_settled(pid);",
+            "stop_member_for_test(pid);",
+        ),
+        (
+            "member_stop_release_resumes_held_and_untaken_members",
+            "wait_sleep_child_settled(other_pid);",
+            "stop_member_for_test(other_pid);",
+        ),
     ];
     assert_eq!(
         bare_sites.len(),
-        5,
-        "the class table names 5 bare settled stops"
+        6,
+        "the class table names 6 bare settled stops"
     );
-    for name in bare_sites {
+    for (name, settle_stmt, stop_stmt) in bare_sites {
         let body = needle_fn_body(source, name);
-        let settle = needle_stmt_line(body, "wait_sleep_child_settled(pid);")
+        let settle = needle_stmt_line(body, settle_stmt)
             .unwrap_or_else(|| panic!("{name}: no settle statement"));
-        let stop = needle_stmt_line(body, "stop_member_for_test(pid);")
+        let stop = needle_stmt_line(body, stop_stmt)
             .unwrap_or_else(|| panic!("{name}: no stop statement"));
         assert!(settle < stop, "{name}: settle must precede the stop");
     }
@@ -98881,207 +99037,375 @@ fn stop_then_read_sites_settle_before_sigstop() {
             .unwrap_or_else(|| panic!("{name}: no discover call"));
         assert!(settle < discover, "{name}: park must precede the scan");
     }
-    // Census/shape consumers parked in fix4: (test, parked statements,
-    // scan anchor). Each parked line must precede the first scan call.
-    let parked_groups: [(&str, &[&str], &str); 32] = [
+    // Census/shape consumers: (test, (parked statement, spawn marker)
+    // pairs, scan anchor). Each park must sit strictly between its own
+    // spawn and the first scan that can consume that child: scans before
+    // the spawn cannot, so anchoring on the park alone would accept a
+    // park moved below the first consuming scan.
+    type ParkedGroup = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static str,
+    );
+    let parked_groups: [ParkedGroup; 33] = [
         (
             "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
-            &["wait_sleep_child_parked(*pid);"],
+            &[(
+                "wait_sleep_child_parked(*pid);",
+                "let mut children = ChildrenGuard(",
+            )],
             "Engine::discover(",
         ),
         (
             "owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest",
-            &["wait_sleep_child_parked(sleeper.id());"],
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_skips_retained_prunes_exited_and_aged_members",
-            &["wait_sleep_child_parked(sleeper.id());"],
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_backs_off_unproductive_members",
-            &["wait_sleep_child_parked(sleeper.id());"],
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_rotation_reaches_the_middle_member",
             &[
-                "wait_sleep_child_parked(first_sleeper.id());",
-                "wait_sleep_child_parked(second_sleeper.id());",
+                (
+                    "wait_sleep_child_parked(first_sleeper.id());",
+                    "let mut first_sleeper = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(second_sleeper.id());",
+                    "let mut second_sleeper = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_telemetry_scans_keep_the_loader_plan_cache",
-            &["wait_sleep_child_parked(sleeper.id());"],
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_spent_budget_scans_exactly_one_member_per_run",
             &[
-                "wait_sleep_child_parked(first_sleeper.id());",
-                "wait_sleep_child_parked(second_sleeper.id());",
+                (
+                    "wait_sleep_child_parked(first_sleeper.id());",
+                    "let mut first_sleeper = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(second_sleeper.id());",
+                    "let mut second_sleeper = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "owned_tree_watch(",
         ),
         (
             "owned_tree_watch_prunes_members_that_gain_retained_views",
-            &["wait_sleep_child_parked(sleeper.id());"],
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
             "dropped_apply_keeps_earlier_data_and_names_gap",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "dropped_first_candidate_keeps_earlier_data",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "dropped_final_candidate_keeps_earlier_data",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "healthy_twin_has_no_dropped_pass_gap",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "real_merge_ordinal_mismatch_drops_pass_with_gap",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "repeated_drops_publish_exactly_one_fixed_gap",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "drops_with_different_errors_share_the_one_fixed_gap",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "idle_tick_resets_the_consecutive_drop_chain",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "healthy_tick_resets_the_consecutive_drop_chain",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted",
             &[
-                "wait_sleep_child_parked(kept.id());",
-                "wait_sleep_child_parked(poison.id());",
-                "wait_sleep_child_parked(healthy.id());",
+                (
+                    "wait_sleep_child_parked(kept.id());",
+                    "let mut kept = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(poison.id());",
+                    "let mut poison = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(healthy.id());",
+                    "let mut healthy = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "apply_ordinary_batch(",
         ),
         (
             "held_back_process_is_forgotten_when_it_exits",
             &[
-                "wait_sleep_child_parked(kept.id());",
-                "wait_sleep_child_parked(poison.id());",
+                (
+                    "wait_sleep_child_parked(kept.id());",
+                    "let mut kept = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(poison.id());",
+                    "let mut poison = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "apply_ordinary_batch(",
         ),
         (
             "third_consecutive_drop_completes_serviced_requests",
-            &["wait_sleep_child_parked(child.id());"],
+            &[(
+                "wait_sleep_child_parked(child.id());",
+                "let mut child = std::process::Command::new(\"sleep\")",
+            )],
             "apply_ordinary_batch(",
         ),
         (
             "persistently_poisoned_tick_stops_blocking_newcomers",
             &[
-                "wait_sleep_child_parked(poison.id());",
-                "wait_sleep_child_parked(newcomer.id());",
+                (
+                    "wait_sleep_child_parked(poison.id());",
+                    "let mut poison = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(newcomer.id());",
+                    "let mut newcomer = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "apply_ordinary_batch(",
         ),
         (
             "capacity_with_evictable_view_admits_waiter_without_capacity_gap",
             &[
-                "wait_sleep_child_parked(a.id());",
-                "wait_sleep_child_parked(b.id());",
-                "wait_sleep_child_parked(c.id());",
+                (
+                    "wait_sleep_child_parked(a.id());",
+                    "let mut a = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(b.id());",
+                    "let mut b = std::process::Command::new(\"sleep\")",
+                ),
+                (
+                    "wait_sleep_child_parked(c.id());",
+                    "let mut c = std::process::Command::new(\"sleep\")",
+                ),
             ],
             "refresh_inventory_once(",
         ),
         (
             "closed_tick_with_provider_free_newcomer_marks_no_additions_blocked",
-            &["wait_sleep_child_parked(sleep.pid());"],
+            &[(
+                "wait_sleep_child_parked(sleep.pid());",
+                "let sleep = SystemScopeChildGuard::new(",
+            )],
             "u07_tick(",
         ),
         (
             "stopped_tick_with_provider_newcomer_marks_unobserved_calls",
-            &["wait_sleep_child_parked(anchor.pid());"],
+            &[(
+                "wait_sleep_child_parked(anchor.pid());",
+                "let anchor = SystemScopeChildGuard::new(",
+            )],
             "u07_tick(",
         ),
         (
             "stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls",
-            &["wait_sleep_child_parked(anchor.pid());"],
+            &[(
+                "wait_sleep_child_parked(anchor.pid());",
+                "let anchor = SystemScopeChildGuard::new(",
+            )],
             "u07_tick(",
         ),
         (
             "stopped_tick_with_provider_free_newcomer_marks_no_unobserved_calls",
-            &["wait_sleep_child_parked(newcomer.pid());"],
+            &[(
+                "wait_sleep_child_parked(newcomer.pid());",
+                "let newcomer = SystemScopeChildGuard::new(",
+            )],
             "u07_name_members(",
         ),
         (
             "stopped_tick_without_newcomer_marks_no_unobserved_calls",
-            &["wait_sleep_child_parked(anchor.pid());"],
+            &[(
+                "wait_sleep_child_parked(anchor.pid());",
+                "let anchor = SystemScopeChildGuard::new(",
+            )],
             "u07_tick(",
         ),
         (
             "probationary_probe_completes_provider_free_newcomer_at_capacity",
-            &["wait_sleep_child_parked(head_pid);"],
+            &[(
+                "wait_sleep_child_parked(head_pid);",
+                "let mut head = std::process::Command::new(\"sleep\")",
+            )],
             "refresh_inventory_once(",
         ),
         (
             "probationary_probe_refuses_without_a_complete_scan",
-            &["wait_sleep_child_parked(head_pid);"],
+            &[(
+                "wait_sleep_child_parked(head_pid);",
+                "let head = SystemScopeChildGuard::new(",
+            )],
             "refresh_inventory_once(",
         ),
         (
-            "owned_tree_watch_repeat_after_file_overwrite_rereads_the_file",
-            &["wait_sh_wrapped_sleep_spawned(sleeper.id());"],
+            "owned_tree_watch_keeps_cheap_members_at_the_watch_cadence",
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
+            "watch_scans_over(",
+        ),
+        (
+            "owned_tree_watch_backs_off_expensive_members_over_the_same_window",
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
+            "watch_scans_over(",
+        ),
+        (
+            "owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata",
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"sleep\")",
+            )],
             "owned_tree_watch(",
         ),
         (
-            "owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves",
-            &["wait_sh_wrapped_sleep_spawned(sleeper.id());"],
-            "owned_tree_watch(",
-        ),
-        (
-            "owned_tree_watch_repeat_after_file_replace_by_rename_misses",
-            &["wait_sh_wrapped_sleep_spawned(sleeper.id());"],
+            "owned_tree_watch_repeat_in_foreign_mount_ns_skips_consult",
+            &[(
+                "wait_sleep_child_parked(sleeper.id());",
+                "let mut sleeper = std::process::Command::new(\"unshare\")",
+            )],
             "owned_tree_watch(",
         ),
     ];
-    for (name, stmts, anchor) in parked_groups {
+    for (name, pairs, anchor) in parked_groups {
         let body = needle_fn_body(source, name);
-        for stmt in stmts {
+        for (stmt, spawn) in pairs {
+            // The spawn marker must be unambiguous: a marker matching
+            // twice (or never) fails the needle instead of silently
+            // anchoring the wrong child.
+            let spawned: Vec<usize> = body
+                .lines()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    line.split_once("//")
+                        .map_or(line, |(code, _)| code)
+                        .contains(spawn)
+                        .then_some(idx)
+                })
+                .collect();
+            assert_eq!(
+                spawned.len(),
+                1,
+                "{name}: spawn marker {spawn:?} must occur exactly once"
+            );
+            let park_lines = body
+                .lines()
+                .filter(|line| {
+                    line.split_once("//").map_or(*line, |(code, _)| code).trim() == *stmt
+                })
+                .count();
+            assert_eq!(
+                park_lines, 1,
+                "{name}: park statement {stmt:?} must occur exactly once"
+            );
             let settle =
                 needle_stmt_line(body, stmt).unwrap_or_else(|| panic!("{name}: no {stmt}"));
+            // Anchored on the spawn, not on the park: a scan before the
+            // spawn cannot consume this child, and moving the park below
+            // the first consuming scan fails here.
             let scan = body
                 .lines()
                 .enumerate()
                 .position(|(idx, line)| {
-                    idx > settle
+                    idx > spawned[0]
                         && line
                             .split_once("//")
                             .map_or(line, |(code, _)| code)
                             .contains(anchor)
                 })
-                .unwrap_or_else(|| panic!("{name}: no {anchor} call after {stmt}"));
-            assert!(settle < scan, "{name}: park must precede the scan");
+                .unwrap_or_else(|| panic!("{name}: no {anchor} call after the spawn"));
+            assert!(spawned[0] < settle, "{name}: spawn must precede the park");
+            assert!(settle < scan, "{name}: park must precede the first scan");
         }
     }
     // Spawner helpers park before return; the maps-stability helper is
@@ -99183,61 +99507,129 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);",
         )
         .unwrap_or_else(|| panic!("{name}: no tick-quantum pin"));
+        // Anchored on the test's first tick, not on a later one:
+        // moving the pin below the first controlled tick fails here.
         let tick = body
             .lines()
-            .enumerate()
-            .position(|(idx, line)| {
-                idx > pin
-                    && line
-                        .split_once("//")
-                        .map_or(line, |(code, _)| code)
-                        .contains(anchor)
+            .position(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .contains(anchor)
             })
-            .unwrap_or_else(|| panic!("{name}: no {anchor} call after the pin"));
-        assert!(pin < tick, "{name}: pin must precede the ticks");
+            .unwrap_or_else(|| panic!("{name}: no {anchor} call"));
+        assert!(pin < tick, "{name}: pin must precede the first tick");
     }
     // `sh -c` wrapped members are reaped with their sleep grandchild: a
     // bare shell kill orphans a 600 s sleep that pollutes system-wide
-    // enumerations. Teardown calls have no order anchor; presence of the
-    // exact statement plus absence of the bare kill pair pins them.
+    // enumerations. The guard's constructor waits for the grandchild, so
+    // construction must precede the first scan; teardown pins the exact
+    // loud `close` plus absence of the bare kill pair.
     for name in [
         "owned_tree_watch_repeat_after_file_overwrite_rereads_the_file",
         "owned_tree_watch_repeat_with_hook_bearing_hit_still_reproves",
         "owned_tree_watch_repeat_after_file_replace_by_rename_misses",
         "owned_tree_watch_repeat_getter_match_takes_full_path",
+        "owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes",
+        "owned_tree_watch_repeat_counts_its_hits",
     ] {
         let body = needle_fn_body(source, name);
         assert!(
-            needle_stmt_line(body, "kill_sh_wrapped_sleep(&mut sleeper);").is_some(),
+            needle_stmt_line(body, "sleeper.close();").is_some(),
             "{name}: no tree-kill statement"
         );
         assert!(
             needle_stmt_line(body, "sleeper.kill().expect(\"kill sleeper\");").is_none(),
             "{name}: bare shell kill is back"
         );
+        let built = body
+            .lines()
+            .position(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .contains("ShWrappedSleep::spawn")
+            })
+            .unwrap_or_else(|| panic!("{name}: no guard construction"));
+        let scan = body
+            .lines()
+            .position(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .contains("owned_tree_watch(")
+            })
+            .unwrap_or_else(|| panic!("{name}: no scan call"));
+        assert!(
+            built < scan,
+            "{name}: guard construction must precede the first scan"
+        );
+    }
+    // The guard's loud path stays loud: softening `close` to `let _`
+    // would still reap via `Drop`, so only these whole-statement pins
+    // kill that mutant.
+    for stmt in [
+        ".expect(\"ShWrappedSleep close lists its grandchild\");",
+        "child.kill().expect(\"kill wrapped shell\");",
+        "\"ShWrappedSleep close orphaned its sleep grandchild {pid}\"",
+    ] {
+        assert!(
+            needle_stmt_line(source, stmt).is_some(),
+            "close lost its loud statement {stmt:?}"
+        );
     }
     // The peer wait proves off-CPU after stability: a descheduled
     // mid-loader peer shows identical partial snapshots but reads `0`.
     // The window-hit helper rejects stale hits: the kill starts the
     // ~160 ms teardown window, so a late hit is near its end.
+    // The window-hit acceptance pins the whole `&& fresh` condition:
+    // deleting the freshness clause fails here.
     let window = needle_fn_body(source, "teardown_spawn_until_window_hit");
     assert!(
-        window.contains("killed_at"),
-        "window-hit helper: no freshness check"
-    );
-    let peer = needle_fn_body(source, "wait_loaded_seed_peer");
-    assert!(
-        peer.contains("wchan_means_blocked"),
-        "peer wait: no off-CPU gate"
-    );
-    let stability = needle_fn_body(source, "wait_member_maps_settled");
-    assert!(
         needle_stmt_line(
-            stability,
-            "let this_image = std::env::current_exe().unwrap();"
+            window,
+            "if pidfd_unready && kill_succeeds && census_unproven && still_window && fresh {"
         )
         .is_some(),
-        "stability helper: no exec gate"
+        "window-hit helper: no freshness clause"
+    );
+    // The seed handshake pins both joints: the waiter's exact READY
+    // report check and the runner template's exact report print.
+    // Deleting either fails here (the behavioral tests would only time
+    // out after 10 s).
+    let peer = needle_fn_body(source, "wait_loaded_seed_peer");
+    assert!(
+        needle_stmt_line(
+            peer,
+            "if std::fs::read_to_string(ready).is_ok_and(|report| report == \"READY\\n\") {"
+        )
+        .is_some(),
+        "peer wait: no READY report check"
+    );
+    let template = needle_fn_body(source, "loaded_seed_provider_with_seed_table");
+    assert!(
+        template.contains("fputs(\"READY\\n\", ready)"),
+        "seed runner template: no READY report"
+    );
+    // The backoff-restart member proves settled-shell before its scans:
+    // the shell prints READY past its own startup, and the test asserts
+    // the exact bytes before the first scan driver.
+    let restart = needle_fn_body(source, "owned_tree_watch_exec_restarts_the_backoff_streak");
+    assert!(
+        needle_stmt_line(
+            restart,
+            "assert_eq!(&ready, b\"READY\", \"the member printed READY past startup\");"
+        )
+        .is_some(),
+        "exec-restart member: no READY proof"
+    );
+    // The fd-inheritor test proves the death cause, not just
+    // disappearance: a natural sleep expiry must fail it loudly.
+    let inheritor = needle_fn_body(source, "fd_inheritor_dies_with_spawning_thread");
+    assert!(
+        needle_stmt_line(
+            inheritor,
+            "assert_fd_inheritor_killed_by_parent_death(status);"
+        )
+        .is_some(),
+        "fd-inheritor test: no death-cause proof"
     );
     // The static-sleeper spawner parks every child it returns.
     let opus = needle_fn_body(source, "opus_spawn_static_sleeps");
@@ -99271,7 +99663,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
     // the only ends_with poll left is the post-settle assertion in the
     // loader-name twin; the only target-not-self loop left is the
     // additionally guarded e06 spawner; the image-gated spelling appears
-    // only in the parked helper and the stability gate.
+    // only in the settled helper.
     let image_gated = ["image", "!=", "this_image"].join(" ");
     assert!(
         !source.contains(&banned_basename),
@@ -99289,8 +99681,8 @@ fn stop_then_read_sites_settle_before_sigstop() {
     );
     assert_eq!(
         source.matches(&image_gated).count(),
-        2,
-        "an ungated exe comparison is back (want only the parked helper and the stability gate)"
+        1,
+        "an ungated exe comparison is back (want only the settled helper)"
     );
     // Fixture lifetimes: no short sleep may reappear. A 30 s child can
     // genuinely exit mid-test when its thread stalls under parallel load,
@@ -99306,6 +99698,10 @@ fn stop_then_read_sites_settle_before_sigstop() {
         (&["\"sleep\", \"", "30\""][..], "short list sleep"),
         (&["\"sleep\", \"", "60\""][..], "short list sleep"),
         (&["[\"", "60\"]"][..], "short fallback sleep"),
+        (&["CString::new(\"", "30\")"][..], "short raw-exec sleep"),
+        (&["CString::new(\"", "60\")"][..], "short raw-exec sleep"),
+        (&["tv_sec: ", "30,"][..], "short raw nanosleep"),
+        (&["tv_sec: ", "60,"][..], "short raw nanosleep"),
     ] {
         let banned = parts.concat();
         assert!(!source.contains(&banned), "{what} is back: {banned:?}");
@@ -102835,7 +103231,7 @@ fn member_stop_release_resumes_held_and_untaken_members() {
         .spawn()
         .unwrap();
     let other_pid = other.id();
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    wait_sleep_child_settled(other_pid);
     stop_member_for_test(other_pid);
     let mut io = ScriptedMemberStops::default();
     io.rows.insert(pid, member_stop_row(pid, &library, key));
@@ -102927,7 +103323,7 @@ fn owned_tree_watch_keeps_cheap_members_at_the_watch_cadence() {
         .spawn()
         .expect("spawn sleeper");
     let member = sleeper.id();
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    wait_sleep_child_parked(sleeper.id());
     let (_dir, mut engine) = watch_engine_with_member(member);
     let scans = watch_scans_over(&mut engine, member, 30);
     assert!(
@@ -102958,7 +103354,7 @@ fn owned_tree_watch_backs_off_expensive_members_over_the_same_window() {
         .spawn()
         .expect("spawn sleeper");
     let member = sleeper.id();
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    wait_sleep_child_parked(sleeper.id());
     let (_dir, mut engine) = watch_engine_with_member(member);
     engine.owned_watch_cheap_scan_bytes = 0;
     let scans = watch_scans_over(&mut engine, member, 30);
@@ -102975,15 +103371,51 @@ fn owned_tree_watch_backs_off_expensive_members_over_the_same_window() {
 /// scans at once instead of after it.
 #[test]
 fn owned_tree_watch_exec_restarts_the_backoff_streak() {
+    use std::io::Read as _;
     use std::io::Write as _;
+    use std::os::unix::io::AsRawFd as _;
     let mut member = std::process::Command::new("sh")
-        .args(["-c", "read line; exec sleep 600"])
+        .args(["-c", "printf READY; read line; exec sleep 600"])
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .die_with_parent()
         .spawn()
         .expect("spawn member");
     let pid = member.id();
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // The shell prints READY past its own startup, before blocking in
+    // `read`: observing it proves the backoff scans below see the
+    // settled shell, not a mid-startup shape.
+    let mut stdout = member.stdout.take().expect("member stdout piped");
+    // SAFETY: the freshly spawned member's stdout pipe is ours.
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "member stdout fcntl get failed");
+    assert!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+        "member stdout nonblocking failed"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ready = [0u8; 5];
+    let mut got = 0;
+    while got < ready.len() {
+        match stdout.read(&mut ready[got..]) {
+            Ok(0) => panic!("the member exited before printing READY"),
+            Ok(n) => got += n,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    member.try_wait().unwrap().is_none(),
+                    "the member exited before printing READY"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the member never printed READY"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => panic!("member stdout read failed: {error}"),
+        }
+    }
+    assert_eq!(&ready, b"READY", "the member printed READY past startup");
     let (_dir, mut engine) = watch_engine_with_member(pid);
     engine.owned_watch_cheap_scan_bytes = 0;
     watch_scans_over(&mut engine, pid, 10);

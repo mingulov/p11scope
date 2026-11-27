@@ -6445,7 +6445,7 @@ mod tests {
     #[test]
     fn learn_drain_loop_defers_remark_until_period() {
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let table = write_task_mountinfo(dir.path(), "mountinfo", 10, 0);
         let calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));

@@ -4826,12 +4826,22 @@ mod tests {
     /// capability shed: 4100 mounts (410 KB, under the 1 MiB cap) with
     /// a pre-shed slice, a shed (further marks fail EPERM), then a
     /// resume. v0.7.1 (unlimited, pre-shed) keeps full coverage; the
-    /// resume must match it. (Unprivileged: generated fixture, the
-    /// shed is an injected EPERM mark.)
+    /// resume must match it. The fixture mirrors the live shape: 4130
+    /// lines (4100 task mounts plus 30 pseudo base lines, all skipped),
+    /// 4100 mounts offered. (Unprivileged: generated fixture, the shed
+    /// is an injected EPERM mark.)
     #[test]
     fn learn_startup_shed_resume_keeps_full_coverage_like_v071() {
         let lines = |count: u64| -> String {
             let mut text = String::new();
+            // Thirty pseudo base lines (all skipped, none an ancestor
+            // of a task point so none hides a task mount).
+            for n in 0..30u64 {
+                text.push_str(&format!(
+                    "{} 23 0:44 / /pseudo{n} rw - proc proc rw\n",
+                    20000 + n
+                ));
+            }
             for id in 51..51 + count {
                 let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
                 while line.len() < 99 {
@@ -4855,7 +4865,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let table = dir.path().join("mountinfo");
-        std::fs::write(&table, lines(4100)).unwrap();
+        let text = lines(4100);
+        assert_eq!(text.lines().count(), 4130, "the live line shape");
+        std::fs::write(&table, &text).unwrap();
         assert!(
             std::fs::metadata(&table).unwrap().len() < 1024 * 1024,
             "the 4100-mount table stays under the read cap"
@@ -4898,6 +4910,72 @@ mod tests {
         assert_eq!(post.uncovered, 0, "retained coverage survives the shed");
         assert_eq!(post.covered.len(), 4100);
         assert!(!post.spent, "retained mounts spend nothing");
+    }
+
+    /// A dense but legal under-cap table completes the startup rotation:
+    /// 13,000 distinct mounts in 728,000 bytes (under the 1 MiB cap) are
+    /// all offered pre-shed, exactly like v0.7.1's unbounded pass — the
+    /// retained set caps at 8192 in both, so covered and uncovered match
+    /// too. Slice derivation: the table read costs 15 credits (open 2 +
+    /// 12 chunk reads + EOF), so slice 1 offers 4081 and slices 2-4 offer
+    /// 4096/4096/727 with no re-read. (Unprivileged: generated fixture.)
+    #[test]
+    fn learn_dense_under_cap_table_completes_startup_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        let mut text = String::new();
+        for id in 51..13051u64 {
+            let mut line = format!("{id} 23 8:1 / /m{id} rw,relatime - ext4 /dev/sda1 rw");
+            assert!(line.len() < 55, "the line fits its 56-byte cell: {line:?}");
+            while line.len() < 55 {
+                line.push(' ');
+            }
+            line.push('\n');
+            assert_eq!(line.len(), 56);
+            text.push_str(&line);
+        }
+        assert_eq!(text.len(), 728_000, "13,000 lines of 56 bytes");
+        assert!(
+            text.len() < 1024 * 1024,
+            "the dense table stays under the read cap"
+        );
+        std::fs::write(&table, &text).unwrap();
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        // v0.7.1: one unbounded pre-shed pass offers every mount; the
+        // retained set caps at 8192 there too.
+        let baseline = super::mark_visible_filesystems(
+            &table,
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut || true,
+            |point, _| marked(id_of(point), 8, 1),
+        );
+        assert_eq!(baseline.attempted, 13_000);
+        assert_eq!(baseline.covered.len(), 8192);
+        assert_eq!(baseline.uncovered, 13_000 - 8192);
+        assert!(!baseline.spent);
+        assert_eq!(baseline.resume_after, None);
+        assert!(!baseline.table_gap);
+        // The resumed startup matches v0.7.1 exactly, in four slices.
+        let driven =
+            super::drive_startup_slices(&table, |point, _| marked(id_of(point), 8, 1), || false);
+        assert_eq!(driven.slices, 4, "4081 + 4096 + 4096 + 727");
+        assert_eq!(
+            driven.outcome.covered, baseline.covered,
+            "the resumed startup matches v0.7.1 coverage"
+        );
+        assert_eq!(driven.outcome.uncovered, 13_000 - 8192);
+        assert!(!driven.outcome.spent, "the rotation wraps");
+        assert_eq!(driven.outcome.resume_after, None);
+        assert!(!driven.outcome.table_gap);
+        assert_eq!(driven.outcome.attempted, 13_000);
     }
 
     /// The startup driver owes the table gap for an oversized table and

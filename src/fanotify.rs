@@ -2185,7 +2185,7 @@ fn production_remark_spawner(
     pending: &mut Option<Receiver<MarkPassOutcome>>,
     job: BoxedRemarkJob,
 ) -> bool {
-    spawn_remark_pass(shared, previous, pending, |s, p| job(s, p))
+    spawn_remark_pass(shared, previous, pending, job)
 }
 
 /// Knobs the drain loop takes from its caller: the re-mark spawner,
@@ -5940,6 +5940,55 @@ mod tests {
         assert_eq!(resumed.covered.len(), 14, "only the tail marks");
     }
 
+    /// The production spawner runs the boxed job it is given on a
+    /// helper thread: a canned job lands its exact outcome through the
+    /// pending slot. Substituting any other job fails this twin.
+    /// (Unprivileged: dummy shared slot, no mounts touched.)
+    #[test]
+    fn learn_production_spawner_runs_boxed_job() {
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(group)));
+        let prev = std::collections::BTreeSet::new();
+        let mut pending = None;
+        let expected = super::MarkPassOutcome {
+            covered: [mnt(51, 8, 1)].into_iter().collect(),
+            uncovered: 3,
+            attempted: 4,
+            spent: true,
+            resume_after: Some(std::path::PathBuf::from("/mnt/m9")),
+            table_gap: false,
+        };
+        let job: super::BoxedRemarkJob = Box::new(move |_, _| expected.clone());
+        assert!(super::production_remark_spawner(
+            &shared,
+            &prev,
+            &mut pending,
+            job
+        ));
+        assert!(pending.is_some(), "the pass stays in flight");
+        let gate = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let landed = loop {
+            if let Some(outcome) = super::adopt_remark_result(&prev, &mut pending) {
+                break outcome;
+            }
+            assert!(std::time::Instant::now() < gate, "the job never lands");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(
+            landed,
+            super::MarkPassOutcome {
+                covered: [mnt(51, 8, 1)].into_iter().collect(),
+                uncovered: 3,
+                attempted: 4,
+                spent: true,
+                resume_after: Some(std::path::PathBuf::from("/mnt/m9")),
+                table_gap: false,
+            }
+        );
+        assert!(pending.is_none());
+    }
+
     /// Drives the real drain loop end to end with a scripted spawner:
     /// every spawn runs the real production job on the fixture
     /// (recorded for exact budget and cursor counts) and feeds a
@@ -6056,7 +6105,7 @@ mod tests {
         // both forced by wall-clock poll timeouts; without the
         // every-tick adopt, nothing is sent until that next due tick.
         let gate = Instant::now() + Duration::from_secs(30);
-        while script.lock().unwrap().spawns.len() < 1 {
+        while script.lock().unwrap().spawns.is_empty() {
             assert!(Instant::now() < gate, "first spawn never captured");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -6154,7 +6203,7 @@ mod tests {
                 // The first spawn installs the async landing; later
                 // spawns run the real job synchronously and feed a
                 // clean outcome that can never send.
-                if recorder.lock().unwrap().len() > 0 {
+                if !recorder.lock().unwrap().is_empty() {
                     let outcome = job(shared.clone(), prev.clone());
                     let mut recorded = recorder.lock().unwrap();
                     recorded.push(RecordedJob {

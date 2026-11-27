@@ -46690,6 +46690,270 @@ int main(void) {
         );
     }
 
+    /// Wrong-key-first over the overflow tier: a never-folded newcomer
+    /// keeps its full count while the evicted key still gaps and
+    /// stages nothing. The overflow unit belongs to its evicted key;
+    /// a neighbor must neither take its gap nor burn it. Fails while
+    /// overflow units are consumable by class.
+    #[test]
+    fn overflow_unit_fires_only_for_its_evicted_key() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        // Three live evictions: two fill the exact set, the third
+        // overflows past the cap.
+        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            3,
+            "three live folds drop with counted overflows"
+        );
+        // Newcomer (44, 1) fires first: full count, no gap, and the
+        // evicted key's protection survives.
+        let row = native.row(44, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(44, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "the newcomer stages once: {staged:?}");
+        assert_eq!(
+            staged[0].1, 7,
+            "the newcomer keeps its full count: {staged:?}"
+        );
+        native.scene.coordinator.registry.publish();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "revived folded count"),
+            "no fold gap for a key that never folded"
+        );
+        // The evicted (41, exec 11) revives: it gaps instead of
+        // re-crediting, proving its unit survived the newcomer.
+        let row = native.row(41, 11, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 11, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert!(
+            staged.is_empty(),
+            "revival past the overflow unit stages nothing: {staged:?}"
+        );
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![
+                "the pair revived past a counted fold for absolute count range (0, 7] (7 unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded"
+                    .to_string()
+            ],
+            "the evicted key gaps exactly once"
+        );
+    }
+
+    /// Correct-key-first over the overflow tier: the evicted key gaps
+    /// and consumes its own unit then a newcomer stages normally.
+    /// Guards the intended precision path through the redesign.
+    #[test]
+    fn evicted_key_consumes_its_own_overflow_unit_first() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        // The evicted (41, exec 11) fires first and consumes its unit.
+        let row = native.row(41, 11, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(41, 11, 0, 7)]);
+        native.scene.coordinator.registry.publish();
+        let gaps: Vec<String> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .map(|gap| gap.reason.clone())
+            .collect();
+        assert_eq!(gaps.len(), 1, "exactly one overflow gap: {gaps:?}");
+        // A newcomer after the consumption stages its full count.
+        let row = native.row(44, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native.counts_read(Vec::new(), vec![(44, 1, 0, 7)]);
+        let staged = native
+            .scene
+            .coordinator
+            .registry
+            .staged_pending_counts_for_test();
+        assert_eq!(staged.len(), 1, "the newcomer stages once: {staged:?}");
+        assert_eq!(
+            staged[0].1, 7,
+            "the newcomer keeps its full count: {staged:?}"
+        );
+    }
+
+    /// Past the overflow tier, evictions poison their class without
+    /// consuming anything: every revival-shaped first staging in the
+    /// class gaps, and the poison stays for the next one. Fails while
+    /// overflow credit is transferable and consumable.
+    #[test]
+    fn past_overflow_evictions_poison_the_class_without_consuming() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.scene.coordinator.set_pair_prune_cap_for_test(2);
+        for ticket in [90u64, 91] {
+            native.scene.coordinator.pair_dropped_tombstones.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, ticket),
+                    exec: 1,
+                    object: 0,
+                },
+                PrunedPairBase {
+                    base: 9,
+                    base_since: at,
+                    pruned_since: at,
+                    pid: 7,
+                },
+            );
+        }
+        // Five live evictions: two fill the exact set, two fill the
+        // overflow tier, the fifth poisons the class.
+        for (pass, exec) in [9u64, 10, 11, 12, 13].iter().enumerate() {
+            native.scene.coordinator.pair_targets.insert(
+                PairKey {
+                    image: DomainCookie::scripted(native.domain, 41),
+                    exec: *exec,
+                    object: 0,
+                },
+                PairTarget::Dropped {
+                    base: 3,
+                    base_since: at,
+                    pid: 7,
+                },
+            );
+            native.scene.coordinator.prune_departed_native_state(
+                at + EXEC_STATE_GRACE_NS + pass as u64,
+            );
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .pair_fold_memory_overflow_for_test(),
+            5,
+            "five live folds drop with counted overflows"
+        );
+        // Four newcomers in the same class all gap: the poison does
+        // not deplete like a consumable credit. Distinct absolutes
+        // keep the gaps from deduplicating into one.
+        for (i, ticket) in [44u64, 45, 46, 47].iter().enumerate() {
+            let absolute = 7 + i as u64;
+            let row = native.row(*ticket, 1, 7, at, 0);
+            native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+            native.counts_read(Vec::new(), vec![(*ticket, 1, 0, absolute)]);
+            let staged = native
+                .scene
+                .coordinator
+                .registry
+                .staged_pending_counts_for_test();
+            assert!(
+                staged.is_empty(),
+                "newcomer {ticket} stages nothing past poison: {staged:?}"
+            );
+        }
+        native.scene.coordinator.registry.publish();
+        let gaps = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "revived folded count")
+            .count();
+        assert_eq!(gaps, 4, "one gap per poisoned newcomer");
+    }
+
     /// Devin #2: finishing a domain drops its folded pairs along
     /// with its tombstones; other domains' entries stay. (Latch
     /// halves arrive with the latch in GREEN.)

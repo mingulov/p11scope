@@ -87174,6 +87174,204 @@ fn tails_with_missing_module_pin_publish_others_plus_gap() {
     }
 }
 
+/// Two providers committed and published with live views; the first
+/// one's pin is then lost on committed state while nothing rescans
+/// it this batch. Returns the engine plus victim and healthy plan
+/// objects and the victim's reconciled module.
+fn committed_two_provider_engine_with_pin_loss() -> (
+    Engine,
+    PinnedObjectId,
+    PinnedObjectId,
+    ReconciledModule,
+) {
+    let raw_a = overlay_module(overlay_key(86));
+    let raw_b = overlay_module(overlay_key(87));
+    let view_a = raw_a.view;
+    let view_b = raw_b.view;
+    let dir = tempfile::tempdir().expect("backing dir");
+    let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1)]);
+    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
+    overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
+    assert!(pins.absorb(pins_b).is_empty());
+    pins.prove_scanned_entries_for_test(&[raw_a.clone(), raw_b.clone()]);
+    let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(modules.len(), 2, "both providers reconcile");
+    let mut engine = Engine::empty();
+    engine.views.push(ProcessView::open(view_a, std::process::id()).unwrap());
+    engine.views.push(ProcessView::open(view_b, std::process::id()).unwrap());
+    engine.plan = plan::build_from_reconciled_modules(&modules);
+    engine.pinned = pins;
+    engine.modules = modules;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(engine.plan.modules.len(), 2, "both modules planned");
+    let victim = engine.plan.modules[0].object;
+    let healthy = engine.plan.modules[1].object;
+    assert_ne!(victim, healthy, "distinct plan objects");
+    let victim_reconciled = engine.modules[0].clone();
+    engine.pinned.remove_pin_for_test(victim);
+    engine.modules.clear();
+    (engine, victim, healthy, victim_reconciled)
+}
+
+/// Candidate construction with a pinless committed-plan module
+/// builds instead of bailing: the victim stays planned for the
+/// render to gap while nothing fresh is unproven. Fails while
+/// construction refuses the whole candidate on plan staleness.
+#[test]
+fn candidate_build_succeeds_with_pinless_plan_module() {
+    let (mut engine, victim, healthy, _) = committed_two_provider_engine_with_pin_loss();
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+        .expect("construction admits the degraded candidate");
+    assert!(
+        candidate.pinned.summary(victim).is_none(),
+        "the victim stays pinless in the candidate"
+    );
+    assert!(
+        candidate.pinned.summary(healthy).is_some(),
+        "the healthy pin stays"
+    );
+    assert!(
+        candidate.plan.modules.iter().any(|m| m.object == victim),
+        "the victim stays planned for the render gap"
+    );
+}
+
+/// Candidate preflight with a pinless committed-plan module passes
+/// instead of bailing: only fresh mutation inputs need exact pins.
+/// Fails while preflight refuses the whole candidate on staleness.
+#[test]
+fn preflight_passes_pinless_plan_module() {
+    let (engine, victim, healthy, _) = committed_two_provider_engine_with_pin_loss();
+    let candidate = LiveCandidate {
+        pinned: engine.pinned.clone(),
+        modules: Vec::new(),
+        plan: engine.plan.clone(),
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: Vec::new(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    assert!(candidate.pinned.summary(victim).is_none());
+    assert!(candidate.pinned.summary(healthy).is_some());
+    engine
+        .preflight_candidate_publication(&candidate)
+        .expect("preflight passes the degraded candidate");
+}
+
+/// A pinless freshly reconciled module still refuses the candidate:
+/// attach inputs without exact identity never proceed. Control that
+/// pins the preserved refusal on both the current and narrowed
+/// predicate.
+#[test]
+fn fresh_module_without_pin_still_refuses_candidate() {
+    let (engine, victim, _, victim_reconciled) = committed_two_provider_engine_with_pin_loss();
+    let candidate = LiveCandidate {
+        pinned: engine.pinned.clone(),
+        modules: vec![victim_reconciled],
+        plan: engine.plan.clone(),
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: Vec::new(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    assert!(candidate.pinned.summary(victim).is_none());
+    let err = engine
+        .preflight_candidate_publication(&candidate)
+        .expect_err("fresh pinless input still refuses");
+    assert!(
+        format!("{err:#}").contains("pinned identity"),
+        "the refusal names identity: {err:#}"
+    );
+}
+
+/// Applying a candidate over a pinless committed plan publishes the
+/// healthy rows plus the victim gap: the victim is never attached
+/// without identity, and the healthy module keeps flowing.
+#[test]
+fn candidate_apply_publishes_healthy_rows_plus_victim_gap() {
+    let (mut engine, victim, healthy, _) = committed_two_provider_engine_with_pin_loss();
+    let victim_path = engine.plan.modules[0].path.clone();
+    let healthy_id = engine.plan.modules[1].id;
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+        .expect("construction admits the degraded candidate");
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .expect("the degraded candidate applies");
+    let ids: Vec<_> = engine
+        .discovery
+        .modules
+        .iter()
+        .map(|module| module.id)
+        .collect();
+    assert!(
+        ids.contains(&healthy_id),
+        "the healthy module publishes: {ids:?}"
+    );
+    let expected = format!(
+        "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+        victim_path
+    );
+    let gaps: Vec<(&str, &str)> = engine
+        .capture_facts
+        .history
+        .losses
+        .values()
+        .filter(|loss| {
+            loss.reason.contains(&victim_path) && loss.reason.contains("lost its comparable pin")
+        })
+        .map(|loss| (loss.subject.as_str(), loss.reason.as_str()))
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![("planned provider object", expected.as_str())],
+        "one exact gap names the victim"
+    );
+    assert!(
+        engine.pinned.summary(victim).is_none(),
+        "the victim never regained a pin through the apply"
+    );
+    assert!(
+        engine.pinned.summary(healthy).is_some(),
+        "the healthy pin is untouched"
+    );
+}
+
 /// Drives rounds until one more pass with `error` has dropped (bounded):
 /// an incidental healthy round under load only costs an extra round.
 fn drop_one_more_pass(

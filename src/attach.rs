@@ -140,11 +140,11 @@ pub(crate) use instance::{
 mod cleanup_worker;
 pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
-pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink};
 /// Test seams for the freed-slot two-clock bound live here so the
 /// privileged leg can name batch states and the measured close cost.
 #[cfg(test)]
 pub(crate) use cleanup_worker::{BatchStatus, SINGLE_LINK_CLOSE_MS};
+pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink};
 #[cfg(test)]
 mod async_value_flags_tests;
 #[cfg(test)]

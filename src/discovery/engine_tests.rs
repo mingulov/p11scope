@@ -60088,8 +60088,9 @@ fn bare_engine_reports_no_mount_park_reserver() {
 #[test]
 fn scan_and_pin_with_proof_debits_a_newly_parked_mount_table() {
     let sleep = e06_spawn_sleeps(1);
-    let table_len =
-        std::fs::read_to_string("/proc/self/mountinfo").expect("a readable table").len() as u64;
+    let table_len = std::fs::read_to_string("/proc/self/mountinfo")
+        .expect("a readable table")
+        .len() as u64;
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleep[0].pid()))
         .expect("readable maps")
         .lines()
@@ -60160,8 +60161,9 @@ fn scan_and_pin_with_proof_debits_a_newly_parked_mount_table() {
 #[test]
 fn scan_retained_view_debits_a_newly_parked_mount_table() {
     let sleep = e06_spawn_sleeps(1);
-    let table_len =
-        std::fs::read_to_string("/proc/self/mountinfo").expect("a readable table").len() as u64;
+    let table_len = std::fs::read_to_string("/proc/self/mountinfo")
+        .expect("a readable table")
+        .len() as u64;
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", sleep[0].pid()))
         .expect("readable maps")
         .lines()

@@ -72,7 +72,7 @@
 
 use super::session_fixture::ScriptedSession;
 use super::*;
-use crate::attach::{BatchStatus, BackendSelection, CapturePolicy, SINGLE_LINK_CLOSE_MS, Scope};
+use crate::attach::{BackendSelection, BatchStatus, CapturePolicy, SINGLE_LINK_CLOSE_MS, Scope};
 use crate::cli::{CaptureArgs, Kind, ScopeArg};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::PinnedObjectId;
@@ -1497,23 +1497,65 @@ fn freed_slot_wait_phase(state: FreedSlotWaitState) -> FreedSlotWaitPhase {
 fn freed_slot_wait_phase_classifies_typed_retirement_state() {
     use FreedSlotWaitPhase::{Engine, Refused, WorkerPending};
     // (ticket, batch, worker, retirements, rejected keys, phase)
-    let rows: &[(bool, Option<BatchStatus>, bool, bool, bool, FreedSlotWaitPhase)] = &[
+    let rows: &[(
+        bool,
+        Option<BatchStatus>,
+        bool,
+        bool,
+        bool,
+        FreedSlotWaitPhase,
+    )] = &[
         (false, None, false, false, false, Engine),
         (false, None, true, false, false, Engine),
         (false, None, true, true, false, Engine),
         (false, None, false, false, true, Engine),
         (false, None, true, true, true, Engine),
-        (false, Some(BatchStatus::Pending), true, false, false, Engine),
-        (true, Some(BatchStatus::Pending), true, false, false, WorkerPending),
-        (true, Some(BatchStatus::Pending), true, true, true, WorkerPending),
-        (true, Some(BatchStatus::Pending), false, false, false, Refused),
+        (
+            false,
+            Some(BatchStatus::Pending),
+            true,
+            false,
+            false,
+            Engine,
+        ),
+        (
+            true,
+            Some(BatchStatus::Pending),
+            true,
+            false,
+            false,
+            WorkerPending,
+        ),
+        (
+            true,
+            Some(BatchStatus::Pending),
+            true,
+            true,
+            true,
+            WorkerPending,
+        ),
+        (
+            true,
+            Some(BatchStatus::Pending),
+            false,
+            false,
+            false,
+            Refused,
+        ),
         (true, Some(BatchStatus::Pending), false, true, true, Refused),
         (true, Some(BatchStatus::Failed), true, false, false, Refused),
         (true, Some(BatchStatus::Failed), false, true, true, Refused),
         (true, None, true, false, false, Refused),
         (true, None, false, true, true, Refused),
         (true, Some(BatchStatus::Released), true, true, true, Engine),
-        (true, Some(BatchStatus::Released), false, false, false, Engine),
+        (
+            true,
+            Some(BatchStatus::Released),
+            false,
+            false,
+            false,
+            Engine,
+        ),
     ];
     for (ticket_present, batch, worker_running, retirements_queued, rejected_keys_queued, phase) in
         rows.iter().copied()

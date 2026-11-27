@@ -2742,5 +2742,96 @@ class Full512CurationTests(unittest.TestCase):
         self.assertNotIn("verify:", result.stdout)
 
 
+class InventoryDecodeTests(unittest.TestCase):
+    def test_missing_inventory_is_a_typed_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "absent.json"
+            cells, entries, errors = CHECKER_MOD["load_inventory"](missing)
+            self.assertEqual((cells, entries), (set(), []))
+            self.assertEqual(errors, [f"{missing}: missing inventory file"])
+
+    def test_undecodable_inventory_is_a_typed_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "ignored-tests.json"
+            bad.write_bytes(b'\xff\xfe{"sites": []}')
+            cells, entries, errors = CHECKER_MOD["load_inventory"](bad)
+            self.assertEqual((cells, entries), (set(), []))
+            self.assertEqual(errors, [f"{bad}: cannot read inventory: "
+                                      "'utf-8' codec can't decode byte 0xff in position 0: "
+                                      "invalid start byte"])
+
+    def test_duplicate_key_inventory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dup = Path(tmp) / "ignored-tests.json"
+            dup.write_text('{"sites": [], "sites": [], "cells": {"a": 1}}',
+                           encoding="utf-8")
+            cells, entries, errors = CHECKER_MOD["load_inventory"](dup)
+            self.assertEqual((cells, entries), (set(), []))
+            self.assertEqual(errors, [f"{dup}: invalid JSON: duplicate JSON key 'sites'"])
+
+    def test_healthy_inventory_loads_without_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "ignored-tests.json"
+            good.write_text('{"sites": [{"file": "src/a.rs", "path": "X"}], '
+                            '"cells": {"privileged": "test cell"}}',
+                            encoding="utf-8")
+            cells, entries, errors = CHECKER_MOD["load_inventory"](good)
+            self.assertEqual(errors, [])
+            self.assertEqual(cells, {"privileged"})
+            self.assertEqual(entries, [{"file": "src/a.rs", "path": "X"}])
+
+
+class InventoryDecodeSweepTests(unittest.TestCase):
+    def test_inventory_decode_mutation_sweep(self):
+        source = CHECKER.read_text(encoding="utf-8")
+        mutations = {
+            "inventory-missing-silent": (
+                '        return set(), [], [f"{inventory_path}: missing inventory file"]',
+                "        return set(), [], []"),
+            "inventory-decode-untyped": (
+                "    except (OSError, UnicodeDecodeError) as exc:",
+                "    except OSError as exc:"),
+            "inventory-dup-keys": (
+                "    data, parse_problems = checker.strict_json(raw, str(inventory_path))",
+                "    data, parse_problems = json.loads(raw), []"),
+        }
+        killed = 0
+        failures = []
+        for name, (old, new) in mutations.items():
+            self.assertIn(old, source, name)
+            with tempfile.TemporaryDirectory() as tmp:
+                temp = Path(tmp)
+                (temp / "scripts").mkdir()
+                (temp / "scripts/check-known-failing.py").write_text(
+                    (ROOT / "scripts/check-known-failing.py").read_text(encoding="utf-8"),
+                    encoding="utf-8")
+                script = temp / "scripts/check-ignored-tests.py"
+                script.write_text(source.replace(old, new, 1), encoding="utf-8")
+                module = runpy.run_path(str(script))
+                probe = temp / "ignored-tests.json"
+                if name == "inventory-missing-silent":
+                    probe = temp / "absent.json"
+                elif name == "inventory-decode-untyped":
+                    probe.write_bytes(b'\xff\xfe{"sites": []}')
+                else:
+                    probe.write_text('{"sites": [], "sites": [], "cells": {"a": 1}}',
+                                     encoding="utf-8")
+                original_errors = CHECKER_MOD["load_inventory"](probe)[2]
+                try:
+                    mutant_errors = module["load_inventory"](probe)[2]
+                except UnicodeDecodeError:
+                    mutant_errors = None
+                if name == "inventory-decode-untyped":
+                    killed_here = original_errors != [] and mutant_errors is None
+                else:
+                    killed_here = original_errors != [] and mutant_errors == []
+                if killed_here:
+                    killed += 1
+                else:
+                    failures.append(f"{name}(original={original_errors!r},mutant={mutant_errors!r})")
+        self.assertEqual(failures, [], f"surviving mutants: {failures}; killed {killed}/{len(mutations)}")
+        print(f"ignored-tests mutation sweep: {killed}/{len(mutations)} killed")
+
+
 if __name__ == "__main__":
     unittest.main()

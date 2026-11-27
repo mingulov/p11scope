@@ -52,6 +52,7 @@ Usage:
       [--inventory PATH] [--runner PATH]
 """
 
+import importlib.util
 import json
 import re
 import sys
@@ -619,13 +620,26 @@ def macro_expansions(path, macro):
     return found
 
 
+def known_failing_checker_module():
+    path = Path(__file__).resolve().parents[1] / "scripts/check-known-failing.py"
+    spec = importlib.util.spec_from_file_location("known_failing_checker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_inventory(inventory_path):
     """(schema_cells, entries, errors). Entries are raw dicts in file order."""
-    raw = Path(inventory_path).read_text(encoding="utf-8")
+    checker = known_failing_checker_module()
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return set(), [], [f"{inventory_path}: invalid JSON: {exc}"]
+        raw = Path(inventory_path).read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return set(), [], [f"{inventory_path}: missing inventory file"]
+    except (OSError, UnicodeDecodeError) as exc:
+        return set(), [], [f"{inventory_path}: cannot read inventory: {exc}"]
+    data, parse_problems = checker.strict_json(raw, str(inventory_path))
+    if data is checker.PARSE_FAILED:
+        return set(), [], parse_problems
     if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
         return set(), [], [f"{inventory_path}: expected an object with a "
                            '"sites" list']

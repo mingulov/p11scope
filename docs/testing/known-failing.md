@@ -81,7 +81,13 @@ does not count today, so the first such row would turn that job red.
 already runs the static check) and requires a complete one-to-one
 typed selection/results document. Unlisted `skipped` / `not_applicable`
 results are neutral and printed as counts; they never excuse a
-listed row.
+listed row. Every JSON input the gate reads (the list, both
+registries, suite fragments, result documents) is admitted only
+through strict typed JSON: duplicate keys, wrong types and
+undecodable bytes are typed refusals, and a missing or unreadable
+required file fails closed with a named error instead of an empty
+mapping. The ignored-test inventory validator reads through the
+same strict loader.
 
 ## Known-issue registry block (exact format)
 

@@ -751,6 +751,31 @@ class ResultDocumentTests(unittest.TestCase):
         doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}], complete=False)
         self.assert_bad_results(doc, "complete must be true")
 
+    def test_nonboolean_complete_is_refused(self):
+        for value in (1, "yes", 0):
+            doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}],
+                             complete=value)
+            f = self.make_f()
+            result = f.run_checker("--results", str(f.results_file(doc)))
+            self.assertNotEqual(result.returncode, 0, value)
+            self.assertIn("complete must be true", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_nonlist_selection_and_results_are_refused(self):
+        good = [{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}]
+        cases = [
+            (result_doc(good, selection={}), "selection must be a nonempty"),
+            (result_doc(good, selection=0), "selection must be a nonempty"),
+            ({**result_doc(good), "results": {}}, "results must be a list"),
+            ({**result_doc(good), "results": None}, "results must be a list"),
+        ]
+        for doc, needle in cases:
+            f = self.make_f()
+            result = f.run_checker("--results", str(f.results_file(doc)))
+            self.assertNotEqual(result.returncode, 0, doc)
+            self.assertIn(needle, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_results_outside_selection_fail(self):
         doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}])
         doc["selection"] = []
@@ -1156,6 +1181,38 @@ class RegistryReadStateTests(unittest.TestCase):
             files, problems = checker.load_ignored_registry(dup)
             self.assertEqual(files, {})
             self.assertIn("duplicate", problems[0])
+
+    def test_unreadable_list_is_typed_problem(self):
+        checker = self.load_checker("list_unreadable")
+        with tempfile.TemporaryDirectory() as temporary:
+            blocked = Path(temporary) / "known-failing.json"
+            blocked.mkdir()
+            rows, problems = checker.load_list(blocked)
+            self.assertEqual(rows, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot read known-failing list", problems[0])
+
+    def test_unreadable_issue_registry_is_present_but_broken(self):
+        checker = self.load_checker("issue_unreadable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "docs").mkdir()
+            (root / "docs/known-limitations.md").mkdir()
+            present, registry, problems = checker.load_issue_registry(root)
+            self.assertTrue(present)
+            self.assertEqual(registry, {})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("known-issue registry: cannot read", problems[0])
+
+    def test_unreadable_ignored_registry_cross_check_is_typed(self):
+        checker = self.load_checker("validator_unreadable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            (root / "tests/ignored-tests.json").mkdir()
+            problems = checker.validate_ignored_known_failing(root, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot read ignored-test registry", problems[0])
 
 
 class ProducerTests(unittest.TestCase):
@@ -2966,6 +3023,81 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     outcomes[label] = problems != []
         self.record(results, "ignored-registry-undecodable", outcomes["original"], outcomes["mutant"])
 
+        # The static list loader types undecodable files instead of
+        # raising: dropping UnicodeDecodeError reopens the traceback.
+        list_decode_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, UnicodeDecodeError) as exc:\n"
+            "        return [], [f\"{path}: cannot read known-failing list: {exc}\"]",
+            "    except OSError as exc:\n"
+            "        return [], [f\"{path}: cannot read known-failing list: {exc}\"]")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", list_decode_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                bad = temp / "known-failing.json"
+                bad.write_bytes(b'{"rows": [\xff]}\n')
+                module = load_script(script, f"list_undecodable_{label}")
+                try:
+                    _rows, problems = module.load_list(bad)
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = problems != []
+        self.record(results, "static-list-undecodable", outcomes["original"], outcomes["mutant"])
+
+        # The known-issue registry loader types undecodable files as
+        # present-but-broken instead of raising.
+        issue_decode_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, UnicodeDecodeError) as exc:\n"
+            "        return True, {}, [f\"known-issue registry: cannot read {path}: {exc}\"]",
+            "    except OSError as exc:\n"
+            "        return True, {}, [f\"known-issue registry: cannot read {path}: {exc}\"]")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", issue_decode_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / "docs").mkdir()
+                (temp / "docs/known-limitations.md").write_bytes(b'# t\xff\n')
+                module = load_script(script, f"issue_undecodable_{label}")
+                try:
+                    _present, _registry, problems = module.load_issue_registry(temp)
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = problems != []
+        self.record(results, "issue-registry-undecodable", outcomes["original"], outcomes["mutant"])
+
+        # The ignored cross-check validator types undecodable files
+        # instead of raising.
+        validator_decode_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, UnicodeDecodeError) as exc:\n"
+            "        return [f\"{path}: cannot read ignored-test registry: {exc}\"]",
+            "    except OSError as exc:\n"
+            "        return [f\"{path}: cannot read ignored-test registry: {exc}\"]")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", validator_decode_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / "tests").mkdir()
+                (temp / "tests/ignored-tests.json").write_bytes(b'{"sites": [\xff]}\n')
+                module = load_script(script, f"validator_undecodable_{label}")
+                try:
+                    problems = module.validate_ignored_known_failing(temp, [])
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = problems != []
+        self.record(results, "ignored-validator-undecodable", outcomes["original"], outcomes["mutant"])
+
         # The cell fallback on a missing registry is deliberate and pinned:
         # re-raising instead breaks registry-less runner-path operation.
         fallback_mutant = self.mutate_source(
@@ -3456,10 +3588,39 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 56
+        total = 59
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")
+
+
+class ShapeGuardMutationTests(unittest.TestCase):
+    def test_shape_guards_own_their_typed_refusals(self):
+        source = CHECKER.read_text(encoding="utf-8")
+        good = [{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}]
+        cases = [
+            ("selection-shape",
+             "if not isinstance(raw_selection, list) or not raw_selection:",
+             result_doc(good, selection={}), "selection must be a nonempty"),
+            ("results-shape",
+             "if not isinstance(raw_results, list):",
+             {**result_doc(good), "results": {}}, "results must be a list"),
+        ]
+        for name, guard, doc, needle in cases:
+            self.assertIn(guard, source, name)
+            with tempfile.TemporaryDirectory() as temporary:
+                mutant = Path(temporary) / "check-known-failing.py"
+                mutant.write_text(source.replace(guard, "if False:", 1), encoding="utf-8")
+                f = fixture(self)
+                path = f.results_file(doc)
+                reference = subprocess.run([sys.executable, "-I", str(CHECKER), "--root", str(f.root),
+                                            "--results", str(path)], capture_output=True, text=True)
+                mutated = subprocess.run([sys.executable, "-I", str(mutant), "--root", str(f.root),
+                                          "--results", str(path)], capture_output=True, text=True)
+                self.assertNotEqual(reference.returncode, 0, name)
+                self.assertIn(needle, reference.stderr, name)
+                self.assertNotIn("Traceback", reference.stderr, name)
+                self.assertNotIn(needle, mutated.stderr, name)
 
 
 class MutationSweepTests(unittest.TestCase):
@@ -3467,6 +3628,7 @@ class MutationSweepTests(unittest.TestCase):
         source = CHECKER.read_text(encoding="utf-8")
         mutations = {
             "complete-record": ('if data.get("complete") is not True:', 'if False:'),
+            "complete-nonbool": ('if data.get("complete") is not True:', 'if False:'),
             "empty-selection": ('if not isinstance(raw_selection, list) or not raw_selection:', 'if not isinstance(raw_selection, list):'),
             "missing-result": ('if missing_results:\n        problems.append', 'if False:\n        problems.append'),
             "outside-selection": ('if missing_selection:\n        problems.append', 'if False:\n        problems.append'),
@@ -3510,6 +3672,10 @@ class MutationSweepTests(unittest.TestCase):
             if name == "complete-record":
                 doc = result_doc([pass_item()])
                 doc["complete"] = False
+                return doc
+            if name == "complete-nonbool":
+                doc = result_doc([pass_item()])
+                doc["complete"] = 1
                 return doc
             if name == "empty-selection":
                 return result_doc([], selection=[])

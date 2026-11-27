@@ -623,7 +623,14 @@ pub(crate) struct MarkOutcome {
 /// later at descendant paths are still visible and are kept; entries
 /// the trigger already hides are dropped with the lower mount.
 pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
+    // A point-to-index map keeps the overmount lookup linear: a dense
+    // table holds thousands of mounts and the arming pass runs under a
+    // one-second bound, so the per-line scan it replaces would eat the
+    // whole budget on parsing alone. Same result in the same order —
+    // overmounts still update in place, pseudo drops still rebuild —
+    // only the lookup is faster.
     let mut mounts: Vec<MountToMark> = Vec::new();
+    let mut index: HashMap<std::path::PathBuf, usize> = HashMap::new();
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split(' ').collect();
         let Some(sep) = fields.iter().position(|field| *field == "-") else {
@@ -644,14 +651,22 @@ pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
             // real cover is harmless — the mark lands on the coverer
             // and is credited there — but an `autofs` trigger must
             // never be opened at all.
+            let before = mounts.len();
             mounts.retain(|mount| !mount.point.starts_with(&point));
+            if mounts.len() != before {
+                index.clear();
+                for (at, mount) in mounts.iter().enumerate() {
+                    index.insert(mount.point.clone(), at);
+                }
+            }
             continue;
         }
         let identity = parse_mount_identity(fields[0], fields[2]);
-        if let Some(existing) = mounts.iter_mut().find(|mount| mount.point == point) {
-            existing.identity = identity;
+        if let Some(&at) = index.get(&point) {
+            mounts[at].identity = identity;
             continue;
         }
+        index.insert(point.clone(), mounts.len());
         mounts.push(MountToMark { point, identity });
     }
     mounts
@@ -1026,81 +1041,123 @@ fn open_learn_group() -> Result<OwnedFd, LearnAbsent> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// One startup mark step that honors cancellation: once the arming
+/// helper is cancelled (its owner timed out and detached it), no
+/// further mark is attempted — not even opening the mount point — so
+/// a detached helper stops dirtying the group. Otherwise the mount is
+/// marked through the group as usual.
+fn cancel_aware_mark(
+    cancel: &AtomicBool,
+    group: &OwnedFd,
+    point: &std::path::Path,
+    mounts: &[MountToMark],
+) -> MarkOutcome {
+    if cancel.load(Ordering::Acquire) {
+        return MarkOutcome {
+            resolved: None,
+            marked: None,
+        };
+    }
+    try_mark_filesystem(group, point, mounts)
+}
+
+/// Starts file learning with injected leaves: the group opener, the
+/// FIONREAD measurer, the mount-table path, and the per-mount mark
+/// step (which receives the group and the cancel flag).
+/// Production [`FileLearner::start`] injects the real fanotify leaves.
+/// The unprivileged composition twin injects a dummy group, a fixture
+/// table, and pure marks, and drives this real composition — open,
+/// measure, bounded arming drive, empty-coverage refusal, adoption —
+/// asserting multi-slice adoption with cursor and gap preserved.
+/// Bypassing the drive, dropping the adoption, or mis-threading
+/// cancel fails `learn_startup_arming_composition_drives_fixture`.
+fn startup_arming(
+    opener: impl FnOnce() -> Result<OwnedFd, LearnAbsent>,
+    measurer: impl FnOnce(&OwnedFd) -> (usize, bool),
+    mountinfo: std::path::PathBuf,
+    mut mark: impl FnMut(&OwnedFd, &AtomicBool, &std::path::Path, &[MountToMark]) -> MarkOutcome
+    + Send
+    + 'static,
+) -> Result<(FileLearner, Receiver<LearnMsg>, StartupDriveOutcome), LearnAbsent> {
+    // The bound moves to user space: the drain sheds a backlog
+    // past `LEARN_BACKLOG_CAP_BYTES` as a named overflow, and no
+    // drain step blocks on a mount.
+    let group = opener()?;
+    // The FIONREAD unit before any filesystem mark exists: the
+    // probe inode is the only marked object, so one open queues
+    // exactly one event and the snapshot is the unit.
+    let (fionread_unit, fionread_exact) = measurer(&group);
+    // The mark pass opens every visible mount: on a hung mount
+    // (unreachable NFS/CIFS, dead FUSE) an open can block
+    // indefinitely, which would wedge `--system` start before
+    // `capturing:`. Run it on a helper under the worker bound; on
+    // timeout the helper is detached (its marks are flushed
+    // through a duplicate while the startup grant is still held,
+    // it places no further marks once cancelled, and it closes
+    // the group when the hang clears) and learning is unavailable
+    // — a named gap, never a hung start. The helper drives
+    // repeated charged slices pre-shed over one table snapshot
+    // until the rotation wraps, so a large-but-under-cap table
+    // keeps the coverage v0.7.1 kept; the post-shed periodic only
+    // retains.
+    let pass = arm_with_bound(group, move |group, cancel| {
+        drive_startup_slices(
+            &mountinfo,
+            |point, mounts| mark(group, cancel, point, mounts),
+            || cancel.load(Ordering::Acquire),
+        )
+    });
+    let Some((group, drive)) = pass else {
+        return Err(LearnAbsent {
+            reason: "mark pass did not finish within the hung-mount bound".to_string(),
+        });
+    };
+    let covered_len = drive.outcome.covered.len();
+    let uncovered = drive.outcome.uncovered;
+    // An identity-less fallback mount that marked successfully
+    // leaves the retained set empty with nothing uncovered: that
+    // is still a working learner, re-decided at the next pass.
+    if drive.outcome.covered.is_empty() && uncovered > 0 {
+        return Err(LearnAbsent {
+            reason: format!("no filesystem could be marked ({uncovered} skipped)"),
+        });
+    }
+    if crate::run::capture_diagnostics_on() {
+        eprintln!(
+            "p11scope: file learning active: {covered_len} filesystems marked ({uncovered} skipped), FIONREAD unit {fionread_unit} B/event",
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_CHANNEL_DEPTH);
+    let state = Arc::new(LearnShutdownState::default());
+    let pending =
+        pending_arming_from_drive(group, tx, drive.clone(), fionread_unit, fionread_exact);
+    Ok((
+        FileLearner {
+            state,
+            thread: None,
+            pending: Some(pending),
+        },
+        rx,
+        drive,
+    ))
+}
+
 impl FileLearner {
     /// Opens the fanotify group and marks every real filesystem
     /// (both need the startup `CAP_SYS_ADMIN` grant), but does not
     /// spawn the reader: call `begin_drain` after the post-setup
     /// capability shed. Without the grant (or fanotify at all) this
     /// returns `LearnAbsent` and the capture keeps today's gaps,
-    /// never a fatal.
+    /// never a fatal. This is dependency injection only; the arming
+    /// composition it runs is [`startup_arming`].
     pub(crate) fn start() -> Result<(Self, Receiver<LearnMsg>), LearnAbsent> {
-        // The bound moves to user space: the drain sheds a backlog
-        // past `LEARN_BACKLOG_CAP_BYTES` as a named overflow, and no
-        // drain step blocks on a mount.
-        let group = open_learn_group()?;
-        // The FIONREAD unit before any filesystem mark exists: the
-        // probe inode is the only marked object, so one open queues
-        // exactly one event and the snapshot is the unit.
-        let (fionread_unit, fionread_exact) = measure_fionread_unit(&group);
-        // The mark pass opens every visible mount: on a hung mount
-        // (unreachable NFS/CIFS, dead FUSE) an open can block
-        // indefinitely, which would wedge `--system` start before
-        // `capturing:`. Run it on a helper under the worker bound; on
-        // timeout the helper is detached (its marks are flushed
-        // through a duplicate while the startup grant is still held,
-        // it places no further marks once cancelled, and it closes
-        // the group when the hang clears) and learning is unavailable
-        // — a named gap, never a hung start. The helper drives
-        // repeated charged slices pre-shed (each with a fresh
-        // production budget, threading the resume cursor) until the
-        // rotation wraps, so a large-but-under-cap table keeps the
-        // coverage v0.7.1 kept; the post-shed periodic only retains.
-        let pass = arm_with_bound(group, |group, cancel| {
-            drive_startup_slices(
-                std::path::Path::new("/proc/self/mountinfo"),
-                |point, mounts| {
-                    if cancel.load(Ordering::Acquire) {
-                        return MarkOutcome {
-                            resolved: None,
-                            marked: None,
-                        };
-                    }
-                    try_mark_filesystem(group, point, mounts)
-                },
-                || cancel.load(Ordering::Acquire),
-            )
-        });
-        let Some((group, drive)) = pass else {
-            return Err(LearnAbsent {
-                reason: "mark pass did not finish within the hung-mount bound".to_string(),
-            });
-        };
-        let covered_len = drive.outcome.covered.len();
-        let uncovered = drive.outcome.uncovered;
-        // An identity-less fallback mount that marked successfully
-        // leaves the retained set empty with nothing uncovered: that
-        // is still a working learner, re-decided at the next pass.
-        if drive.outcome.covered.is_empty() && uncovered > 0 {
-            return Err(LearnAbsent {
-                reason: format!("no filesystem could be marked ({uncovered} skipped)"),
-            });
-        }
-        if crate::run::capture_diagnostics_on() {
-            eprintln!(
-                "p11scope: file learning active: {covered_len} filesystems marked ({uncovered} skipped), FIONREAD unit {fionread_unit} B/event",
-            );
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_CHANNEL_DEPTH);
-        let state = Arc::new(LearnShutdownState::default());
-        let pending = pending_arming_from_drive(group, tx, drive, fionread_unit, fionread_exact);
-        Ok((
-            Self {
-                state,
-                thread: None,
-                pending: Some(pending),
-            },
-            rx,
-        ))
+        startup_arming(
+            open_learn_group,
+            measure_fionread_unit,
+            std::path::PathBuf::from("/proc/self/mountinfo"),
+            |group, cancel, point, mounts| cancel_aware_mark(cancel, group, point, mounts),
+        )
+        .map(|(learner, channel, _)| (learner, channel))
     }
 
     /// Spawns the reader thread with the caller's current capability
@@ -3897,6 +3954,49 @@ mod tests {
         }
     }
 
+    /// Writes a mountinfo fixture with `task` task mounts (100 bytes
+    /// each, points `/mnt/m51..`, distinct filesystems) plus `pseudo`
+    /// skipped pseudo base lines: `task + pseudo` lines total, `task`
+    /// mounts offered. Returns the table path.
+    fn write_task_mountinfo(
+        dir: &std::path::Path,
+        file: &str,
+        task: u64,
+        pseudo: u64,
+    ) -> std::path::PathBuf {
+        let mut text = String::new();
+        for n in 0..pseudo {
+            text.push_str(&format!(
+                "{} 23 0:44 / /pseudo{n} rw - proc proc rw\n",
+                20000 + n
+            ));
+        }
+        for id in 51..51 + task {
+            let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+            while line.len() < 99 {
+                line.push(' ');
+            }
+            line.push('\n');
+            assert_eq!(line.len(), 100);
+            text.push_str(&line);
+        }
+        assert_eq!(text.lines().count() as u64, task + pseudo);
+        let table = dir.join(file);
+        std::fs::write(&table, &text).unwrap();
+        table
+    }
+
+    /// The mount id carried in a task-fixture point name (`/mnt/m{id}`
+    /// or `/m{id}`), resolving each mark to its own mount's identity.
+    fn task_id_of(point: &std::path::Path) -> u64 {
+        point
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('m'))
+            .and_then(|id| id.parse().ok())
+            .expect("fixture points carry their mount id")
+    }
+
     /// The mark parser carries mount identity (mount id + filesystem
     /// device) beside each point, and an overmounted point keeps the
     /// topmost (last) mount's identity: the path resolves there.
@@ -5306,6 +5406,122 @@ mod tests {
         assert_eq!(pending.covered, covered);
         assert!(!pending.initial_gap_owed, "full coverage owes no gap");
         assert_eq!(pending.remark_cursor, None, "a wrapped rotation resets");
+    }
+
+    /// The startup arming composition drives a dense fixture through
+    /// the real production path — open, measure, bounded multi-slice
+    /// drive, adoption — with injected leaves and no fanotify group:
+    /// the 4100-mount table completes in exactly 2 slices with cursor
+    /// and gap preserved into the pending arming. Replacing the drive
+    /// with a single slice, or dropping the adoption, fails this twin.
+    /// (Unprivileged: dummy group fd, generated fixture, pure marks.)
+    #[test]
+    fn learn_startup_arming_composition_drives_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = write_task_mountinfo(dir.path(), "mountinfo", 4100, 30);
+        let (learner, _channel, drive) = super::startup_arming(
+            || {
+                let dummy = std::fs::File::open("/dev/null").unwrap();
+                Ok(std::os::fd::OwnedFd::from(dummy))
+            },
+            |_| (64, true),
+            table,
+            |_, _, point, _| marked(task_id_of(point), 8, 1),
+        )
+        .expect("arming succeeds on the fixture");
+        assert_eq!(drive.slices, 2, "4086 + 14 across two charged slices");
+        assert_eq!(drive.outcome.attempted, 4100);
+        assert_eq!(drive.outcome.uncovered, 0);
+        assert!(!drive.outcome.spent);
+        assert_eq!(drive.outcome.resume_after, None);
+        let pending = learner.pending.as_ref().expect("pending arming");
+        assert_eq!(pending.covered.len(), 4100);
+        assert!(
+            !pending.initial_gap_owed,
+            "full coverage owes no initial gap"
+        );
+        assert_eq!(
+            pending.remark_cursor, None,
+            "a wrapped rotation resets the first periodic cursor"
+        );
+        assert_eq!(pending.fionread_unit, 64);
+        assert!(pending.fionread_exact);
+        // The empty-coverage refusal keeps its exact typed shape
+        // through the same composition: nothing marked, all counted.
+        let table = write_task_mountinfo(dir.path(), "nomark", 10, 0);
+        let absent = super::startup_arming(
+            || {
+                let dummy = std::fs::File::open("/dev/null").unwrap();
+                Ok(std::os::fd::OwnedFd::from(dummy))
+            },
+            |_| (64, true),
+            table,
+            |_, _, _, _| unresolved(),
+        );
+        let Err(absent) = absent else {
+            panic!("empty coverage must refuse startup");
+        };
+        assert_eq!(absent.reason, "no filesystem could be marked (10 skipped)");
+    }
+
+    /// A cancelled arming mark attempts nothing: with cancel set, even
+    /// an openable directory resolves to nothing (the group is never
+    /// touched); with cancel clear, the same directory resolves through
+    /// the attempted mark. Flipping the branch fails this twin.
+    /// (Unprivileged: dummy group fd, real tempdir.)
+    #[test]
+    fn learn_cancel_aware_mark_short_circuits_on_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let point = dir.path().join("sub");
+        std::fs::create_dir(&point).unwrap();
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let cancel = AtomicBool::new(true);
+        let cut = super::cancel_aware_mark(&cancel, &group, &point, &[]);
+        assert_eq!(
+            cut,
+            super::MarkOutcome {
+                resolved: None,
+                marked: None,
+            },
+            "a cancelled mark resolves nothing"
+        );
+        cancel.store(false, Ordering::Release);
+        let tried = super::cancel_aware_mark(&cancel, &group, &point, &[]);
+        assert!(
+            tried.resolved.is_some(),
+            "an uncancelled mark opens and resolves: {tried:?}"
+        );
+        assert!(
+            tried.marked.is_none(),
+            "the dummy group cannot take the mark: {tried:?}"
+        );
+    }
+
+    /// The driver stops between slices once cancelled, preserving the
+    /// partial rotation: covered mounts stay covered, the cursor points
+    /// at the last offer, and the remainder counts uncovered with the
+    /// spent flag set. (Unprivileged: generated fixture.)
+    #[test]
+    fn learn_startup_drive_stops_between_slices_on_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = write_task_mountinfo(dir.path(), "mountinfo", 4100, 30);
+        let driven = super::drive_startup_slices(
+            &table,
+            |point, _| marked(task_id_of(point), 8, 1),
+            || true,
+        );
+        assert_eq!(driven.slices, 1, "cancel stops after the first slice");
+        assert_eq!(driven.outcome.attempted, 4086);
+        assert_eq!(driven.outcome.covered.len(), 4086);
+        assert_eq!(driven.outcome.uncovered, 14);
+        assert!(driven.outcome.spent);
+        assert_eq!(
+            driven.outcome.resume_after,
+            Some(std::path::PathBuf::from("/mnt/m4136"))
+        );
+        assert!(!driven.outcome.table_gap);
     }
 
     /// The drain handoff preserves the startup cursor, gap and

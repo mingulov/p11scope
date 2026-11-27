@@ -54,6 +54,7 @@ Usage:
 
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -244,20 +245,66 @@ def decode_rust_str(raw):
     return "".join(out)
 
 
+def scan_dir_files(directory, predicate):
+    """(files, problems): matching regular files directly inside `directory`.
+
+    `pathlib` globbing swallows listing failures, so this uses
+    `os.scandir` and reports them as typed problems instead.
+    """
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError as exc:
+        return [], [f"cannot scan directory {directory}: {exc.strerror or exc}"]
+    return [Path(entry.path) for entry in entries
+            if predicate(entry.name) and entry.is_file()], []
+
+
+def scan_tree_files(top, predicate, excluded=()):
+    """(files, problems): every matching file under `top`, sorted.
+
+    Enumeration failures are typed problems, never silent skips:
+    `os.walk` reports unreadable directories through `onerror`
+    (bare `Path.rglob` suppresses them). Directory symlinks are not
+    followed; `excluded` prunes matching directory names at every
+    level. File symlinks are yielded and fail at read time when
+    dangling. Shared with the privileged producer, which imports
+    this module for its token-index scan.
+    """
+    files = []
+    problems = []
+
+    def onerror(exc):
+        problems.append(f"cannot scan directory {exc.filename}: {exc.strerror or exc}")
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=onerror, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if name not in excluded)
+        for name in sorted(filenames):
+            if predicate(name):
+                files.append(Path(dirpath) / name)
+    return files, problems
+
+
 def crate_roots(root):
-    """Crate-root files: workspace lib/bin, every tests/ file, every crates/ member."""
+    """Crate-root files: workspace lib/bin, every tests/ file, every crates/ member.
+
+    Returns (roots, problems): listing failures are typed problems.
+    """
     roots = []
+    problems = []
     for cand in (root / "src" / "lib.rs", root / "src" / "main.rs"):
         if cand.is_file():
             roots.append(cand)
     tests = root / "tests"
     if tests.is_dir():
-        roots.extend(sorted(p for p in tests.glob("*.rs") if p.is_file()))
+        found, scan_problems = scan_dir_files(tests, lambda name: name.endswith(".rs"))
+        roots.extend(found)
+        problems.extend(scan_problems)
     crates = root / "crates"
     if crates.is_dir():
-        for cargo in sorted(crates.rglob("Cargo.toml")):
-            if any(seg in EXCLUDED_SEGMENTS for seg in cargo.parts):
-                continue
+        cargo_files, cargo_problems = scan_tree_files(
+            crates, lambda name: name == "Cargo.toml", EXCLUDED_SEGMENTS)
+        problems.extend(cargo_problems)
+        for cargo in cargo_files:
             member = cargo.parent
             for cand in (member / "src" / "lib.rs", member / "src" / "main.rs"):
                 if cand.is_file():
@@ -265,9 +312,11 @@ def crate_roots(root):
             for sub in ("tests", "benches", "examples"):
                 subdir = member / sub
                 if subdir.is_dir():
-                    roots.extend(sorted(p for p in subdir.glob("*.rs")
-                                        if p.is_file()))
-    return roots
+                    found, scan_problems = scan_dir_files(
+                        subdir, lambda name: name.endswith(".rs"))
+                    roots.extend(found)
+                    problems.extend(scan_problems)
+    return roots, problems
 
 
 def child_candidates(path, name):
@@ -280,8 +329,14 @@ def child_candidates(path, name):
 
 
 def build_filemap(root):
-    """Map every reachable .rs file to its module path segments."""
+    """Map every reachable .rs file to its module path segments.
+
+    Returns (filemap, problems): unreadable files are typed
+    problems. Files that are merely absent (an unresolvable `mod`
+    target names no file that could hide an ignore site) stay silent.
+    """
     filemap = {}
+    problems = []
 
     def visit(path, prefix):
         if path in filemap:
@@ -289,6 +344,9 @@ def build_filemap(root):
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append(f"cannot read source {path}: {exc}")
             return
         filemap[path] = prefix
         stripped = strip_code(text)
@@ -306,23 +364,30 @@ def build_filemap(root):
                 if found:
                     visit(found[0], prefix + [name])
 
-    for entry in crate_roots(root):
+    entries, root_problems = crate_roots(root)
+    problems.extend(root_problems)
+    for entry in entries:
         visit(entry, [])
-    return filemap
+    return filemap, problems
 
 
 def rust_files(root):
-    """Every scanned .rs file, sorted, minus excluded segments."""
+    """Every scanned .rs file, sorted, minus excluded segments.
+
+    Returns (files, problems): enumeration failures are typed
+    problems, never silent skips.
+    """
     found = []
+    problems = []
     for dirname in SCAN_DIRS:
         top = root / dirname
         if not top.is_dir():
             continue
-        for path in sorted(top.rglob("*.rs")):
-            if any(seg in EXCLUDED_SEGMENTS for seg in path.parts):
-                continue
-            found.append(path)
-    return found
+        files, scan_problems = scan_tree_files(
+            top, lambda name: name.endswith(".rs"), EXCLUDED_SEGMENTS)
+        found.extend(files)
+        problems.extend(scan_problems)
+    return found, problems
 
 
 def macro_spans(stripped):
@@ -402,9 +467,13 @@ def scan_file(path, filemap):
 
     Returns (sites, errors). A site is (line, module_segments, item, macro,
     reason) where item is the following fn name ($name in macros) and macro
-    is the enclosing macro_rules! name or None.
+    is the enclosing macro_rules! name or None. Unreadable files are
+    errors, never silent skips.
     """
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], [f"cannot read source: {exc}"]
     stripped = strip_code(text)
     spans = macro_spans(stripped)
     base = filemap.get(path, [])
@@ -435,9 +504,11 @@ def scan_file(path, filemap):
 def scan_sources(root):
     """{file: [(line, path, macro, reason)]} plus parse errors."""
     root = Path(root)
-    filemap = build_filemap(root)
-    found, errors = {}, []
-    for path in rust_files(root):
+    filemap, map_problems = build_filemap(root)
+    found, errors = {}, list(map_problems)
+    files, list_problems = rust_files(root)
+    errors.extend(list_problems)
+    for path in files:
         sites, file_errors = scan_file(path, filemap)
         for message in file_errors:
             errors.append(f"{path.relative_to(root)}: {message}")
@@ -501,7 +572,7 @@ def manifest_version(root):
     """The root Cargo.toml package version, or None when unreadable."""
     try:
         text = (Path(root) / DEFAULT_MANIFEST).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
     if match is None:
@@ -599,8 +670,15 @@ def default_absent(cfg_attrs):
 
 
 def macro_expansions(path, macro):
-    """(name, default_absent) for each `macro!(name, ...)` invocation."""
-    text = Path(path).read_text(encoding="utf-8")
+    """(expansions, error): (name, default_absent) for each `macro!(name, ...)` invocation.
+
+    An unreadable macro file is a typed error, never a silent empty
+    expansion list.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], f"cannot read macro source {path}: {exc}"
     stripped = strip_code(text)
     def_spans = [(lo, hi) for _, lo, hi in macro_spans(stripped)
                  if _ == macro]
@@ -617,7 +695,7 @@ def macro_expansions(path, macro):
             continue
         attrs = cfg_blocked_above(stripped, text, match.start())
         found.append((arg.group(1), default_absent(attrs)))
-    return found
+    return found, None
 
 
 def known_failing_checker_module():
@@ -789,8 +867,10 @@ def check(root=ROOT, inventory=None, runner=None):
         else:
             stem = entry["path"][:-1]
             module = stem.rsplit("::", 1)[0] if "::" in stem else ""
-            expansions = macro_expansions(root / entry["file"], macro)
-            if not expansions:
+            expansions, macro_error = macro_expansions(root / entry["file"], macro)
+            if macro_error is not None:
+                failures.append(f"FAIL {where}: {macro_error}")
+            elif not expansions:
                 failures.append(f"FAIL {where}: macro {macro} has no "
                                 "invocations to verify")
             for name, absent in expansions:
@@ -829,8 +909,11 @@ def check(root=ROOT, inventory=None, runner=None):
             stem = path[:-1]
             macro = stem.rsplit("::", 1)[-1]
             module = stem.rsplit("::", 1)[0] if "::" in stem else ""
-            for name, absent in macro_expansions(root / entry["file"],
-                                                 macro):
+            expansions, macro_error = macro_expansions(root / entry["file"], macro)
+            if macro_error is not None:
+                failures.append(f"FAIL {entry['file']}: {macro_error}")
+                continue
+            for name, absent in expansions:
                 if name is not None and absent:
                     wide_sites.add(f"{module}::{name}" if module else name)
     for member in sorted(wide):

@@ -383,6 +383,14 @@ class StaticValidationTests(unittest.TestCase):
             "RUN = 'test_sample.py'\n",
             "RUN = [('test_sample.py', [])] + [('test_other.py', [])]\n",
             "DRIVEN = []\n",
+            "RUN = [123, ('test_sample.py', [])]\n",
+            "RUN = [('test_sample.py', []), 123]\n",
+            "RUN = [('a.py', []), 123, ('test_sample.py', [])]\n",
+            "RUN = [(123, [])]\n",
+            "RUN = [('', [])]\n",
+            "RUN = [('test_sample.py', []), ('', [])]\n",
+            "RUN = [('test_sample.py', [1])]\n",
+            "RUN = [('test_sample.py', []), ('x.py', ['ok', 1])]\n",
         )
         for body in bodies:
             f = fixture(self)
@@ -395,6 +403,17 @@ class StaticValidationTests(unittest.TestCase):
             self.assertIn("suite invocation is not registered in scripts/run-python-suites.py",
                           result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_deeply_nested_registry_refuses_registration(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_run")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            (root / "scripts/run-python-suites.py").write_text(
+                "RUN = " + "[" * 10000 + "]" * 10000 + "\n", encoding="utf-8")
+            self.assertFalse(checker.python_suite_registered(
+                root, {"runner": "python-suite", "path": "tests/python/test_sample.py",
+                       "invocation": []}))
 
     def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
         self.assert_bad_row(row(runner="privileged-lib"), "refused until")
@@ -831,6 +850,19 @@ class ResultDocumentTests(unittest.TestCase):
             self.assertIn("complete must be true", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
 
+    def test_trailing_malformed_result_is_refused(self):
+        good = {"path": "tests/python/test_sample.py", "test": "Sample.test_x"}
+        tail = {"path": "tests/python/test_sample.py", "test": "Sample.test_tail"}
+        doc = result_doc([good])
+        doc["selection"].append({"path": tail["path"], "test": tail["test"], "invocation": []})
+        doc["results"].append({"path": tail["path"], "test": tail["test"], "invocation": [],
+                               "state": 123, "signature": None})
+        f = self.make_f()
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertNotEqual(result.returncode, 0, doc)
+        self.assertIn("state is not in the closed terminal-state vocabulary", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_nonlist_selection_and_results_are_refused(self):
         good = [{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}]
         cases = [
@@ -1112,6 +1144,14 @@ class StrictNullAdmissionTests(unittest.TestCase):
         self.assertIn("invalid JSON", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_deeply_nested_json_is_typed_refusal(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_json")
+        deep = "[" * 1000000 + "]" * 1000000
+        data, problems = checker.strict_json(deep, "deep")
+        self.assertIs(data, checker.PARSE_FAILED)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("invalid JSON", problems[0])
+
     def test_missing_documents_are_typed_refusals(self):
         f = fixture(self)
         result = f.run_checker("--results", str(f.root / "absent.json"))
@@ -1306,6 +1346,74 @@ class RegistryReadStateTests(unittest.TestCase):
             problems = checker.validate_ignored_known_failing(root, [])
             self.assertEqual(len(problems), 1)
             self.assertIn("cannot read ignored-test registry", problems[0])
+
+    def test_trailing_malformed_list_row_is_refused(self):
+        checker = self.load_checker("list_trailing")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "known-failing.json"
+            bad = row()
+            bad["test"] = 123
+            write_json(path, {"schema": "p11scope/known-failing/v1", "rows": [row(), bad]})
+            rows, problems = checker.load_list(path)
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(problems)
+            self.assertTrue(any("row 2" in problem for problem in problems))
+
+    def test_trailing_malformed_issue_is_refused(self):
+        checker = self.load_checker("issue_trailing")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "docs").mkdir()
+            (root / "docs/known-limitations.md").write_text(
+                "# Known limitations\n\n## Known limitations in 0.7.2\n\n"
+                "<!-- p11scope-known-issues-v1\n"
+                '{"schema":"p11scope/known-issues/v1","issues":['
+                '{"id":"KI-01","test":true},{"id":"KI-02","test":"yes"}]}\n'
+                "-->\n### KI-01\nplain explanation\n### KI-02\nplain explanation\n",
+                encoding="utf-8")
+            present, registry, problems = checker.load_issue_registry(root)
+            self.assertTrue(present)
+            self.assertTrue(any("must be a boolean" in problem for problem in problems))
+
+    def test_trailing_malformed_site_refuses_registry(self):
+        checker = self.load_checker("ignored_trailing")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ignored-tests.json"
+            path.write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "src/a.rs", "path": "X"}, {"file": 1, "path": "Y"}]}\n',
+                encoding="utf-8")
+            files, problems = checker.load_ignored_registry(path)
+            self.assertEqual(files, {})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("site 2 must have string file and path", problems[0])
+
+    def test_trailing_ambiguous_site_refuses_registry(self):
+        checker = self.load_checker("ignored_ambiguous")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ignored-tests.json"
+            path.write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "src/a.rs", "path": "X"}, '
+                '{"file": "src/b.rs", "path": "X"}]}\n',
+                encoding="utf-8")
+            files, problems = checker.load_ignored_registry(path)
+            self.assertEqual(files, {})
+            self.assertEqual(len(problems), 1)
+            self.assertIn("claimed by more than one file", problems[0])
+
+    def test_trailing_malformed_cross_check_site_is_refused(self):
+        checker = self.load_checker("validator_trailing")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            (root / "tests/ignored-tests.json").write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                '{"file": "src/a.rs", "path": "X", "cell": "known-failing"}, 42]}\n',
+                encoding="utf-8")
+            problems = checker.validate_ignored_known_failing(
+                root, [{"path": "src/a.rs", "test": "X"}])
+            self.assertTrue(any("malformed site entries" in problem for problem in problems))
 
 
 class ProducerTests(unittest.TestCase):
@@ -1602,6 +1710,57 @@ class WorkflowScanTests(unittest.TestCase):
         self.assertIn("unknown workflow directory entry", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_trailing_unknown_workflow_entry_is_refused(self):
+        f = fixture(self)
+        (f.root / ".github/workflows/zzz-notes.txt").write_text("notes\n", encoding="utf-8")
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unknown workflow directory entry", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_unlistable_workflow_directory_is_typed(self):
+        checker = load_script(CHECKER, "known_failing_checker_wf_unlistable")
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if str(path).endswith(".github/workflows"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".github/workflows").mkdir(parents=True)
+            (root / ".github/workflows/main.yml").write_text("jobs: {}\n", encoding="utf-8")
+            with mock.patch("os.scandir", side_effect=guarded):
+                invocations, problems = checker.workflow_invocations(root)
+            self.assertEqual(invocations, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot list workflow directory", problems[0])
+
+    def test_deeply_nested_workflow_is_typed_refusal(self):
+        checker = load_script(CHECKER, "known_failing_checker_deep_yaml")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".github/workflows").mkdir(parents=True)
+            deep = "".join("  " * i + "k%d:\n" % i for i in range(600)) + "  " * 600 + "v\n"
+            (root / ".github/workflows/main.yml").write_text(deep, encoding="utf-8")
+            invocations, problems = checker.workflow_invocations(root)
+            self.assertEqual(invocations, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot parse workflow", problems[0])
+
+    def test_trailing_unparsable_step_is_refused(self):
+        f = fixture(self)
+        (f.root / ".github/workflows/main.yml").write_text(
+            "jobs:\n  test:\n    steps:\n      - run: echo ok\n"
+            "      - run: |\n"
+            "          python3 -I scripts/ci/check-cell-results.py \"$out/results.jsonl --require x\n",
+            encoding="utf-8")
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unparsable step mentions a cell checker", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 class ShutdownCrashTests(unittest.TestCase):
     CRASH_BODY = (
@@ -1705,6 +1864,34 @@ class FragmentAdmissionTests(unittest.TestCase):
             output = temp / "merged.json"
             problems = runner.merge_typed_fragments(
                 [(temp / "absent.json", "test_sample.py", [], 1)], output, "github")
+            document = json.loads(output.read_text(encoding="utf-8"))
+            rows = {item["test"]: item for item in document["results"]}
+            self.assertTrue(problems)
+            self.assertEqual(rows["<suite-process>"]["state"], "failed")
+            self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                             "fragment_invalid")
+
+    def test_trailing_malformed_suite_event_is_fragment_invalid(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_trailing_event")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            fragment = temp / "fragment.json"
+            write_json(fragment, {
+                "schema": "p11scope/python-suite-fragment/v1",
+                "path": "tests/python/test_sample.py", "invocation": [], "process_exit": 1,
+                "complete": True,
+                "selection": [{"test": "Sample.test_x"}],
+                "results": [{"test": "Sample.test_x", "state": "failed",
+                             "signature": {"cell": "X", "branch": "B"}}],
+                "suite_events": [
+                    {"event": "tearDownModule", "state": "passed", "signature": None},
+                    {"event": "tearDownModule", "state": "failed", "signature": 42},
+                ],
+            })
+            output = temp / "merged.json"
+            problems = runner.merge_typed_fragments(
+                [(fragment, "test_sample.py", [], 1)], output, "github")
             document = json.loads(output.read_text(encoding="utf-8"))
             rows = {item["test"]: item for item in document["results"]}
             self.assertTrue(problems)
@@ -1919,6 +2106,53 @@ class DriverReadTests(unittest.TestCase):
                                             runner.read_driver(ROOT))
         self.assertEqual(problems, ["tests/python/test_ghost.py is not registered: add it to RUN, "
                                     "DRIVEN or EXCLUDED in scripts/run-python-suites.py"])
+
+    def test_unregistered_trailing_suite_file_is_refused(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_walk")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "tests/python").mkdir(parents=True)
+            (temp / "tests/python/test_a.py").write_text("x = 1\n", encoding="utf-8")
+            (temp / "tests/python/test_zzz_ghost.py").write_text("x = 1\n", encoding="utf-8")
+            problems = runner.registry_problems(
+                runner.present_suites(temp), [("test_a.py", [])], {}, {},
+                runner.read_driver(temp))
+            self.assertEqual(problems, ["tests/python/test_zzz_ghost.py is not registered: add it to RUN, "
+                                        "DRIVEN or EXCLUDED in scripts/run-python-suites.py"])
+
+    def test_undecodable_suite_filename_is_refused(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_badname")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "tests/python").mkdir(parents=True)
+            bad = os.path.join(bytes(temp / "tests/python"), b"test_\xff6.py")
+            with open(bad, "wb") as handle:
+                handle.write(b"x = 1\n")
+            problems = runner.registry_problems(
+                runner.present_suites(temp), [], {}, {}, runner.read_driver(temp))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("is not registered", problems[0])
+
+    def test_unlistable_suite_directory_refuses_members(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_unlistable")
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if str(path).rstrip("/").endswith("tests/python"):
+                raise PermissionError(13, "Permission denied", str(path).rstrip("/"))
+            return real_scandir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "tests/python").mkdir(parents=True)
+            (temp / "tests/python/test_a.py").write_text("x = 1\n", encoding="utf-8")
+            with mock.patch("os.scandir", side_effect=guarded):
+                present = runner.present_suites(temp)
+            self.assertEqual(present, set())
+            problems = runner.registry_problems(
+                present, [("test_a.py", [])], {}, {}, runner.read_driver(temp))
+            self.assertTrue(any("test_a.py" in problem and "does not exist" in problem
+                                for problem in problems))
 
 
 class ScopeSkipTests(unittest.TestCase):
@@ -2318,6 +2552,24 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertFalse(output.exists())
 
+    def test_converter_rejects_trailing_malformed_verdict_typed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            test_name = "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64"
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text(test_name + "\n")
+            verdicts.write_text(test_name + "\tPASS\nNOT-A-VERDICT-LINE\n")
+            converter = ROOT / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                     str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("malformed verdict line 2", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(output.exists())
+
     def test_converter_rejects_undecodable_inputs_typed(self):
         cases = (("verdicts", "cannot read structured records"),
                  ("sidecar", "missing or invalid JSON"))
@@ -2455,7 +2707,7 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
                      temp / "scripts/check-ignored-tests.py")
         (temp / base).mkdir()
-        (temp / base / "bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+        (temp / base / "zzz_bad.rs").write_bytes(b"fn broken_\xff() {}\n")
         (temp / base / "good.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
         return load_script(temp / "scripts/ci/privileged-lib-results.py", label)
 
@@ -2463,22 +2715,172 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
         module = self.token_index_case("privileged_token_index_src", "src")
         index, problems = module.rust_token_index()
         self.assertEqual(index.get("ExampleToken"), {"src/good.rs"})
-        self.assertEqual(problems, ["cannot read Rust source src/bad.rs: 'utf-8' codec can't decode "
+        self.assertEqual(problems, ["cannot read Rust source src/zzz_bad.rs: 'utf-8' codec can't decode "
                                     "byte 0xff in position 10: invalid start byte"])
 
     def test_undecodable_tests_rust_source_is_reported(self):
         module = self.token_index_case("privileged_token_index_tests", "tests")
         index, problems = module.rust_token_index()
         self.assertEqual(index.get("ExampleToken"), {"tests/good.rs"})
-        self.assertEqual(problems, ["cannot read Rust source tests/bad.rs: 'utf-8' codec can't decode "
+        self.assertEqual(problems, ["cannot read Rust source tests/zzz_bad.rs: 'utf-8' codec can't decode "
                                     "byte 0xff in position 10: invalid start byte"])
 
     def test_undecodable_crates_rust_source_is_reported(self):
         module = self.token_index_case("privileged_token_index_crates", "crates")
         index, problems = module.rust_token_index()
         self.assertEqual(index.get("ExampleToken"), {"crates/good.rs"})
-        self.assertEqual(problems, ["cannot read Rust source crates/bad.rs: 'utf-8' codec can't decode "
+        self.assertEqual(problems, ["cannot read Rust source crates/zzz_bad.rs: 'utf-8' codec can't decode "
                                     "byte 0xff in position 10: invalid start byte"])
+
+    def token_index_blocked_case(self, label, base):
+        temp = Path(tempfile.mkdtemp(prefix="known-failing-token-blocked-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        (temp / "scripts/ci").mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                     temp / "scripts/ci/privileged-lib-results.py")
+        shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                     temp / "scripts/check-ignored-tests.py")
+        (temp / base / "blocked").mkdir(parents=True)
+        (temp / base / "ok.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+        (temp / base / "blocked/x.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+        return temp, load_script(temp / "scripts/ci/privileged-lib-results.py", label)
+
+    def blocked_scandir(self, temp):
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if Path(path).name == "blocked" and str(temp) in str(path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        return guarded
+
+    def test_unreadable_src_directory_is_reported(self):
+        temp, module = self.token_index_blocked_case("privileged_token_blocked_src", "src")
+        with mock.patch("os.scandir", side_effect=self.blocked_scandir(temp)):
+            index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"src/ok.rs"})
+        self.assertEqual(problems, [f"cannot scan directory {temp}/src/blocked: Permission denied"])
+
+    def test_unreadable_tests_directory_is_reported(self):
+        temp, module = self.token_index_blocked_case("privileged_token_blocked_tests", "tests")
+        with mock.patch("os.scandir", side_effect=self.blocked_scandir(temp)):
+            index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"tests/ok.rs"})
+        self.assertEqual(problems, [f"cannot scan directory {temp}/tests/blocked: Permission denied"])
+
+    def test_unreadable_crates_directory_is_reported(self):
+        temp, module = self.token_index_blocked_case("privileged_token_blocked_crates", "crates")
+        with mock.patch("os.scandir", side_effect=self.blocked_scandir(temp)):
+            index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"crates/ok.rs"})
+        self.assertEqual(problems, [f"cannot scan directory {temp}/crates/blocked: Permission denied"])
+
+    def token_index_dangling_case(self, label, base):
+        temp = Path(tempfile.mkdtemp(prefix="known-failing-token-dangling-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        (temp / "scripts/ci").mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                     temp / "scripts/ci/privileged-lib-results.py")
+        shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                     temp / "scripts/check-ignored-tests.py")
+        (temp / base).mkdir()
+        (temp / base / "good.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+        os.symlink(temp / base / "gone.rs", temp / base / "zzz_dangling.rs")
+        return load_script(temp / "scripts/ci/privileged-lib-results.py", label)
+
+    def test_dangling_src_rust_link_is_reported(self):
+        module = self.token_index_dangling_case("privileged_token_dangling_src", "src")
+        index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"src/good.rs"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot read Rust source src/zzz_dangling.rs", problems[0])
+
+    def test_dangling_tests_rust_link_is_reported(self):
+        module = self.token_index_dangling_case("privileged_token_dangling_tests", "tests")
+        index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"tests/good.rs"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot read Rust source tests/zzz_dangling.rs", problems[0])
+
+    def test_dangling_crates_rust_link_is_reported(self):
+        module = self.token_index_dangling_case("privileged_token_dangling_crates", "crates")
+        index, problems = module.rust_token_index()
+        self.assertEqual(index.get("ExampleToken"), {"crates/good.rs"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot read Rust source crates/zzz_dangling.rs", problems[0])
+
+    def test_hidden_duplicate_token_refuses_conversion(self):
+        temp = Path(tempfile.mkdtemp(prefix="known-failing-token-flip-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        (temp / "scripts/ci").mkdir(parents=True)
+        (temp / "tests").mkdir()
+        shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                     temp / "scripts/ci/privileged-lib-results.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     temp / "scripts/check-known-failing.py")
+        shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                     temp / "scripts/check-ignored-tests.py")
+        (temp / "tests/ignored-tests.json").write_text(
+            '{"schema": "p11scope/ignored-tests/v1", "sites": []}\n', encoding="utf-8")
+        (temp / "src/blocked").mkdir(parents=True)
+        (temp / "src/visible.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+        (temp / "src/blocked/hidden.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+        selection = temp / "selection.txt"
+        verdicts = temp / "verdicts.tsv"
+        output = temp / "out.json"
+        selection.write_text("ExampleToken\n", encoding="utf-8")
+        verdicts.write_text("ExampleToken\tPASS\n", encoding="utf-8")
+        module = load_script(temp / "scripts/ci/privileged-lib-results.py",
+                             "privileged_token_flip")
+        with mock.patch("os.scandir", side_effect=self.blocked_scandir(temp)):
+            code = module.main([str(selection), str(verdicts), str(output), "github"])
+        self.assertEqual(code, 1)
+        self.assertFalse(output.exists())
+
+    def test_blocked_directory_never_greens_conversion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "scripts/ci").mkdir(parents=True)
+            (temp / "tests").mkdir()
+            shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                         temp / "scripts/ci/privileged-lib-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                         temp / "scripts/check-ignored-tests.py")
+            (temp / "tests/ignored-tests.json").write_text(
+                '{"schema": "p11scope/ignored-tests/v1", "sites": []}\n', encoding="utf-8")
+            (temp / "src/blocked").mkdir(parents=True)
+            (temp / "src/visible.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+            (temp / "src/blocked/hidden.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text("ExampleToken\n", encoding="utf-8")
+            verdicts.write_text("ExampleToken\tPASS\n", encoding="utf-8")
+            converter = temp / "scripts/ci/privileged-lib-results.py"
+            command = [sys.executable, "-I", str(converter), str(selection),
+                       str(verdicts), str(output), "github"]
+            control = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(control.returncode, 0, control.stdout)
+            self.assertIn("no unambiguous Rust source path", control.stderr)
+            os.chmod(temp / "src/blocked", 0)
+            try:
+                try:
+                    os.listdir(temp / "src/blocked")
+                    listable = True
+                except OSError:
+                    listable = False
+                blocked = subprocess.run(command, capture_output=True, text=True)
+            finally:
+                os.chmod(temp / "src/blocked", 0o755)
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+            self.assertNotIn("Traceback", blocked.stderr)
+            if listable:
+                self.assertIn("no unambiguous Rust source path", blocked.stderr)
+            else:
+                self.assertIn("cannot scan directory", blocked.stderr)
 
     def test_undecodable_rust_source_refuses_conversion(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3940,7 +4342,229 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     outcomes[label] = False
         self.record(results, "merge-output-write", outcomes["original"], outcomes["mutant"])
 
-        total = 64
+        # Every RUN entry is validated before any lookup: skipping one
+        # clause lets a trailing malformed entry hide behind a match.
+        clause_cases = (
+            ("registry-entry-shape",
+             "        if not isinstance(item, (list, tuple)) or len(item) != 2:\n            return None",
+             "RUN = [('test_sample.py', []), 123]\n"),
+            ("registry-entry-name",
+             "        if not isinstance(entry, str) or not entry:\n            return None",
+             "RUN = [('test_sample.py', []), ('', [])]\n"),
+            ("registry-entry-args",
+             "        if not isinstance(args, (list, tuple)):\n            return None",
+             "RUN = [('test_sample.py', []), ('x.py', 5)]\n"),
+            ("registry-entry-argtype",
+             "        if not all(isinstance(arg, str) for arg in args):\n            return None",
+             "RUN = [('test_sample.py', []), ('x.py', ['ok', 1])]\n"),
+        )
+        for mutant_name, old, body in clause_cases:
+            clause_mutant = self.mutate_source(
+                ROOT / "scripts/check-known-failing.py", old,
+                old.replace("return None", "continue"))
+            outcomes = {}
+            for label, source in (("original", helper_source), ("mutant", clause_mutant)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    script = temp / "check-known-failing.py"
+                    script.write_text(source, encoding="utf-8")
+                    (temp / "scripts").mkdir()
+                    (temp / "scripts/run-python-suites.py").write_text(body, encoding="utf-8")
+                    module = load_script(script, f"checker_clause_{label}_{mutant_name}")
+                    probe_row = {"path": "tests/python/test_sample.py",
+                                 "runner": "python-suite", "invocation": []}
+                    outcomes[label] = module.python_suite_registered(temp, probe_row) is False
+            self.record(results, mutant_name, outcomes["original"], outcomes["mutant"])
+
+        # A syntax-broken registry refuses registration instead of
+        # raising: dropping the parse boundary reopens the traceback.
+        parse_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    try:\n        tree = ast.parse(text)\n    except SyntaxError:\n        return None",
+            "    try:\n        tree = ast.parse(text)\n    except LookupError:\n        return None")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", parse_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / "scripts").mkdir()
+                (temp / "scripts/run-python-suites.py").write_text(
+                    "RUN = " + "[" * 10000 + "]" * 10000 + "\n", encoding="utf-8")
+                module = load_script(script, f"checker_parse_{label}")
+                probe_row = {"path": "tests/python/test_sample.py",
+                             "runner": "python-suite", "invocation": []}
+                try:
+                    outcomes[label] = module.python_suite_registered(temp, probe_row) is False
+                except SyntaxError:
+                    outcomes[label] = False
+        self.record(results, "registry-parse-decode", outcomes["original"], outcomes["mutant"])
+
+        # Absurdly nested JSON is an invalid document, never a crash.
+        recursion_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (json.JSONDecodeError, DuplicateKeyError, ValueError, RecursionError) as exc:",
+            "    except (json.JSONDecodeError, DuplicateKeyError, ValueError) as exc:")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", recursion_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"checker_recursion_{label}")
+                try:
+                    data, problems = module.strict_json(
+                        "[" * 1000000 + "]" * 1000000, "deep")
+                except RecursionError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = data is module.PARSE_FAILED and problems != []
+        self.record(results, "strict-json-recursion", outcomes["original"], outcomes["mutant"])
+
+        # Absurdly nested workflows are unparsable documents, never crashes.
+        yaml_recursion_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:",
+            "        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", yaml_recursion_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / ".github/workflows").mkdir(parents=True)
+                deep = "".join("  " * i + "k%d:\n" % i for i in range(600))
+                (temp / ".github/workflows/main.yml").write_text(
+                    deep + "  " * 600 + "v\n", encoding="utf-8")
+                module = load_script(script, f"workflow_recursion_{label}")
+                try:
+                    _invocations, problems = module.workflow_invocations(temp)
+                except RecursionError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = problems != []
+        self.record(results, "workflow-yaml-recursion", outcomes["original"], outcomes["mutant"])
+
+        # An unlistable workflow directory is a typed problem, never
+        # an escaped PermissionError.
+        listing_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    try:\n"
+            "        entries = sorted(workflow_dir.iterdir())\n"
+            "    except OSError as exc:\n"
+            "        return [], [f\"{workflow_dir}: cannot list workflow directory: {exc}\"]",
+            "    entries = sorted(workflow_dir.iterdir())")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", listing_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / ".github/workflows").mkdir(parents=True)
+                (temp / ".github/workflows/main.yml").write_text("jobs: {}\n", encoding="utf-8")
+                module = load_script(script, f"workflow_listing_{label}")
+                real_scandir = os.scandir
+
+                def guarded(path, *args, **kwargs):
+                    if str(path).endswith(".github/workflows"):
+                        raise PermissionError(13, "Permission denied", str(path))
+                    return real_scandir(path, *args, **kwargs)
+
+                with mock.patch("os.scandir", side_effect=guarded):
+                    try:
+                        _invocations, problems = module.workflow_invocations(temp)
+                    except PermissionError:
+                        outcomes[label] = False
+                    else:
+                        outcomes[label] = problems != []
+        self.record(results, "workflow-dir-listing", outcomes["original"], outcomes["mutant"])
+
+        # Malformed ignored-registry sites refuse the whole mapping
+        # instead of being skipped into partial evidence.
+        site_shape_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        if not isinstance(site, dict) or not isinstance(site.get(\"file\"), str) or not isinstance(site.get(\"path\"), str):\n"
+            "            return {}, [f\"{path}: ignored-test registry site {index} must have string file and path\"]",
+            "        if not isinstance(site, dict) or not isinstance(site.get(\"file\"), str) or not isinstance(site.get(\"path\"), str):\n"
+            "            continue")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", site_shape_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                registry = temp / "ignored-tests.json"
+                registry.write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "src/a.rs", "path": "X"}, {"file": 1, "path": "Y"}]}\n',
+                    encoding="utf-8")
+                module = load_script(script, f"ignored_shape_{label}")
+                _files, problems = module.load_ignored_registry(registry)
+                outcomes[label] = problems != []
+        self.record(results, "ignored-site-shape", outcomes["original"], outcomes["mutant"])
+
+        # Ambiguous ignored-registry paths refuse the whole mapping
+        # instead of collapsing to one claimant.
+        site_ambiguous_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        if site[\"path\"] in files and files[site[\"path\"]] != site[\"file\"]:\n"
+            "            return {}, [f\"{path}: ignored-test registry path {site['path']!r} is claimed by more than one file\"]",
+            "        pass")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", site_ambiguous_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                registry = temp / "ignored-tests.json"
+                registry.write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "src/a.rs", "path": "X"}, '
+                    '{"file": "src/b.rs", "path": "X"}]}\n',
+                    encoding="utf-8")
+                module = load_script(script, f"ignored_ambiguous_{label}")
+                _files, problems = module.load_ignored_registry(registry)
+                outcomes[label] = problems != []
+        self.record(results, "ignored-site-ambiguous", outcomes["original"], outcomes["mutant"])
+
+        # Rust scan problems refuse the privileged conversion instead
+        # of being ignored into a shrunken token set.
+        scan_propagate_mutant = self.mutate_source(
+            ROOT / "scripts/ci/privileged-lib-results.py",
+            "    index, index_problems = rust_token_index()\n"
+            "    if index_problems:\n"
+            "        print(f\"privileged-lib-results: {'; '.join(index_problems)}\", file=sys.stderr)\n"
+            "        return 1",
+            "    index, index_problems = rust_token_index()")
+        outcomes = {}
+        for label, source in (("original", privileged_source), ("mutant", scan_propagate_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "tests").mkdir()
+                (temp / "scripts/check-known-failing.py").write_text(
+                    CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                             temp / "scripts/check-ignored-tests.py")
+                (temp / "tests/ignored-tests.json").write_text(
+                    '{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                    '{"file": "src/a.rs", "path": "X"}]}\n', encoding="utf-8")
+                (temp / "src").mkdir()
+                (temp / "src/zzz_bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+                script = temp / "scripts/ci/privileged-lib-results.py"
+                script.write_text(source, encoding="utf-8")
+                selection = temp / "selection.txt"
+                verdicts = temp / "verdicts.tsv"
+                output = temp / "out.json"
+                selection.write_text("X\n", encoding="utf-8")
+                verdicts.write_text("X\tPASS\n", encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(selection),
+                                      str(verdicts), str(output), "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0
+        self.record(results, "privileged-scan-propagate", outcomes["original"], outcomes["mutant"])
+
+        total = 75
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

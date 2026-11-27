@@ -803,6 +803,37 @@ class TypedCellResultsTests(unittest.TestCase):
             self.assertIn("require file", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
 
+    def test_trailing_malformed_row_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(
+                json.dumps({"cell": "a", "pass": True, "detail": "d",
+                            "qualification": "qualified"}) + "\n"
+                '{"cell": "b", "pass": "yes"}\n', encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path), "--require", "a"],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("line 2", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_trailing_malformed_require_line_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                             "qualification": "qualified"}) + "\n", encoding="utf-8")
+            require_path = temp / "require.txt"
+            require_path.write_text("a\nnot one cell\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path),
+                 "--require-file", str(require_path)],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not one exact cell name", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_unreadable_registry_fails_typed_emit_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             temp = Path(tmp)

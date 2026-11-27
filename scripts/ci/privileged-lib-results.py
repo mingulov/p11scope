@@ -59,9 +59,10 @@ def rust_token_index():
         base = ROOT / base_name
         if not base.is_dir():
             continue
-        for path in sorted(base.rglob("*.rs")):
-            if any(segment in scanner.EXCLUDED_SEGMENTS for segment in path.parts):
-                continue
+        files, scan_problems = scanner.scan_tree_files(
+            base, lambda name: name.endswith(".rs"), scanner.EXCLUDED_SEGMENTS)
+        problems.extend(scan_problems)
+        for path in files:
             try:
                 stripped = scanner.strip_code(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError) as exc:

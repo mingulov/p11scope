@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check-ignored-tests.py"
@@ -2789,8 +2790,10 @@ class InventoryDecodeSweepTests(unittest.TestCase):
                 '        return set(), [], [f"{inventory_path}: missing inventory file"]',
                 "        return set(), [], []"),
             "inventory-decode-untyped": (
-                "    except (OSError, UnicodeDecodeError) as exc:",
-                "    except OSError as exc:"),
+                "    except (OSError, UnicodeDecodeError) as exc:\n"
+                "        return set(), [], [f\"{inventory_path}: cannot read inventory: {exc}\"]",
+                "    except OSError as exc:\n"
+                "        return set(), [], [f\"{inventory_path}: cannot read inventory: {exc}\"]"),
             "inventory-dup-keys": (
                 "    data, parse_problems = checker.strict_json(raw, str(inventory_path))",
                 "    data, parse_problems = json.loads(raw), []"),
@@ -2831,6 +2834,295 @@ class InventoryDecodeSweepTests(unittest.TestCase):
                     failures.append(f"{name}(original={original_errors!r},mutant={mutant_errors!r})")
         self.assertEqual(failures, [], f"surviving mutants: {failures}; killed {killed}/{len(mutations)}")
         print(f"ignored-tests mutation sweep: {killed}/{len(mutations)} killed")
+
+
+class ScanTreeTests(unittest.TestCase):
+    def test_scan_lists_matching_files_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "sub").mkdir()
+            (temp / "b.rs").write_text("x\n", encoding="utf-8")
+            (temp / "a.rs").write_text("x\n", encoding="utf-8")
+            (temp / "sub/c.rs").write_text("x\n", encoding="utf-8")
+            (temp / "note.txt").write_text("x\n", encoding="utf-8")
+            files, problems = CHECKER_MOD["scan_tree_files"](
+                temp, lambda name: name.endswith(".rs"))
+            self.assertEqual(problems, [])
+            self.assertEqual(files, [temp / "a.rs", temp / "b.rs", temp / "sub/c.rs"])
+
+    def test_scan_prunes_excluded_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "target").mkdir()
+            (temp / "target/hidden.rs").write_text("x\n", encoding="utf-8")
+            (temp / "ok.rs").write_text("x\n", encoding="utf-8")
+            files, problems = CHECKER_MOD["scan_tree_files"](
+                temp, lambda name: name.endswith(".rs"), ("target",))
+            self.assertEqual(problems, [])
+            self.assertEqual(files, [temp / "ok.rs"])
+
+    def test_scan_missing_top_is_a_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files, problems = CHECKER_MOD["scan_tree_files"](
+                Path(tmp) / "absent", lambda name: True)
+            self.assertEqual(files, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot scan directory", problems[0])
+
+    def test_scan_unreadable_subdirectory_is_a_problem(self):
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if Path(path).name == "blocked":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "blocked").mkdir()
+            (temp / "blocked/x.rs").write_text("x\n", encoding="utf-8")
+            (temp / "ok.rs").write_text("x\n", encoding="utf-8")
+            with mock.patch("os.scandir", side_effect=guarded):
+                files, problems = CHECKER_MOD["scan_tree_files"](
+                    temp, lambda name: name.endswith(".rs"))
+            self.assertEqual(files, [temp / "ok.rs"])
+            self.assertEqual(len(problems), 1)
+            self.assertTrue(problems[0].endswith("blocked: Permission denied"))
+
+    def test_scan_dir_files_reports_unlistable_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "a.rs").write_text("x\n", encoding="utf-8")
+            files, problems = CHECKER_MOD["scan_dir_files"](
+                temp, lambda name: name.endswith(".rs"))
+            self.assertEqual(files, [temp / "a.rs"])
+            self.assertEqual(problems, [])
+
+            def guarded(path, *args, **kwargs):
+                raise PermissionError(13, "Permission denied", str(path))
+
+            with mock.patch("os.scandir", side_effect=guarded):
+                files, problems = CHECKER_MOD["scan_dir_files"](
+                    temp, lambda name: name.endswith(".rs"))
+            self.assertEqual(files, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("cannot scan directory", problems[0])
+
+
+class ScanErrorTests(unittest.TestCase):
+    def inventory_tree(self, tmp):
+        temp = Path(tmp)
+        (temp / "tests").mkdir(exist_ok=True)
+        inventory = temp / "tests/ignored-tests.json"
+        inventory.write_text(json.dumps({
+            "sites": [], "cells": {"privileged": "test cell"}}), encoding="utf-8")
+        return temp, inventory
+
+    def test_undecodable_source_is_a_typed_scan_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "src").mkdir()
+            (temp / "src/bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+            found, errors = CHECKER_MOD["scan_sources"](temp)
+            self.assertEqual(found, {})
+            self.assertTrue(any("cannot read source" in error for error in errors))
+
+    def test_trailing_malformed_inventory_entry_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            inventory.write_text(json.dumps({
+                "sites": [{"file": "src/a.rs", "path": "X", "reason": "r",
+                           "cell": "helper"}, 42],
+                "cells": {"helper": "test cell"}}), encoding="utf-8")
+            failures = CHECKER_MOD["check"](root=temp, inventory=inventory,
+                                            runner=temp / "none.sh")
+            self.assertTrue(any("not an object" in failure for failure in failures))
+
+    def test_hidden_ignore_in_blocked_directory_is_refused(self):
+        real_scandir = os.scandir
+
+        def guarded(path, *args, **kwargs):
+            if Path(path).name == "blocked":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            (temp / "src/blocked").mkdir(parents=True)
+            (temp / "src/ok.rs").write_text("fn ok() {}\n", encoding="utf-8")
+            (temp / "src/blocked/hidden.rs").write_text(
+                "#[ignore]\nfn hidden() {}\n", encoding="utf-8")
+            with mock.patch("os.scandir", side_effect=guarded):
+                blocked = CHECKER_MOD["check"](root=temp, inventory=inventory,
+                                               runner=temp / "none.sh")
+            self.assertTrue(any("cannot scan directory" in failure for failure in blocked))
+            control = CHECKER_MOD["check"](root=temp, inventory=inventory,
+                                           runner=temp / "none.sh")
+            self.assertTrue(any("hidden.rs" in failure for failure in control))
+
+    def test_blocked_directory_cli_never_greens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            (temp / "src/blocked").mkdir(parents=True)
+            (temp / "src/ok.rs").write_text("fn ok() {}\n", encoding="utf-8")
+            (temp / "src/blocked/hidden.rs").write_text(
+                "#[ignore]\nfn hidden() {}\n", encoding="utf-8")
+            command = [sys.executable, "-I", str(CHECKER), "--root", str(temp),
+                       "--runner", str(temp / "none.sh")]
+            control = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(control.returncode, 0, control.stdout)
+            self.assertIn("hidden.rs", control.stdout)
+            os.chmod(temp / "src/blocked", 0)
+            try:
+                try:
+                    os.listdir(temp / "src/blocked")
+                    listable = True
+                except OSError:
+                    listable = False
+                blocked = subprocess.run(command, capture_output=True, text=True)
+            finally:
+                os.chmod(temp / "src/blocked", 0o755)
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+            self.assertNotIn("Traceback", blocked.stdout + blocked.stderr)
+            if listable:
+                self.assertIn("hidden.rs", blocked.stdout)
+            else:
+                self.assertIn("cannot scan directory", blocked.stdout)
+
+    def test_undecodable_source_cli_is_typed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            (temp / "src").mkdir()
+            (temp / "src/bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), "--root", str(temp),
+                 "--runner", str(temp / "none.sh")],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("cannot read source", result.stdout)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_unreadable_macro_source_is_typed_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "macros.rs"
+            bad.write_bytes(b"macro_rules! m \xff {}\n")
+            expansions, error = CHECKER_MOD["macro_expansions"](bad, "m")
+            self.assertEqual(expansions, [])
+            self.assertIn("cannot read macro source", error)
+
+    def test_healthy_macro_source_expands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "macros.rs"
+            good.write_text("macro_rules! m { ($n:ident) => {}; }\nm!(thing);\n",
+                            encoding="utf-8")
+            expansions, error = CHECKER_MOD["macro_expansions"](good, "m")
+            self.assertIsNone(error)
+            self.assertEqual([name for name, _ in expansions], ["thing"])
+
+    def test_undecodable_manifest_is_typed_unknown_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp, inventory = self.inventory_tree(tmp)
+            (temp / "Cargo.toml").write_bytes(b'[package]\nversion = "\xff"\n')
+            failures = CHECKER_MOD["check"](root=temp, inventory=inventory,
+                                            runner=temp / "none.sh")
+            self.assertTrue(any("cannot read a package version" in failure
+                                for failure in failures))
+
+
+class InventoryScanSweepTests(unittest.TestCase):
+    def test_scan_mutation_sweep(self):
+        source = CHECKER.read_text(encoding="utf-8")
+        mutations = {
+            "scan-onerror-drop": (
+                "        problems.append(f\"cannot scan directory {exc.filename}: {exc.strerror or exc}\")",
+                "        pass"),
+            "scanfile-decode-drop": (
+                "    except (OSError, UnicodeDecodeError) as exc:\n"
+                "        return [], [f\"cannot read source: {exc}\"]",
+                "    except OSError as exc:\n"
+                "        return [], [f\"cannot read source: {exc}\"]"),
+            "inventory-scan-propagate": (
+                "    failures.extend(f\"FAIL scan: {e}\" for e in scan_errors)",
+                "    pass"),
+            "macro-read-decode": (
+                "    except (OSError, UnicodeDecodeError) as exc:\n"
+                "        return [], f\"cannot read macro source {path}: {exc}\"",
+                "    except OSError as exc:\n"
+                "        return [], f\"cannot read macro source {path}: {exc}\""),
+        }
+        killed = 0
+        failures = []
+        for name, (old, new) in mutations.items():
+            self.assertIn(old, source, name)
+            with tempfile.TemporaryDirectory() as tmp:
+                temp = Path(tmp)
+                (temp / "scripts").mkdir()
+                (temp / "scripts/check-known-failing.py").write_text(
+                    (ROOT / "scripts/check-known-failing.py").read_text(encoding="utf-8"),
+                    encoding="utf-8")
+                script = temp / "scripts/check-ignored-tests.py"
+                script.write_text(source.replace(old, new, 1), encoding="utf-8")
+                module = runpy.run_path(str(script))
+                killed_here = self.run_scan_oracle(module, name, temp)
+                if killed_here:
+                    killed += 1
+                else:
+                    failures.append(name)
+        self.assertEqual(failures, [], f"surviving mutants: {failures}; killed {killed}/{len(mutations)}")
+        print(f"ignored-tests scan sweep: {killed}/{len(mutations)} killed")
+
+    def run_scan_oracle(self, module, name, temp):
+        if name == "scan-onerror-drop":
+            (temp / "tree/blocked").mkdir(parents=True)
+            (temp / "tree/blocked/x.rs").write_text("x\n", encoding="utf-8")
+            (temp / "tree/ok.rs").write_text("x\n", encoding="utf-8")
+            real_scandir = os.scandir
+
+            def guarded(path, *args, **kwargs):
+                if Path(path).name == "blocked":
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            with mock.patch("os.scandir", side_effect=guarded):
+                _files, original = CHECKER_MOD["scan_tree_files"](
+                    temp / "tree", lambda n: n.endswith(".rs"))
+                _files, mutant = module["scan_tree_files"](
+                    temp / "tree", lambda n: n.endswith(".rs"))
+            return original != [] and mutant == []
+        if name == "scanfile-decode-drop":
+            bad = temp / "bad.rs"
+            bad.write_bytes(b"fn broken_\xff() {}\n")
+            _sites, original = CHECKER_MOD["scan_file"](bad, {})
+            try:
+                _sites, mutant = module["scan_file"](bad, {})
+            except UnicodeDecodeError:
+                return original != []
+            return False
+        if name == "inventory-scan-propagate":
+            (temp / "root/tests").mkdir(parents=True)
+            (temp / "root/tests/ignored-tests.json").write_text(json.dumps({
+                "sites": [], "cells": {"privileged": "test cell"}}), encoding="utf-8")
+            (temp / "root/src").mkdir()
+            (temp / "root/src/bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+            original = CHECKER_MOD["check"](
+                root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                runner=temp / "root/nonexistent.sh")
+            mutant = module["check"](
+                root=temp / "root", inventory=temp / "root/tests/ignored-tests.json",
+                runner=temp / "root/nonexistent.sh")
+            original_scan = [f for f in original if "FAIL scan" in f]
+            mutant_scan = [f for f in mutant if "FAIL scan" in f]
+            return original_scan != [] and mutant_scan == []
+        if name == "macro-read-decode":
+            bad = temp / "macros.rs"
+            bad.write_bytes(b"macro_rules! m \xff {}\n")
+            _expansions, original = CHECKER_MOD["macro_expansions"](bad, "m")
+            try:
+                _expansions, mutant = module["macro_expansions"](bad, "m")
+            except UnicodeDecodeError:
+                return original is not None
+            return False
+        raise AssertionError(f"unknown scan mutant {name}")
 
 
 if __name__ == "__main__":

@@ -162,7 +162,7 @@ def strict_json(text, label):
     try:
         return json.loads(text, object_pairs_hook=object_no_duplicates,
                           parse_constant=reject_json_constant), []
-    except (json.JSONDecodeError, DuplicateKeyError, ValueError) as exc:
+    except (json.JSONDecodeError, DuplicateKeyError, ValueError, RecursionError) as exc:
         return PARSE_FAILED, [f"{label}: invalid JSON: {exc}"]
 
 
@@ -522,7 +522,10 @@ def registry_run_entries(registry_path):
     The suite registry is never executed here: the production runner
     needs module globals (`__file__`) at import time, so executing it
     in a probe namespace crashes on the valid real file. The RUN
-    assignment is a plain literal; anything else refuses the row.
+    assignment is a plain literal, and every entry is validated
+    before any lookup: one malformed entry refuses the whole
+    registry. Entries are (nonempty name, args) pairs with string
+    arguments.
     """
     try:
         text = registry_path.read_text(encoding="utf-8")
@@ -546,6 +549,16 @@ def registry_run_entries(registry_path):
             run_value = None
     if not run_seen or not isinstance(run_value, list):
         return None
+    for item in run_value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        entry, args = item
+        if not isinstance(entry, str) or not entry:
+            return None
+        if not isinstance(args, (list, tuple)):
+            return None
+        if not all(isinstance(arg, str) for arg in args):
+            return None
     return run_value
 
 
@@ -560,15 +573,7 @@ def python_suite_registered(root, row):
         return False
     name = row["path"][len(prefix):]
     invocation = row_invocation(row)
-    for item in entries:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            return False
-        entry, args = item
-        if not isinstance(args, (list, tuple)):
-            return False
-        if entry == name and list(args) == invocation:
-            return True
-    return False
+    return any(entry == name and list(args) == invocation for entry, args in entries)
 
 
 def shell_string_array(text, name):
@@ -703,13 +708,17 @@ def workflow_invocations(root):
     problems = []
     if not workflow_dir.is_dir():
         return [], [f"{workflow_dir}: missing workflow directory"]
-    for path in sorted(workflow_dir.iterdir()):
+    try:
+        entries = sorted(workflow_dir.iterdir())
+    except OSError as exc:
+        return [], [f"{workflow_dir}: cannot list workflow directory: {exc}"]
+    for path in entries:
         if path.suffix not in (".yml", ".yaml") or not path.is_file():
             problems.append(f"{path}: unknown workflow directory entry: only .yml and .yaml files are workflows")
             continue
         try:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
             problems.append(f"{path}: cannot parse workflow: {exc}")
             continue
         jobs = document.get("jobs") if isinstance(document, dict) else None
@@ -858,8 +867,10 @@ def load_ignored_registry(path):
     so each caller applies its own missing-file policy visibly; every
     other read failure yields a typed problem, as does a present file
     that fails strict parsing or is not an object with a sites list.
-    Entries that are not {file, path} string pairs are skipped; paths
-    claimed by more than one file are dropped as ambiguous.
+    Every site is validated before any mapping: a site that is not a
+    {file, path} string pair, or a path claimed by more than one
+    file, refuses the whole registry instead of yielding partial
+    evidence.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -872,15 +883,12 @@ def load_ignored_registry(path):
         detail = f" ({load_problems[0]})" if load_problems else ""
         return {}, [f"{path}: ignored-test registry must be an object with a sites list{detail}"]
     files = {}
-    ambiguous = set()
-    for site in registry["sites"]:
+    for index, site in enumerate(registry["sites"], 1):
         if not isinstance(site, dict) or not isinstance(site.get("file"), str) or not isinstance(site.get("path"), str):
-            continue
+            return {}, [f"{path}: ignored-test registry site {index} must have string file and path"]
         if site["path"] in files and files[site["path"]] != site["file"]:
-            ambiguous.add(site["path"])
+            return {}, [f"{path}: ignored-test registry path {site['path']!r} is claimed by more than one file"]
         files[site["path"]] = site["file"]
-    for claimed in ambiguous:
-        del files[claimed]
     return files, []
 
 

@@ -4124,7 +4124,8 @@ def exact_manifest_object_fallbacks(evidence):
 
 def surface_signature(evidence):
     surfaces = evidence["surfaces"]
-    require(surfaces, "evidence.surfaces is empty")
+    # No emptiness assert: an empty list already fails the exact Counter
+    # equality at every call site, which prints the surfaces.
     require(
         all(surface["acquisition"] == "ok" for surface in surfaces),
         f"surface acquisition failure: {surfaces}",
@@ -4133,7 +4134,8 @@ def surface_signature(evidence):
 
 
 def table_signature(evidence):
-    require(len(evidence["discovery"]) == 1, evidence["discovery"])
+    # No one-provider assert: the shape caller runs behind its kept one
+    # and the row caller behind the induced head / canary shape.
     return Counter(
         (table["source"], tuple(table["version"]), table["entries"])
         for table in evidence["discovery"][0]["tables"]
@@ -4188,7 +4190,9 @@ def version_canary_scan_shape(evidence, target_bits):
         require(u64(end), "raw table extent overflows")
         groups.setdefault(offset, []).append(table)
 
-    def anchored(table, wanted):
+    def anchored(table):
+        wanted = expected_scan_agreement(
+            tuple(table["version"]), table["entries"])
         require(table.get("linkage") == "heuristic"
                 and type(table.get("exports_agreeing")) is int
                 and table["exports_agreeing"] == wanted,
@@ -4204,8 +4208,8 @@ def version_canary_scan_shape(evidence, target_bits):
         require(len(ordered_views) == 2 and all(table["version"] == version for table in views)
                 and ordered_views[0]["entries"] == 68 and 70 <= ordered_views[1]["entries"] <= 92,
                 "duplicate or conflicting same-base fixture views")
-        anchored(ordered_views[0], 1)
-        anchored(ordered_views[1], 3)
+        anchored(ordered_views[0])
+        anchored(ordered_views[1])
     ordered = sorted((offset, max(offset + word * (table["entries"] + 1) for table in views))
                      for offset, views in groups.items())
     require(all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:])),
@@ -4228,7 +4232,7 @@ def version_canary_scan_shape(evidence, target_bits):
                 require(word * (count + 1) == page - offset % page,
                         "partial fixture prefix does not end at its page boundary")
         else:
-            anchored(prefix, 3 if count == 92 else 1)
+            anchored(prefix)
             if count == 92:
                 require(paired, "recovered extension lacks its same-base common prefix")
         # A complete92 row may cross pages: no VMA-end witness is published.
@@ -4283,8 +4287,10 @@ def exact_canary_surface_records(evidence, manifest_records, scan_records):
     scan-interface row, or any leftover fails. The deceptive interface[9]
     has no manifest record, so any interface[9] row fails as unaccounted.
     """
+    # No one-provider assert: the canary entry guards it in
+    # version_canary_scan_shape and the induced entry in its head, both
+    # before this runs.
     modules = evidence["discovery"]
-    require(len(modules) == 1, "canary surfaces need one provider")
     module_path = modules[0]["path"]
     require(
         type(module_path) is str and module_path,
@@ -4335,12 +4341,11 @@ def exact_canary_surface_records(evidence, manifest_records, scan_records):
             f"scan table {major}.{minor}",
         )
     # The deceptive interface[9] has no manifest record, so any
-    # interface[9] row lands here as unaccounted: the exclusion is the
+    # interface[9] row fails its take above: the exclusion is the
     # partition itself, with derive_matrix_manifest_records asserting at
-    # import that no record carries it. Defense in depth: the count
-    # backstop (exact_shape) runs before this check, so any row left
-    # over here already failed there as a Counter mismatch.
-    require(not remaining, f"canary has unaccounted surfaces: {remaining!r}")
+    # import that no record carries it. No leftover assert: exact_shape
+    # runs first with the same multiset, so a passing Counter plus
+    # passing takes leave nothing over by counting.
 
 
 TABLE_ROW_KEYS = frozenset(
@@ -4349,6 +4354,32 @@ TABLE_ROW_KEYS = frozenset(
 SCAN_LINKAGE_VOCABULARY = frozenset(
     {"interface", "live_return", "manifest", "exports", "heuristic"}
 )
+# Exported-getter ordinals per scanned table version, from the fixture's
+# fill_table calls: slot 3 always holds C_GetFunctionList, slots 68/69
+# hold the interface getters exactly under anchors=1 (t30/t31/t32/
+# tfuture/tunknown), while the anchors=0 tables (legacy, t240) export
+# only slot 3. The producer's export_agreement counts same-target
+# entries, so agreement is exactly the in-range anchor count below —
+# never a loose set. The transcription oracle pins the fixture side
+# (fill versions, anchor flags and assignments); this list is the
+# checker's independent pin of the same truth.
+MATRIX_SCAN_TABLE_ANCHORS = {
+    (2, 40): (3,),
+    (3, 0): (3, 68, 69),
+    (3, 1): (3, 68, 69),
+    (3, 2): (3, 68, 69),
+    (3, 9): (3, 68, 69),
+    (4, 0): (3, 68, 69),
+}
+
+
+def expected_scan_agreement(version, entries):
+    """Exact export agreement: anchors with ordinals below entries."""
+    return sum(
+        anchor < entries for anchor in MATRIX_SCAN_TABLE_ANCHORS[version]
+    )
+
+
 # Baseline scan rows, (version, entries) -> (allowed linkages, exact
 # exports_agreeing). Only (3,0,92) can be a live return: it is the one
 # table BPF records name (the workload's C_GetInterface calls), and
@@ -4356,18 +4387,21 @@ SCAN_LINKAGE_VOCABULARY = frozenset(
 # (observed 97 heuristic vs 50 live_return across captures). Every other
 # baseline row is sweep-only (no record can name it), single-linkage, and
 # single-agreement (pure function of decoded content and the fixed
-# fixture exports, BPF-independent).
+# fixture exports, BPF-independent). Agreement derives from the anchor
+# list above: the same function rules baseline, paired and extra rows.
 MATRIX_SCAN_ROW_CONTRACT = {
-    ((2, 40), 68): (frozenset({"heuristic"}), 1),
-    ((3, 0), 92): (frozenset({"heuristic", "live_return"}), 3),
-    ((3, 1), 92): (frozenset({"heuristic"}), 3),
-    ((3, 2), 104): (frozenset({"heuristic"}), 3),
-    ((3, 9), 104): (frozenset({"heuristic"}), 3),
+    ((2, 40), 68): (
+        frozenset({"heuristic"}), expected_scan_agreement((2, 40), 68)),
+    ((3, 0), 92): (
+        frozenset({"heuristic", "live_return"}),
+        expected_scan_agreement((3, 0), 92)),
+    ((3, 1), 92): (
+        frozenset({"heuristic"}), expected_scan_agreement((3, 1), 92)),
+    ((3, 2), 104): (
+        frozenset({"heuristic"}), expected_scan_agreement((3, 2), 104)),
+    ((3, 9), 104): (
+        frozenset({"heuristic"}), expected_scan_agreement((3, 9), 104)),
 }
-# Adaptive extra rows (terminal/paired views): sweep-only linkage, and an
-# agreement count that can only be 0/1/3 (getter anchors come as a triple
-# or not at all; @3 alone, all three, or out of range).
-EXTRA_SCAN_AGREEING = frozenset({0, 1, 3})
 
 
 def exact_table_row(table):
@@ -4413,14 +4447,16 @@ def exact_scan_baseline_row(table, key):
 
 
 def exact_scan_extra_row(table):
-    """One adaptive extra row: sweep-only linkage, agreement 0/1/3."""
+    """One adaptive extra row: sweep-only linkage, exact derived agreement."""
     require(
         table["linkage"] in SCAN_LINKAGE_VOCABULARY
         and table["linkage"] == "heuristic",
         f"matrix scan extra has unallowed linkage: {table!r}",
     )
+    version = tuple(table["version"])
     require(
-        table["exports_agreeing"] in EXTRA_SCAN_AGREEING,
+        table["exports_agreeing"]
+        == expected_scan_agreement(version, table["entries"]),
         f"matrix scan extra has wrong export agreement: {table!r}",
     )
 
@@ -4434,7 +4470,8 @@ def exact_matrix_table_rows(evidence, wanted, *, scan_baseline, word, extras):
     (canary lanes, whose extras interleave). `extras` is None
     (forbidden) or "canary". Malformed, extra, missing, misordered or
     misplaced rows fail."""
-    require(len(evidence["discovery"]) == 1, "matrix tables need one provider")
+    # No one-provider assert: the canary entry guards it in
+    # version_canary_scan_shape and the induced entry in its head.
     tables = evidence["discovery"][0]["tables"]
     for table in tables:
         exact_table_row(table)
@@ -5740,7 +5777,8 @@ def validate_canary(lane, document, target_bits=64):
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
     if kind == "metrics":
-        require(document["schema"] == METRICS_SCHEMA, document["schema"])
+        # No schema assert: exact_metrics_schema opens with the identical
+        # check, same verdict and same message.
         exact_metrics_schema(document, run=owned_metrics)
     else:
         exact_profile_v3_selection(document, terminal=trace)
@@ -5794,11 +5832,9 @@ def validate_canary(lane, document, target_bits=64):
     elif not scanned:
         allowances["discovery_uncorroborated"] = 1
     exact_counters(evidence, allowances)
-    sources = [module["sources"] for module in evidence["discovery"]]
-    require(
-        sources == ([["scan", "manifest"]] if scanned else [["manifest"]]),
-        f"unexpected discovery sources: {sources}",
-    )
+    # No sources assert: multi-module shapes fail the one-provider assert
+    # in version_canary_scan_shape, and single-module flips fail the
+    # discovery semantics or the table signature, all before this point.
     outcomes = [module["corroboration"] for module in evidence["discovery"]]
     wanted_outcomes = (
         [["agreed"]]
@@ -5821,8 +5857,8 @@ def validate_canary(lane, document, target_bits=64):
         require(evidence["final_drain"] is evidence["drain_proven"], evidence["final_drain"])
         require(evidence["counters_available"] is True, evidence["counters_available"])
     else:
-        schema = METRICS_SCHEMA if kind == "metrics" else PROFILE_SCHEMA
-        require(document["schema"] == schema, document["schema"])
+        # No schema assert: metrics documents passed one above and profile
+        # documents passed selection, both before this branch.
         require(document["capture"]["mode"] == kind, document["capture"])
         require(document["capture"]["privacy_mode"] == privacy, document["capture"])
         exact_capture_modules(document)
@@ -6453,6 +6489,182 @@ def rejected(action):
     except AssertionError:
         return
     raise AssertionError("mutated fixture was accepted")
+
+
+# Committed transcription drift rows: (name, find, replace, message).
+# Each mutates a temp copy of the live fixture exactly once and must fail
+# the transcription oracle with its message — the first-firing pin for
+# that drift. One row per guard keeps every pin killed mechanically.
+MATRIX_FIXTURE_DRIFT_ROWS = (
+    ("defines-unique",
+     "#define LEGACY_MAJOR 2\n",
+     "#define LEGACY_MAJOR 2\n#define LEGACY_MAJOR 2\n",
+     "LEGACY_MAJOR default is not unique"),
+    ("config-defaults",
+     "#define LEGACY_MAJOR 2",
+     "#define LEGACY_MAJOR 3",
+     "canary build defaults drifted"),
+    ("export-decl-function-list",
+     "CK_RV C_GetFunctionList(void **out);",
+     "CK_RV C_GetFunctionListed(void **out);",
+     "export declaration drifted"),
+    ("export-decl-interface-list",
+     "CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);",
+     "CK_RV C_GetInterfaceListed(CK_INTERFACE *out, CK_ULONG *count);",
+     "export declaration drifted"),
+    ("export-decl-interface",
+     "CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);",
+     "CK_RV C_GetInterfaced(void *name, void *version, void **out, CK_FLAGS flags);",
+     "export declaration drifted"),
+    ("name-exact",
+     'static char exact[] = "PKCS 11";',
+     'static char exact[] = "PKCS 12";',
+     "exact name bytes drifted"),
+    ("name-alternate",
+     'static char alternate[] = "Acme Standard ABI";',
+     'static char alternate[] = "Acme Standard ABX";',
+     "alternate name bytes drifted"),
+    ("name-deceptive",
+     'static char deceptive[] = "Vendor Pretend";',
+     'static char deceptive[] = "Vendor Pretenx";',
+     "deceptive name bytes drifted"),
+    ("pinned-unique",
+     "static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {\n",
+     "static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {\n"
+     "static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {\n",
+     "fill_table signature drifted"),
+    ("fill-body",
+     "    if (anchors) {\n",
+     "    if (anchors) {\n    if (anchors) {\n",
+     "fill_table body drifted"),
+    ("version-assign",
+     "table->version = (CK_VERSION){major, minor};",
+     "table->version = (CK_VERSION){major, major};",
+     "version assignment drifted"),
+    ("stubs-fill",
+     "for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];",
+     "for (int i = 0; i < 103; i++) table->functions[i] = stubs[i];",
+     "stubs fill drifted"),
+    ("anchor3",
+     "table->functions[3] = (void *)C_GetFunctionList;",
+     "table->functions[3] = stubs[3];",
+     "C_GetFunctionList anchor drifted"),
+    ("anchor68",
+     "table->functions[68] = (void *)C_GetInterfaceList;",
+     "table->functions[68] = stubs[68];",
+     "C_GetInterfaceList anchor drifted"),
+    ("anchor69",
+     "table->functions[69] = (void *)C_GetInterface;",
+     "table->functions[69] = stubs[69];",
+     "C_GetInterface anchor drifted"),
+    ("anchor-order",
+     "table->functions[68] = (void *)C_GetInterfaceList;\n"
+     "        table->functions[69] = (void *)C_GetInterface;",
+     "table->functions[69] = (void *)C_GetInterface;\n"
+     "        table->functions[68] = (void *)C_GetInterfaceList;",
+     "anchor block reordered"),
+    ("untrusted0",
+     "table->functions[0] = (void *)write; /* preloaded libc, not provider-owned */",
+     "table->functions[0] = (void *)read; /* preloaded libc, not provider-owned */",
+     "untrusted-targets block drifted"),
+    ("untrusted1",
+     "table->functions[1] = (void *)&legacy; /* mapped, but not executable */",
+     "table->functions[1] = (void *)&t240; /* mapped, but not executable */",
+     "untrusted-targets block drifted"),
+    ("assign-count",
+     "for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];\n",
+     "for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];\n"
+     "    table->functions[5] = 0;\n",
+     "function-word assignments drifted"),
+    ("legacy-guard",
+     "if (LEGACY_PADDING)",
+     "if (LEGACY_PADDING && 1)",
+     "legacy padding guard drifted"),
+    ("sparse-guard",
+     "if (SPARSE_LEGACY >= -1) {",
+     "if (SPARSE_LEGACY >= -2) {",
+     "sparse legacy guard drifted"),
+    ("iface-count",
+     "CK_ULONG needed = MATRIX_INTERFACES ? (SINGLE_INTERFACE ? 1 : 13) : 0;",
+     "CK_ULONG needed = MATRIX_INTERFACES ? (SINGLE_INTERFACE ? 1 : 12) : 0;",
+     "interface count literal drifted"),
+    ("filled-twice",
+     "    fill_table(&t30, 3, 0, 1);\n",
+     "    fill_table(&t30, 3, 0, 1);\n    fill_table(&t30, 3, 0, 1);\n",
+     "table filled twice"),
+    ("anchor-token",
+     "fill_table(&t32, INTERFACE_MAJOR, INTERFACE_MINOR, 1);",
+     "fill_table(&t32, INTERFACE_MAJOR, INTERFACE_MINOR, 2);",
+     "anchor token is not 0/1"),
+    ("tables-equal",
+     "fill_table(&t30, 3, 0, 1);",
+     "fill_table(&t30, 3, 1, 1);",
+     "tables drifted"),
+    ("single-unique",
+     "        if (SINGLE_INTERFACE) {\n",
+     "        if (SINGLE_INTERFACE) {\n        if (SINGLE_INTERFACE) {\n",
+     "single-interface branch drifted"),
+    ("split-unique",
+     "        } else {\n",
+     "        } else {\n        } else {\n",
+     "branch split drifted"),
+    ("row-twice",
+     "            out[0] = (CK_INTERFACE){exact, &t240, 0};\n",
+     "            out[0] = (CK_INTERFACE){exact, &t240, 0};\n"
+     "            out[0] = (CK_INTERFACE){exact, &t240, 0};\n",
+     "row published twice"),
+    ("name-drift",
+     "out[1] = (CK_INTERFACE){exact, &t30, 0};",
+     "out[1] = (CK_INTERFACE){exactx, &t30, 0};",
+     "interface name drifted"),
+    ("table-drift",
+     "out[1] = (CK_INTERFACE){exact, &t30, 0};",
+     "out[1] = (CK_INTERFACE){exact, t30, 0};",
+     "interface table drifted"),
+    ("rows-range",
+     "            out[5] = (CK_INTERFACE){exact, &tunknown, 0};\n",
+     "",
+     "interface rows drifted"),
+    ("ifaces-equal",
+     "out[1] = (CK_INTERFACE){exact, &t30, 0};\n"
+     "            out[2] = (CK_INTERFACE){exact, &t31, 0};",
+     "out[1] = (CK_INTERFACE){exact, &t31, 0};\n"
+     "            out[2] = (CK_INTERFACE){exact, &t30, 0};",
+     "interfaces drifted"),
+    ("byte-exact",
+     "/* Function-table ABI fixture.",
+     "/* Function-table ABI fixture!",
+     "bytes drifted at offset"),
+)
+
+
+def run_transcription_drift_rows():
+    """Each committed drift row must fail transcription with its message."""
+    global matrix_fixture_path
+    live_text = matrix_fixture_path().read_text(encoding="utf-8")
+    saved = matrix_fixture_path
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            drifted = Path(tmp) / "version_matrix.c"
+            for name, find, replace, message in MATRIX_FIXTURE_DRIFT_ROWS:
+                require(
+                    live_text.count(find) == 1,
+                    f"drift {name} does not apply exactly once",
+                )
+                drifted.write_text(
+                    live_text.replace(find, replace, 1), encoding="utf-8")
+                matrix_fixture_path = lambda: drifted
+                try:
+                    matrix_fixture_transcription_matches_source()
+                except AssertionError as error:
+                    require(
+                        message in str(error),
+                        f"drift {name} died elsewhere: {error}",
+                    )
+                else:
+                    raise AssertionError(f"drift {name} was accepted")
+    finally:
+        matrix_fixture_path = saved
 
 
 def self_test():
@@ -7860,6 +8072,8 @@ def self_test():
     # build; any drift fails here, before the fixtures below consume it.
     matrix_fixture_transcription_matches_source()
     print("matrix fixture transcription matches the canary build: OK")
+    run_transcription_drift_rows()
+    print("matrix fixture drifts die in their named pins: OK")
     # Wiring: the transcription check must end at the byte-exact backstop
     # (dropping that call would silently re-admit everything the
     # fine-grained pins cannot see).
@@ -7901,31 +8115,66 @@ def self_test():
     # itself and rejects any normaliser construct.
     with open(__file__, encoding="utf-8") as handle:
         fixture_bytes_comparison_has_no_normaliser(handle.read())
-    for bad_snippet in (
-        "x = re.sub(a, b)",
-        "x.strip(",
-        "x.lower(",
-        "x.upper(",
-        "x.split(",
-        "x.casefold(",
-        "collapse_ws(x)",
-        "normalize(x)",
-        "unicodedata.normalize(x)",
-        "x.encode(",
-        "x.decode(",
-        "import difflib",
-        'x.replace("a", "b")',
+    # Each negative below carries exactly the two allowed line-ending
+    # replaces, so it clears the count gate and dies only in its named
+    # clause: removing any clause lets its negatives pass.
+    crlf_replace = 'line.replace(b"\\r\\n", b"\\n")'
+    for bad_snippet, message in (
+        ("x = re.sub(a, b)", "forbidden normaliser"),
+        ("x.strip(", "forbidden normaliser"),
+        ("x.lower(", "forbidden normaliser"),
+        ("x.upper(", "forbidden normaliser"),
+        ("x.split(", "forbidden normaliser"),
+        ("x.casefold(", "forbidden normaliser"),
+        ("collapse_ws(x)", "forbidden normaliser"),
+        ("normalize(x)", "forbidden normaliser"),
+        ("unicodedata.normalize(x)", "forbidden normaliser"),
+        ("x.encode(", "forbidden normaliser"),
+        ("x.decode(", "forbidden normaliser"),
+        ("import difflib", "forbidden normaliser"),
+        ('x.replace("a", "b")', "replaces beyond line endings"),
     ):
+        snippet = (
+            "def f(): return " + bad_snippet + "\n"
+            + crlf_replace + "\n" + crlf_replace
+        )
         try:
-            fixture_bytes_comparison_has_no_normaliser(
-                "def f(): return " + bad_snippet
+            fixture_bytes_comparison_has_no_normaliser(snippet)
+        except AssertionError as error:
+            require(
+                message in str(error),
+                f"normaliser negative died elsewhere: {error}",
             )
-        except AssertionError:
-            pass
         else:
             raise AssertionError(
                 "normaliser self-check missed: " + bad_snippet
             )
+    # The count gate: three line-ending replaces are one too many.
+    try:
+        fixture_bytes_comparison_has_no_normaliser(
+            "def f(): return x\n"
+            + crlf_replace + "\n" + crlf_replace + "\n" + crlf_replace
+        )
+    except AssertionError as error:
+        require(
+            "must normalise line endings on both sides" in str(error),
+            f"replace-count negative died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("normaliser self-check missed the replace count")
+    # The helper-presence gate: a comparison missing a helper fails here,
+    # not with an IndexError downstream.
+    try:
+        fixture_bytes_comparison_has_no_normaliser(
+            "def matrix_fixture_bytes_match_live():\n    pass\n"
+        )
+    except AssertionError as error:
+        require(
+            "is missing" in str(error),
+            f"missing-helper negative died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("normaliser self-check missed the missing helper")
     print("matrix fixture comparison has no normaliser: OK")
 
     version = evidence_fixture(
@@ -7982,6 +8231,117 @@ def self_test():
     validate_canary("default-safe-profile", safe32, 32)
     rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
     rejected(lambda: validate_canary("default-safe-profile", safe, 32))
+    # Canary entry guards: width, lane/ABI match, acquisition, provider
+    # count, typed rows, baseline rows, aliases, sources, corroboration,
+    # capture shape and modules. A message pins the guard; None means the
+    # removal accepts, so any refusal kills.
+    try:
+        validate_canary("default-safe-profile", safe, 16)
+    except AssertionError as error:
+        require(
+            str(error).startswith("invalid canary target width"),
+            f"bad target width died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("bad canary target width was accepted")
+    print("canary lanes refuse a bad target width: OK")
+    try:
+        validate_canary("object-ia32", safe, 64)
+    except AssertionError as error:
+        require(
+            str(error).startswith("object lane contradicts"),
+            f"object lane mismatch died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("object lane mismatch was accepted")
+    print("canary lanes refuse an object lane mismatch: OK")
+    for name, mutate, message in (
+        ("acquisition",
+         lambda d: d["evidence"]["surfaces"][0].update(acquisition="failed"),
+         "surface acquisition failure"),
+        ("two-modules",
+         lambda d: (
+             d["evidence"]["discovery"].append(
+                 copy.deepcopy(d["evidence"]["discovery"][0])),
+             d["evidence"].update(discovery_conflicts=2),
+         ),
+         "version fixture needs one provider"),
+        ("null-version",
+         lambda d: d["evidence"]["discovery"][0]["tables"][0].update(version=None),
+         "bad version"),
+        ("drop-baseline",
+         lambda d: d["evidence"]["discovery"][0]["tables"].remove(
+             next(table for table in d["evidence"]["discovery"][0]["tables"]
+                  if table["source"] == "scan" and table["version"] == [3, 0])),
+         "lost a required table"),
+        ("baseline-linkage",
+         lambda d: next(
+             table for table in d["evidence"]["discovery"][0]["tables"]
+             if table["source"] == "scan" and table["version"] == [2, 40]
+         ).update(linkage="live_return"),
+         "unallowed linkage"),
+        ("baseline-agreeing",
+         lambda d: next(
+             table for table in d["evidence"]["discovery"][0]["tables"]
+             if table["source"] == "scan" and table["version"] == [2, 40]
+         ).update(exports_agreeing=2),
+         "wrong export agreement"),
+        ("aliases",
+         lambda d: d["evidence"].update(aliased=[["C_X", "C_Y"]]),
+         None),
+        ("corroboration",
+         lambda d: d["evidence"]["discovery"][0].update(
+             corroboration=["conflict", "agreed"]),
+         "unexpected corroboration"),
+        ("mode",
+         lambda d: d["capture"].update(mode="trace"),
+         "'mode': 'trace'"),
+        ("modules",
+         lambda d: d["capture"]["modules"][0].update(path="/other/p11.so"),
+         None),
+    ):
+        bad = copy.deepcopy(safe)
+        mutate(bad)
+        settle_fixture_verdict(bad)
+        try:
+            validate_canary("default-safe-profile", bad)
+        except AssertionError as error:
+            if message is not None:
+                require(
+                    message in str(error),
+                    f"{name} violation died elsewhere: {error}",
+                )
+        else:
+            raise AssertionError(f"{name} violation was accepted")
+    print("canary entry guards refuse their violations: OK")
+    trace = copy.deepcopy(safe["evidence"])
+    trace.update(privacy_mode="allowlisted", capture_aborted=None,
+                 final_drain=False, counters_available=True,
+                 trace_truncated=False)
+    validate_canary("default-safe-trace", trace)
+    print("canary accepts a healthy trace lane: OK")
+    for name, mutate, message in (
+        ("privacy",
+         lambda d: d.update(privacy_mode="bogus-privacy"), "bogus-privacy"),
+        ("aborted",
+         lambda d: d.update(capture_aborted="bogus-abort"), "bogus-abort"),
+        ("drain",
+         lambda d: d.update(final_drain=True), "True"),
+        ("counters",
+         lambda d: d.update(counters_available=False), "False"),
+    ):
+        bad = copy.deepcopy(trace)
+        mutate(bad)
+        try:
+            validate_canary("default-safe-trace", bad)
+        except AssertionError as error:
+            require(
+                message in str(error),
+                f"trace {name} died elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"trace {name} violation was accepted")
+    print("canary trace guards refuse their violations: OK")
     # Independently literal H7 ledger expectations. These constructed documents
     # test the validator; they do not stand in for installed canary captures.
     object_ordinals = {
@@ -9562,6 +9922,109 @@ def self_test():
     else:
         raise AssertionError("induced G4 missed the missing table")
     print("induced G4 rejects a missing scan table: OK")
+    # The (3,0) row is live in both linkages: a heuristic positive keeps
+    # the allowed set honest (removing the member must fail this).
+    heuristic = copy.deepcopy(induced["G4"])
+    next(
+        table
+        for table in heuristic["evidence"]["discovery"][0]["tables"]
+        if table["source"] == "scan" and table["version"] == [3, 0]
+    )["linkage"] = "heuristic"
+    validate_induced("G4", heuristic)
+    print("induced G4 accepts a heuristic (3,0) row: OK")
+    # White-box caller guards: a baseline escaping the row contract, or
+    # an unknown extras mode, must fail at the seam, not downstream.
+    try:
+        exact_matrix_table_rows(
+            induced["G4"]["evidence"], VERSION_TABLES_SCANNED,
+            scan_baseline=[((9, 9), 9)], word=8, extras=None,
+        )
+    except AssertionError as error:
+        require(
+            str(error).startswith("matrix scan baseline escapes"),
+            f"escaping baseline died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("escaping scan baseline was accepted")
+    print("matrix tables refuse an escaping scan baseline: OK")
+    try:
+        exact_matrix_table_rows(
+            induced["G4"]["evidence"], VERSION_TABLES_SCANNED,
+            scan_baseline=[((2, 40), 68), ((2, 40), 68), ((3, 0), 92)],
+            word=8, extras="bogus",
+        )
+    except AssertionError as error:
+        require(
+            str(error).startswith("unknown scan extras mode"),
+            f"bogus extras mode died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("bogus scan extras mode was accepted")
+    print("matrix tables refuse an unknown scan extras mode: OK")
+    # Induced head guards: lane, capture shape, modules, sources,
+    # corroboration, and the lane counter stages. A message pins the
+    # guard; None means the removal accepts, so any refusal kills.
+    try:
+        validate_induced("G9", induced["G4"])
+    except AssertionError as error:
+        require(
+            str(error).startswith("unknown induced lane"),
+            f"unknown lane died elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("unknown induced lane was accepted")
+    print("induced lanes refuse an unknown lane: OK")
+    for name, lane, mutate, message in (
+        ("schema", "G4",
+         lambda d: d.update(schema="metrics"), None),
+        ("mode", "G4",
+         lambda d: d["capture"].update(mode="trace"), "'mode': 'trace'"),
+        ("privacy", "G4",
+         lambda d: d["capture"].update(privacy_mode="unsafe-unvalidated-metadata"),
+         "'privacy_mode': 'unsafe-unvalidated-metadata'"),
+        ("modules", "G4",
+         lambda d: d["capture"]["modules"][0].update(path="/other/p11.so"),
+         None),
+        ("sources", "G4",
+         lambda d: (
+             d["evidence"]["discovery"].append(
+                 copy.deepcopy(d["evidence"]["discovery"][0])),
+             d["capture"]["modules"].append(
+                 copy.deepcopy(d["capture"]["modules"][0])),
+             d["evidence"].update(discovery_conflicts=2),
+         ),
+         "unexpected discovery sources"),
+        ("corroboration", "G4",
+         lambda d: (
+             d["evidence"]["discovery"][0].update(corroboration=["agreed"]),
+             d["evidence"].update(discovery_conflicts=0),
+         ),
+         "unexpected corroboration"),
+        ("g4-counters", "G4",
+         lambda d: d["evidence"].update(start_insert_failures=0), None),
+        ("g5-counters", "G5",
+         lambda d: d["evidence"].update(rv_update_failures=0), None),
+        ("module-path", "G4",
+         lambda d: (
+             d["evidence"]["discovery"][0].update(path=123),
+             d["capture"]["modules"][0].update(path=123),
+         ),
+         "need the observed provider path"),
+    ):
+        bad = copy.deepcopy(induced[lane])
+        mutate(bad)
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            if message is not None:
+                require(
+                    message in str(error),
+                    f"{name} violation died elsewhere: {error}",
+                )
+        else:
+            raise AssertionError(f"{name} violation was accepted")
+    print("induced head guards refuse their violations: OK")
 
     bad = copy.deepcopy(induced["G3"])
     bad["evidence"]["rv_update_failures"] = 1

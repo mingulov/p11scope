@@ -329,6 +329,54 @@ fn interface_version_does_not_erase_observed_common_or_extend_a_shorter_layout()
             "a 2.40 label on 104-word storage does not claim extension ordinals"
         );
         assert_eq!(interface(&manifest, 1).functions.len(), 92);
+        // v072-canary-surfaces F2 twin: interface[4] is fixed
+        // exact/KnownPrefix/104 in every unflagged build, while
+        // interface[12] (boundary name over t32) tracks t32's label:
+        // it reads this build's version and bound and corroborates to
+        // KnownPrefix, and stays unpublished when the version (4.19)
+        // has no known bound. The canary build is the (3, 2) row.
+        let fourth = interface(&manifest, 4);
+        assert_eq!(
+            fourth.version,
+            Some(Version { major: 3, minor: 9 }),
+            "{name}"
+        );
+        assert_eq!(fourth.functions.len(), 104, "{name}");
+        assert!(matches!(&fourth.walk, WalkOutcome::KnownPrefix), "{name}");
+        assert!(
+            matches!(
+                fourth.source,
+                SurfaceSource::Interface {
+                    classification: InterfaceClassification::ExactStandard,
+                    ..
+                }
+            ),
+            "{name}"
+        );
+        if (major, minor) == (4, 19) {
+            assert!(
+                manifest.surfaces.iter().all(|surface| !matches!(
+                    surface.source,
+                    SurfaceSource::Interface { index: 12, .. }
+                )),
+                "{name}"
+            );
+        } else {
+            let twelfth = interface(&manifest, 12);
+            assert_eq!(twelfth.version, Some(Version { major, minor }), "{name}");
+            assert_eq!(twelfth.functions.len(), bound, "{name}");
+            assert!(matches!(&twelfth.walk, WalkOutcome::KnownPrefix), "{name}");
+            assert!(
+                matches!(
+                    twelfth.source,
+                    SurfaceSource::Interface {
+                        classification: InterfaceClassification::CorroboratedStandardPrefix,
+                        ..
+                    }
+                ),
+                "{name}"
+            );
+        }
     }
 }
 

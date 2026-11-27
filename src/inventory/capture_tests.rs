@@ -1452,13 +1452,13 @@ impl LaneHost<Pin> for Scene {
         self.coordinator.abandon_capture_coverage();
     }
 
-    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
-        self.note(if receipt.exec_coverage.is_some() {
+    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind) {
+        self.note(if matches!(kind, ReceiptKind::Activation) {
             "note_extend_receipt(activating)"
         } else {
             "note_extend_receipt"
         });
-        self.coordinator.note_extend_receipt(receipt);
+        self.coordinator.note_extend_receipt(receipt, kind);
     }
 
     fn note_capture_custody(&mut self, custody: &ScopeCustody) {
@@ -1972,7 +1972,7 @@ struct ReverseOrderHost {
 impl LaneHost<Pin> for ReverseOrderHost {
     fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
     fn abandon_capture_coverage(&mut self) {}
-    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt, _kind: ReceiptKind) {}
     fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
     fn has_pending_targets(&self) -> bool {
         self.start_pending
@@ -2203,7 +2203,7 @@ impl LaneHost<Pin> for ReceiptHost {
             false
         }
     }
-    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, _kind: ReceiptKind) {
         self.receipts
             .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
         self.receipt_max.push(receipt.attach_ns_max);
@@ -3536,6 +3536,20 @@ fn stop_without_backlog_notes_nothing() {
             .iter()
             .map(|backlog| backlog.endpoints.len())
             .collect::<Vec<_>>()
+    );
+}
+
+/// The drain default reports nothing pending: hosts without a fold
+/// must not hold the coverage end open (a lying default wedges every
+/// stop driver — the blocking loop never exits and the cooperative
+/// gate never advances).
+#[test]
+fn drain_default_reports_nothing_pending() {
+    let log = Log::default();
+    let mut host = ContinuationHost::new(&log, Vec::new());
+    assert!(
+        !host.drain_stop_backlog(),
+        "hosts without a fold report an empty drain"
     );
 }
 
@@ -5200,7 +5214,7 @@ impl ContinuationHost {
 impl LaneHost<Pin> for ContinuationHost {
     fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
     fn abandon_capture_coverage(&mut self) {}
-    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt, _kind: ReceiptKind) {}
     fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
     fn take_target_delta(&mut self) -> TargetDelta {
         std::mem::take(&mut self.delta)
@@ -8686,8 +8700,8 @@ mod publication_progress_tests {
         fn abandon_capture_coverage(&mut self) {
             self.scene.abandon_capture_coverage();
         }
-        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
-            self.scene.note_extend_receipt(receipt);
+        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind) {
+            self.scene.note_extend_receipt(receipt, kind);
         }
         fn note_capture_custody(&mut self, custody: &ScopeCustody) {
             self.scene.note_capture_custody(custody);

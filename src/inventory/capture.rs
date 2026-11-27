@@ -57,7 +57,7 @@ use crate::attach::{AttachBackend, BackendSelection};
 use crate::discovery::caller_registry::{CallerEvent, ProcessSource, UnknownReason, now_ns};
 use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
-    InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
+    InventoryCoordinator, NativeBatch, NativeReceipt, PassReport, ReceiptKind,
 };
 use crate::discovery::identity::RetainedInventoryTarget;
 use crate::discovery::inventory_attach_set::{AttachEndpoint, AttachObjectId, TargetDelta};
@@ -554,7 +554,7 @@ pub(crate) trait LaneHost<Pin> {
     fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage);
     /// Forget a capture coverage that never activated (the auto fallback).
     fn abandon_capture_coverage(&mut self);
-    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
+    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind);
     /// Terminal accounting for the lane backlog still deferred when the
     /// stop lands. The coordinator stashes it for the paced fold below.
     /// Default: ignore (hosts without a fold).
@@ -635,8 +635,8 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
         InventoryCoordinator::abandon_capture_coverage(self);
     }
 
-    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
-        InventoryCoordinator::note_extend_receipt(self, receipt);
+    fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind) {
+        InventoryCoordinator::note_extend_receipt(self, receipt, kind);
     }
 
     fn note_stop_backlog(&mut self, backlog: TargetDelta) {
@@ -1124,7 +1124,7 @@ impl<L> NativeLane<L> {
                 "the first extend did not activate the capture".into(),
             ));
         }
-        host.note_extend_receipt(&receipt);
+        host.note_extend_receipt(&receipt, ReceiptKind::Activation);
         host.note_attach_ticks();
         host.note_native_lane();
         if let Some(reason) = lossy {
@@ -1240,7 +1240,7 @@ impl<L> NativeLane<L> {
         // latches the ticks until the next pass, a pass that does not
         // unlatches them.
         self.tick_fd_exhausted = receipt.fd_exhausted;
-        host.note_extend_receipt(&receipt);
+        host.note_extend_receipt(&receipt, ReceiptKind::Pass);
         self.attached += receipt.attached.len();
         self.failed += receipt.failed.len();
         if let Some(reason) = &receipt.refused
@@ -1308,7 +1308,10 @@ impl<L> NativeLane<L> {
         if !tick_receipt_forwards(&receipt) {
             return;
         }
-        host.note_extend_receipt(&receipt);
+        // Pass kind: the flush never carries deferred endpoints, so the
+        // kind is moot for deferral accounting (no deferral rows, span
+        // or peak; failure rows still stage).
+        host.note_extend_receipt(&receipt, ReceiptKind::Pass);
         self.attached += receipt.attached.len();
         self.failed += receipt.failed.len();
         if let Some(reason) = &receipt.refused
@@ -5352,7 +5355,7 @@ mod stop_latch_tests {
     impl LaneHost<F9Pin> for F9Host {
         fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
         fn abandon_capture_coverage(&mut self) {}
-        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+        fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, _kind: ReceiptKind) {
             self.receipts
                 .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
         }

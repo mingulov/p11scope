@@ -249,10 +249,11 @@ pub(crate) fn is_deferral_folded_reason(reason: &str) -> bool {
     reason.starts_with("attach finished late:") || reason.starts_with("attach unfinished at stop:")
 }
 
-/// One stop-time deferral summary input: how many receipts deferred
-/// for the key, the peak per-receipt deferral, and every endpoint id
-/// ever deferred for it. The summary splits the key's own ids into
-/// attached, failed and still deferred, so each deferred endpoint
+/// One stop-time deferral summary input: how many scan-pass receipts
+/// deferred for the key, the peak per-pass deferral, and every
+/// endpoint id ever deferred for it (activation receipts fold ids
+/// without counting as passes). The summary splits the key's own ids
+/// into attached, failed and still deferred, so each deferred endpoint
 /// counts exactly once under the module it deferred for.
 #[derive(Debug, Default)]
 struct DeferralFold {
@@ -5135,7 +5136,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
+    pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind) {
         // Exec coverage is the binder's, whatever capture coverage holds.
         if let Some(coverage) = receipt.exec_coverage {
             self.holder_pool.reset();
@@ -5198,7 +5199,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // The receipt's stamps just landed; feed the pre-arm watches.
         self.note_prearm_receipt();
-        self.note_partial_attach(receipt);
+        self.note_partial_attach(receipt, kind);
         if let Some(custody) = &receipt.custody {
             self.note_capture_custody(custody);
         }
@@ -5218,8 +5219,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// run-wide. The subject and reason shapes are pinned verbatim:
     /// the oracle matches them. At stop each module's per-receipt
     /// deferral gaps gain one appended summary; concise folds the
-    /// rows under it at render time.
-    fn note_partial_attach(&mut self, receipt: &ExtendReceipt) {
+    /// rows under it at render time. Every receipt kind stages rows
+    /// and folds ids; only scan-pass receipts bump the pass span and
+    /// per-pass peak (the activation receipt is not a scan pass).
+    fn note_partial_attach(&mut self, receipt: &ExtendReceipt, kind: ReceiptKind) {
         // Deferred endpoints dedupe: a receipt may carry the same
         // endpoint twice across its defer calls.
         let deferred: BTreeSet<EndpointId> = receipt
@@ -5234,6 +5237,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
+        // Only scan-pass receipts count toward the pass span and peak.
+        let count_pass = matches!(kind, ReceiptKind::Pass);
         let mut by_module: BTreeMap<AttachModuleKey, (usize, BTreeSet<EndpointId>)> =
             BTreeMap::new();
         let mut unclaimed = (0usize, BTreeSet::new());
@@ -5314,7 +5319,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ),
                     None,
                 );
-                {
+                if count_pass {
                     let fold = self.deferral_folds.entry(Some(key)).or_default();
                     fold.passes += 1;
                     fold.max_deferred = fold.max_deferred.max(deferred_here_count);
@@ -5358,7 +5363,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
                 units: None,
             });
-            {
+            if count_pass {
                 let fold = self.deferral_folds.entry(None).or_default();
                 fold.passes += 1;
                 fold.max_deferred = fold.max_deferred.max(unclaimed_deferred_count);
@@ -16781,6 +16786,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 }
 
+/// Which extend produced a receipt: the activating extend (before pass
+/// one runs) or a scan-pass extend (inter-pass tick flushes ride along
+/// as pass receipts; they never carry deferred endpoints). Only
+/// scan-pass receipts count toward the deferral-fold pass span and
+/// per-pass peak; the activation receipt stages rows and folds ids
+/// like any receipt but is not a scan pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiptKind {
+    Activation,
+    Pass,
+}
+
 /// One native input for `stage_native` (plan §3.6). S2/S3 add an object
 /// fact variant here.
 #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 constructs them.
@@ -19216,35 +19233,41 @@ pub(crate) mod tests {
         assert_eq!(delta.endpoints.len(), 2);
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
 
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: delta.endpoints[0].id,
-                object: delta.endpoints[0].object,
-                at_ns: 2_000,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         assert_eq!(
             coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
             crate::render::PrearmWatchState::PinnedUnarmed,
             "partial attachment remains unarmed for the declared set"
         );
 
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let rows = coordinator.prearm_rows();
         let watch = rows[0].watch.as_ref().unwrap();
         assert_eq!(watch.state, crate::render::PrearmWatchState::Armed);
@@ -19272,21 +19295,24 @@ pub(crate) mod tests {
         let delta = coordinator.take_target_delta();
         assert_eq!(delta.endpoints.len(), 2);
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         assert_eq!(
             coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
             crate::render::PrearmWatchState::Armed,
@@ -19316,21 +19342,24 @@ pub(crate) mod tests {
         coordinator.absorb_prearm_plan(1_000);
         let delta = coordinator.take_target_delta();
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         {
             let capture = coordinator.capture.as_mut().expect("native coverage");
             capture.last_clean_ns = Some(4_000);
@@ -19359,21 +19388,24 @@ pub(crate) mod tests {
         coordinator.absorb_prearm_plan(1_000);
         let delta = coordinator.take_target_delta();
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         {
             let capture = coordinator.capture.as_mut().expect("native coverage");
             capture.last_clean_ns = Some(4_000);
@@ -19406,21 +19438,24 @@ pub(crate) mod tests {
         coordinator.absorb_prearm_plan(1_000);
         let delta = coordinator.take_target_delta();
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         assert_eq!(
             coordinator.prearm_rows()[0].watch.as_ref().unwrap().state,
             crate::render::PrearmWatchState::Armed,
@@ -19509,14 +19544,17 @@ pub(crate) mod tests {
         );
 
         // Partial stamps: one member only — mapped but no window.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: delta.endpoints[0].id,
-                object: delta.endpoints[0].object,
-                at_ns: 2_000,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: delta.endpoints[0].id,
+                    object: delta.endpoints[0].object,
+                    at_ns: 2_000,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let rows = coordinator.prearm_rows();
         assert!(rows[0].mapped);
         assert!(rows[0].attached_at_ns.is_none());
@@ -19526,21 +19564,24 @@ pub(crate) mod tests {
         );
 
         // Full declared set: the base window over [scope start, max].
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![
-                AttachedEndpoint {
-                    id: delta.endpoints[0].id,
-                    object: delta.endpoints[0].object,
-                    at_ns: 2_000,
-                },
-                AttachedEndpoint {
-                    id: delta.endpoints[1].id,
-                    object: delta.endpoints[1].object,
-                    at_ns: 3_000,
-                },
-            ],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![
+                    AttachedEndpoint {
+                        id: delta.endpoints[0].id,
+                        object: delta.endpoints[0].object,
+                        at_ns: 2_000,
+                    },
+                    AttachedEndpoint {
+                        id: delta.endpoints[1].id,
+                        object: delta.endpoints[1].object,
+                        at_ns: 3_000,
+                    },
+                ],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let rows = coordinator.prearm_rows();
         assert_eq!(rows[0].attached_at_ns, Some(3_000));
         assert_eq!(
@@ -19610,14 +19651,17 @@ pub(crate) mod tests {
             "the scan-corroborated offset joins the same object"
         );
         let extra_endpoint = absorbed.delta.endpoints[0];
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: extra_endpoint.id,
-                object: extra_endpoint.object,
-                at_ns: 4_000,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: extra_endpoint.id,
+                    object: extra_endpoint.object,
+                    at_ns: 4_000,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let rows = coordinator.prearm_rows();
         assert_eq!(
             rows[0].attached_at_ns,
@@ -21639,16 +21683,19 @@ pub(crate) mod tests {
         };
         // a.so complete (0..2), b.so one failed (3) one attached (4),
         // c.so (5) deferred.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attached(0, 100), attached(2, 120), attached(4, 130)],
-            failed: vec![EndpointFailure {
-                id: endpoint(3).id,
-                object: endpoint(3).object,
-                reason: "kernel refused".into(),
-                link_retained: false,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attached(0, 100), attached(2, 120), attached(4, 130)],
+                failed: vec![EndpointFailure {
+                    id: endpoint(3).id,
+                    object: endpoint(3).object,
+                    reason: "kernel refused".into(),
+                    link_retained: false,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.project_catalog(&catalog, &verdicts, 140);
         coordinator.registry.publish();
         assert_eq!(
@@ -21656,10 +21703,13 @@ pub(crate) mod tests {
             UseCoverage::Unknown(UnknownReason::NotAttached),
             "one of a.so's endpoints is not attached yet"
         );
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attached(1, 110)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attached(1, 110)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.project_catalog(&catalog, &verdicts, 150);
         coordinator.registry.publish();
         assert_eq!(
@@ -21912,31 +21962,40 @@ pub(crate) mod tests {
             link_retained: false,
         };
         // One attached, one failed: partial attach.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: endpoint(0).id,
-                object: endpoint(0).object,
-                at_ns: 100,
-            }],
-            failed: vec![failed(1)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: endpoint(0).id,
+                    object: endpoint(0).object,
+                    at_ns: 100,
+                }],
+                failed: vec![failed(1)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         // A second failure for the same module: a second gap with the
         // cumulative count.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            failed: vec![failed(2)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                failed: vec![failed(2)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         // An endpoint no module claims: unattributed, run-wide.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            failed: vec![EndpointFailure {
-                id: crate::discovery::inventory_attach_set::EndpointId(9999),
-                object: endpoint(0).object,
-                reason: "kernel refused".into(),
-                link_retained: false,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                failed: vec![EndpointFailure {
+                    id: crate::discovery::inventory_attach_set::EndpointId(9999),
+                    object: endpoint(0).object,
+                    reason: "kernel refused".into(),
+                    link_retained: false,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let gaps: Vec<_> = coordinator
             .registry
@@ -22014,25 +22073,31 @@ pub(crate) mod tests {
             info_revoked: vec![],
         };
         // One attached, one deferred: partial attach.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: endpoint(0).id,
-                object: endpoint(0).object,
-                at_ns: 100,
-            }],
-            deferred: deferred(1),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: endpoint(0).id,
+                    object: endpoint(0).object,
+                    at_ns: 100,
+                }],
+                deferred: deferred(1),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         // A retry attaches the deferred endpoint: no new gap, but the
         // earlier one stands (the deferral window's calls are lost).
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: endpoint(1).id,
-                object: endpoint(1).object,
-                at_ns: 200,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: endpoint(1).id,
+                    object: endpoint(1).object,
+                    at_ns: 200,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let gaps: Vec<_> = coordinator
             .registry
@@ -22113,14 +22178,17 @@ pub(crate) mod tests {
         let catalog_b = capture_catalog(&pins, &[&b], pid, generation);
         coordinator.project_catalog(&catalog_b, &verdicts, 70);
         let b_endpoint = absorbed_b.delta.endpoints[0];
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![b_endpoint],
-                objects: vec![b_endpoint.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![b_endpoint],
+                    objects: vec![b_endpoint.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let gaps: Vec<_> = coordinator
             .registry
@@ -22154,14 +22222,17 @@ pub(crate) mod tests {
             gaps[0].reason
         );
         // A clean attach next pass adds no second gap.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: b_endpoint.id,
-                object: b_endpoint.object,
-                at_ns: 200,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: b_endpoint.id,
+                    object: b_endpoint.object,
+                    at_ns: 200,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         assert_eq!(
             coordinator
@@ -22238,28 +22309,34 @@ pub(crate) mod tests {
         for pass in 0..13u32 {
             let rest: Vec<_> = (2 * pass + 2..28).map(endpoint).collect();
             let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                attached: vec![
-                    attached(2 * pass, 100 + u64::from(pass)),
-                    attached(2 * pass + 1, 100 + u64::from(pass)),
-                ],
-                deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                    endpoints: rest,
-                    objects,
-                    info_revoked: vec![],
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    attached: vec![
+                        attached(2 * pass, 100 + u64::from(pass)),
+                        attached(2 * pass + 1, 100 + u64::from(pass)),
+                    ],
+                    deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                        endpoints: rest,
+                        objects,
+                        info_revoked: vec![],
+                    },
+                    ..ExtendReceipt::default()
                 },
-                ..ExtendReceipt::default()
-            });
+                ReceiptKind::Pass,
+            );
             if pass == 4 {
                 // Apply the first five per-receipt gaps mid-run: the
                 // summary appends after applied and staged rows alike.
                 coordinator.commit_batch(false).unwrap();
             }
         }
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attached(26, 200), attached(27, 200)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attached(26, 200), attached(27, 200)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         // Mid-run the deferrals never use the failure subject.
         let failed_deferrals = coordinator
             .registry
@@ -22379,20 +22456,23 @@ pub(crate) mod tests {
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
         let fail = endpoint(0);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            failed: vec![EndpointFailure {
-                id: fail.id,
-                object: fail.object,
-                reason: "kernel refused".into(),
-                link_retained: false,
-            }],
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![endpoint(1), endpoint(2)],
-                objects: vec![endpoint(1).object, endpoint(2).object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                failed: vec![EndpointFailure {
+                    id: fail.id,
+                    object: fail.object,
+                    reason: "kernel refused".into(),
+                    link_retained: false,
+                }],
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![endpoint(1), endpoint(2)],
+                    objects: vec![endpoint(1).object, endpoint(2).object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         let attach = |id: u32| {
             let target = endpoint(id);
             AttachedEndpoint {
@@ -22401,10 +22481,13 @@ pub(crate) mod tests {
                 at_ns: 200,
             }
         };
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attach(1), attach(2), attach(3)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attach(1), attach(2), attach(3)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let failures: Vec<_> = coordinator
             .registry
@@ -22563,16 +22646,18 @@ pub(crate) mod tests {
         // deferred) and never reads "all attached by stop". The
         // failure gap stays exactly as staged.
         let (_dir, mut coordinator, endpoints) = deferral_outcome_fixture(4);
-        coordinator.note_extend_receipt(&deferral_outcome_receipt(
-            &[endpoints[2], endpoints[3]],
-            &[],
-            &[endpoints[0], endpoints[1]],
-        ));
-        coordinator.note_extend_receipt(&deferral_outcome_receipt(
-            &[endpoints[1]],
-            &[endpoints[0]],
-            &[],
-        ));
+        coordinator.note_extend_receipt(
+            &deferral_outcome_receipt(
+                &[endpoints[2], endpoints[3]],
+                &[],
+                &[endpoints[0], endpoints[1]],
+            ),
+            ReceiptKind::Pass,
+        );
+        coordinator.note_extend_receipt(
+            &deferral_outcome_receipt(&[endpoints[1]], &[endpoints[0]], &[]),
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -22621,16 +22706,18 @@ pub(crate) mod tests {
         // Each lands in exactly one bucket; the buckets sum to the
         // distinct total.
         let (_dir, mut coordinator, endpoints) = deferral_outcome_fixture(6);
-        coordinator.note_extend_receipt(&deferral_outcome_receipt(
-            &[endpoints[5]],
-            &[],
-            &endpoints[0..5],
-        ));
-        coordinator.note_extend_receipt(&deferral_outcome_receipt(
-            &[endpoints[0], endpoints[1]],
-            &[endpoints[2]],
-            &[endpoints[3], endpoints[4]],
-        ));
+        coordinator.note_extend_receipt(
+            &deferral_outcome_receipt(&[endpoints[5]], &[], &endpoints[0..5]),
+            ReceiptKind::Pass,
+        );
+        coordinator.note_extend_receipt(
+            &deferral_outcome_receipt(
+                &[endpoints[0], endpoints[1]],
+                &[endpoints[2]],
+                &[endpoints[3], endpoints[4]],
+            ),
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -22694,23 +22781,29 @@ pub(crate) mod tests {
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
         let rest: Vec<_> = (0..4).map(endpoint).collect();
         let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: rest,
-                objects,
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: rest,
+                    objects,
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         let first = endpoint(0);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: first.id,
-                object: first.object,
-                at_ns: 200,
-            }],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: first.id,
+                    object: first.object,
+                    at_ns: 200,
+                }],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -22792,14 +22885,17 @@ pub(crate) mod tests {
         for _ in 0..3 {
             let rest = vec![ghost(9998), ghost(9999)];
             let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                    endpoints: rest,
-                    objects,
-                    info_revoked: vec![],
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                        endpoints: rest,
+                        objects,
+                        info_revoked: vec![],
+                    },
+                    ..ExtendReceipt::default()
                 },
-                ..ExtendReceipt::default()
-            });
+                ReceiptKind::Pass,
+            );
         }
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
@@ -22875,14 +22971,17 @@ pub(crate) mod tests {
         coordinator.registry.publish();
         // One endpoint deferred by a pass receipt: one row, one pass.
         let first = absorbed.delta.endpoints[0];
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![first],
-                objects: vec![first.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![first],
+                    objects: vec![first.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         // The stop note carries both endpoints — the receipt-covered one
         // and the never-extended one — but the drain folds only the latter.
         coordinator.note_stop_backlog(absorbed.delta);
@@ -23127,14 +23226,17 @@ pub(crate) mod tests {
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
         let shrunk = endpoint(1);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![shrunk],
-                objects: vec![shrunk.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![shrunk],
+                    objects: vec![shrunk.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         // Membership revised before stop: the module re-lowers with
         // only the kept endpoint, so the deferred one is unindexed when
         // the stop note re-carries it from the lane backlog.
@@ -23379,19 +23481,22 @@ pub(crate) mod tests {
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         let first = absorbed.delta.endpoints[0];
         let second = absorbed.delta.endpoints[1];
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: first.id,
-                object: first.object,
-                at_ns: 100,
-            }],
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![second],
-                objects: vec![second.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: first.id,
+                    object: first.object,
+                    at_ns: 100,
+                }],
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![second],
+                    objects: vec![second.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         coordinator.note_stop_backlog(absorbed.delta.clone());
         while coordinator.drain_stop_backlog() {}
         coordinator.commit_batch(false).unwrap();
@@ -23452,23 +23557,29 @@ pub(crate) mod tests {
         for pass in 0..2u32 {
             let rest: Vec<_> = (2 * pass + 2..6).map(endpoint).collect();
             let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                attached: vec![
-                    attach(2 * pass, 100 + u64::from(pass)),
-                    attach(2 * pass + 1, 100 + u64::from(pass)),
-                ],
-                deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                    endpoints: rest,
-                    objects,
-                    info_revoked: vec![],
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    attached: vec![
+                        attach(2 * pass, 100 + u64::from(pass)),
+                        attach(2 * pass + 1, 100 + u64::from(pass)),
+                    ],
+                    deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                        endpoints: rest,
+                        objects,
+                        info_revoked: vec![],
+                    },
+                    ..ExtendReceipt::default()
                 },
-                ..ExtendReceipt::default()
-            });
+                ReceiptKind::Pass,
+            );
         }
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attach(4, 200), attach(5, 200)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attach(4, 200), attach(5, 200)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -23549,19 +23660,22 @@ pub(crate) mod tests {
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
         let kept = endpoint(0);
         let evicted = endpoint(1);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: kept.id,
-                object: kept.object,
-                at_ns: 100,
-            }],
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![evicted],
-                objects: vec![evicted.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: kept.id,
+                    object: kept.object,
+                    at_ns: 100,
+                }],
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![evicted],
+                    objects: vec![evicted.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         // Membership revised before stop: A re-lowers with only the
         // kept endpoint, so the deferred one is unindexed at fold time.
         let repolicy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
@@ -23685,15 +23799,18 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(others.len(), 2, "two unshared endpoints attach: {others:?}");
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: others,
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: vec![shared],
-                objects: vec![shared.object],
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: others,
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![shared],
+                    objects: vec![shared.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -23796,26 +23913,35 @@ pub(crate) mod tests {
         };
         // Pass one defers two, pass two defers one; both stream
         // mid-run exactly as the pass loop emits them.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attach(0, 100), attach(1, 100)],
-            deferred: defer(&[2, 3]),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attach(0, 100), attach(1, 100)],
+                deferred: defer(&[2, 3]),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let first = Presentation::capture(&coordinator, "workload", 50, 100, 1);
         emitter.emit(&mut writer, &first.gaps, false, 100).unwrap();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attach(2, 200)],
-            deferred: defer(&[3]),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attach(2, 200)],
+                deferred: defer(&[3]),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         let second = Presentation::capture(&coordinator, "workload", 50, 200, 2);
         emitter.emit(&mut writer, &second.gaps, false, 200).unwrap();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![attach(3, 300)],
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![attach(3, 300)],
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
         let final_presentation = Presentation::capture(&coordinator, "workload", 50, 1000, 2);
@@ -23902,14 +24028,20 @@ pub(crate) mod tests {
                 info_revoked: vec![],
             }
         };
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: defer(&[0, 1]),
-            ..ExtendReceipt::default()
-        });
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: defer(&[2, 3]),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: defer(&[0, 1]),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: defer(&[2, 3]),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let attached: Vec<AttachedEndpoint> = (0..4)
             .map(|id| {
                 let target = endpoint(id);
@@ -23920,10 +24052,13 @@ pub(crate) mod tests {
                 }
             })
             .collect();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached,
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached,
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -24002,14 +24137,17 @@ pub(crate) mod tests {
             .copied()
             .collect();
         let objects: Vec<_> = rest.iter().map(|target| target.object).collect();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            deferred: crate::discovery::inventory_attach_set::TargetDelta {
-                endpoints: rest,
-                objects,
-                info_revoked: vec![],
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: rest,
+                    objects,
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
             },
-            ..ExtendReceipt::default()
-        });
+            ReceiptKind::Pass,
+        );
         let attached: Vec<AttachedEndpoint> = endpoints_a
             .iter()
             .chain(endpoints_b.iter())
@@ -24019,10 +24157,13 @@ pub(crate) mod tests {
                 at_ns: 200,
             })
             .collect();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached,
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached,
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -24077,19 +24218,22 @@ pub(crate) mod tests {
         );
         let key = absorbed.verdicts.keys().next().unwrap().clone();
         coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: absorbed
-                .delta
-                .endpoints
-                .iter()
-                .map(|endpoint| crate::attach::capture::AttachedEndpoint {
-                    id: endpoint.id,
-                    object: endpoint.object,
-                    at_ns: 10,
-                })
-                .collect(),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: absorbed
+                    .delta
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| crate::attach::capture::AttachedEndpoint {
+                        id: endpoint.id,
+                        object: endpoint.object,
+                        at_ns: 10,
+                    })
+                    .collect(),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let whole = AttachVerdict::Admitted {
             endpoints: 2,
             reasons: Vec::new(),
@@ -24284,7 +24428,8 @@ pub(crate) mod tests {
                 custody: Some(custody),
                 ..ExtendReceipt::default()
             };
-            self.coordinator.note_extend_receipt(&receipt);
+            self.coordinator
+                .note_extend_receipt(&receipt, ReceiptKind::Pass);
         }
 
         pub(super) fn project(&mut self, pid: u32, now_ns: u64) {
@@ -28909,13 +29054,16 @@ exit 0
                 at_ns: 150,
                 reason: "an exec of the PID target was observed".into(),
             });
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            custody: Some(ScopeCustody::PidLost {
-                at_ns: 199,
-                reason: "PID custody lost".into(),
-            }),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                custody: Some(ScopeCustody::PidLost {
+                    at_ns: 199,
+                    reason: "PID custody lost".into(),
+                }),
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         scene.project(7, 320);
         scene.coordinator.registry.publish();
         assert_eq!(scene.coverage(caller), frozen, "a post-stop note wiped it");
@@ -29324,11 +29472,14 @@ exit 0
         /// activating extend receipt.
         pub(super) fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
             let domain = NativeDomainId::mint();
-            scene.coordinator.note_extend_receipt(&ExtendReceipt {
-                activated_roots: true,
-                exec_coverage: Some(ExecCoverage::scripted(domain, coverage_ns)),
-                ..ExtendReceipt::default()
-            });
+            scene.coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(ExecCoverage::scripted(domain, coverage_ns)),
+                    ..ExtendReceipt::default()
+                },
+                ReceiptKind::Pass,
+            );
             Self {
                 scene,
                 domain,
@@ -43158,15 +43309,18 @@ exit 0
                 .next()
                 .map(|endpoint| (endpoint.id, endpoint.object))
                 .expect("the driver image admits provider endpoints");
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                attached: vec![crate::attach::capture::AttachedEndpoint {
-                    id: endpoint.0,
-                    object: endpoint.1,
-                    at_ns: 4_000,
-                }],
-                custody: Some(ScopeCustody::CgroupHeld),
-                ..ExtendReceipt::default()
-            });
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    attached: vec![crate::attach::capture::AttachedEndpoint {
+                        id: endpoint.0,
+                        object: endpoint.1,
+                        at_ns: 4_000,
+                    }],
+                    custody: Some(ScopeCustody::CgroupHeld),
+                    ..ExtendReceipt::default()
+                },
+                ReceiptKind::Pass,
+            );
             let refresh = collect(&mut coordinator, &control);
             coordinator.apply_cgroup_collection(refresh, 4_000).unwrap();
             coordinator.commit_batch(false).unwrap();
@@ -54942,10 +55096,13 @@ int main(void) {
     #[test]
     fn note_extend_receipt_forwards_info_return_deferred() {
         let mut scene = CaptureScene::new(2);
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            info_return_deferred: 2,
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                info_return_deferred: 2,
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let (_, observations) = scene.coordinator.info_join.snapshot();
         assert_eq!(observations.gaps.return_deferred, 2);
     }
@@ -54956,10 +55113,13 @@ int main(void) {
     #[test]
     fn note_extend_receipt_forwards_info_return_refused_hazard() {
         let mut scene = CaptureScene::new(2);
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            info_return_refused_hazard: 3,
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                info_return_refused_hazard: 3,
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         let (_, observations) = scene.coordinator.info_join.snapshot();
         assert_eq!(observations.gaps.return_refused_hazard, 3);
     }
@@ -55119,10 +55279,13 @@ int main(void) {
     #[test]
     fn note_extend_receipt_reports_info_revoke_failures() {
         let mut scene = CaptureScene::new(2);
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            info_revoke_failed: 2,
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                info_revoke_failed: 2,
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Pass,
+        );
         scene.coordinator.commit_batch(false).unwrap();
         let gaps = scene.coordinator.registry.gaps();
         assert!(

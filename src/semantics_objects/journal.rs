@@ -16510,11 +16510,14 @@ pub(crate) mod tests {
                     crate::discovery::caller_registry::RegistryLimits::default_limits(),
                 )
                 .unwrap();
-            coordinator.note_extend_receipt(&crate::attach::capture::ExtendReceipt {
-                activated_roots: true,
-                exec_coverage: Some(crate::attach::capture::ExecCoverage::scripted(domain, 0)),
-                ..crate::attach::capture::ExtendReceipt::default()
-            });
+            coordinator.note_extend_receipt(
+                &crate::attach::capture::ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(crate::attach::capture::ExecCoverage::scripted(domain, 0)),
+                    ..crate::attach::capture::ExtendReceipt::default()
+                },
+                crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+            );
             coordinator.set_semantic_binding_clock(bind_sight_clock);
             let mut identity = BindIdentity::default();
             let primary =
@@ -16635,15 +16638,17 @@ pub(crate) mod tests {
             domain: NativeDomainId,
             image: ImageIdentity,
         ) -> crate::discovery::caller_registry::CallerId {
-            self.coordinator
-                .note_extend_receipt(&crate::attach::capture::ExtendReceipt {
+            self.coordinator.note_extend_receipt(
+                &crate::attach::capture::ExtendReceipt {
                     activated_roots: true,
                     exec_coverage: Some(crate::attach::capture::ExecCoverage::scripted(
                         domain,
                         image.exec_id,
                     )),
                     ..crate::attach::capture::ExtendReceipt::default()
-                });
+                },
+                crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+            );
             let module = self.binding().reference_single_provider_module().clone();
             genuine_bind(
                 &mut self.coordinator,

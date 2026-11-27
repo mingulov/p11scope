@@ -2569,11 +2569,14 @@ impl BindingScene {
         let inventory = NativeDomainId::mint();
         let foreign = NativeDomainId::mint();
         for domain in [detailed, inventory, foreign] {
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                activated_roots: true,
-                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-                ..ExtendReceipt::default()
-            });
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                    ..ExtendReceipt::default()
+                },
+                crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+            );
         }
         coordinator.set_semantic_binding_clock(sight_clock);
         Self {
@@ -3408,11 +3411,14 @@ impl ConversionScene {
             AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
                 .expect("shell lane starts");
         let detailed = lane.domain();
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         scene.answer(pid, detailed, 7);
         scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
         let module = scene.module.clone();
@@ -4544,11 +4550,14 @@ impl CgroupScene {
             .key
             .clone();
         // Detailed binder proof for the semantic binding.
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let mut identity = ScriptedPidIdentity::default();
         identity.answers.insert(
             (pid, detailed),
@@ -6913,11 +6922,14 @@ impl SameCallerProviders {
         let lane = AttestedSemanticLane::start(subset, &Scope::Pid(pid), BackendSelection::Auto)
             .expect("two physically held providers form a shell lane");
         let domain = lane.domain();
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let providers: Vec<_> = lane
             .subset()
             .required()
@@ -7109,11 +7121,14 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
     let lane = AttestedSemanticLane::start(subset, &Scope::Pid(pid_a), BackendSelection::Auto)
         .expect("shell lane starts over two providers");
     let detailed = lane.domain();
-    scene.coordinator.note_extend_receipt(&ExtendReceipt {
-        activated_roots: true,
-        exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
-        ..ExtendReceipt::default()
-    });
+    scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+            ..ExtendReceipt::default()
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     // One actual physical registry module per retained provider, plus
     // a foreign inode no provider claims.
     let providers: Vec<(PinnedObjectId, String, ModuleKey)> = lane
@@ -8446,11 +8461,14 @@ fn native_semantic_single_provider_refresh_target_preserved() {
         AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
             .expect("shell lane starts over one provider");
     let detailed = lane.domain();
-    scene.coordinator.note_extend_receipt(&ExtendReceipt {
-        activated_roots: true,
-        exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
-        ..ExtendReceipt::default()
-    });
+    scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+            ..ExtendReceipt::default()
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     // Retained physical identity and digest select the provider. The
     // registry path may differ from the attachment FD path.
     let subset = lane.subset();
@@ -10409,6 +10427,7 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
             fn note_extend_receipt(
                 &mut self,
                 _receipt: &crate::attach::inventory::capture::ExtendReceipt,
+                _kind: crate::discovery::engine::inventory_coordinator::ReceiptKind,
             ) {
             }
             fn note_capture_custody(

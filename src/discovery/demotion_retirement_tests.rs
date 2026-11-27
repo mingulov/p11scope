@@ -3220,15 +3220,14 @@ fn round4_late_initial_handle_requires_new_fence(delayed_staging: bool, competin
 
     let first_domain = scene.native.domain;
     let second_domain = NativeDomainId::mint();
-    scene
-        .native
-        .scene
-        .coordinator
-        .note_extend_receipt(&ExtendReceipt {
+    scene.native.scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
             activated_roots: true,
             exec_coverage: Some(ExecCoverage::scripted(second_domain, 0)),
             ..ExtendReceipt::default()
-        });
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     scene.native.domain = second_domain;
     scene.native.answer(7, 500, 99);
     let row = scene.native.row(99, 1, 7, 100, 0);

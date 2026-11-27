@@ -10316,11 +10316,14 @@ mod custody_chain_tests {
             )
             .unwrap();
             let detailed = NativeDomainId::mint();
-            coordinator.note_extend_receipt(&ExtendReceipt {
-                activated_roots: true,
-                exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
-                ..ExtendReceipt::default()
-            });
+            coordinator.note_extend_receipt(
+                &ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+                    ..ExtendReceipt::default()
+                },
+                crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+            );
             coordinator.set_semantic_binding_clock(sight_clock);
             let pins = operation_pins();
             let pin = pins.pinned().next().unwrap();
@@ -10714,11 +10717,14 @@ mod custody_chain_tests {
         .expect("shell lane starts");
         let domain = lane.domain();
         let mut scene = CustodyScene::new();
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let pid = std::process::id();
         let caller = scene.admit(pid, 50);
         scene.map(caller, pid, 60);
@@ -11096,11 +11102,14 @@ mod custody_chain_tests {
         .expect("shell lane starts");
         let domain = lane.domain();
         let mut scene = CustodyScene::new();
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let pid = std::process::id();
         let caller = scene.admit(pid, 50);
         scene.map(caller, pid, 60);

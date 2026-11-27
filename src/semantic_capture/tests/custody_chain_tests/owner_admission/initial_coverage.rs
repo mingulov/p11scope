@@ -211,17 +211,20 @@ fn stage_physical_use_from(
     assert!(first_ns > 3 && first_ns <= at_ns + 3);
     scene.coordinator.set_semantic_binding_clock(sight_clock);
     SIGHT_NS.with(|clock| clock.set(first_ns - 1));
-    scene.coordinator.note_extend_receipt(&ExtendReceipt {
-        attached: vec![AttachedEndpoint {
-            id: endpoint.id,
-            object: endpoint.object,
-            at_ns: first_ns - 3,
-        }],
-        custody: Some(ScopeCustody::CgroupHeld),
-        activated_roots: true,
-        exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-        ..ExtendReceipt::default()
-    });
+    scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: endpoint.id,
+                object: endpoint.object,
+                at_ns: first_ns - 3,
+            }],
+            custody: Some(ScopeCustody::CgroupHeld),
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+            ..ExtendReceipt::default()
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     let mut identity = PhysicalIdentity {
         domain,
         pid,

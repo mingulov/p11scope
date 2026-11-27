@@ -2248,9 +2248,9 @@ Limits that matter in pods:
   count (and the per-pass peak when it differs) and whether every
   endpoint had attached by stop (otherwise how many attached, failed
   or were still deferred at stop), while `--json` keeps every per-pass
-  row plus the appended summary. A backlog no pass receipt covered
-  summarizes as `deferred at stop` instead, with no pass count or
-  peak. Endpoints that failed to attach
+  row plus the appended summary. Activation-only deferrals, which no
+  pass receipt ever measured, summarize as `deferred at stop` instead,
+  with no pass count or peak. Endpoints that failed to attach
   keep their own `native endpoint attach failed` gap. A stop
   (or a second SIGINT) that lands during a Multi attach extend waits for
   that extend first, up to 4 s plus one in-flight group attach.

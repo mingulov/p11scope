@@ -194,21 +194,24 @@ impl ScopedNativeScene {
         let endpoint = delta.endpoints[0];
         let domain = NativeDomainId::mint();
         let attached_ns = crate::discovery::caller_registry::now_ns();
-        coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: delta
-                .endpoints
-                .iter()
-                .map(|endpoint| AttachedEndpoint {
-                    id: endpoint.id,
-                    object: endpoint.object,
-                    at_ns: attached_ns,
-                })
-                .collect(),
-            custody: Some(ScopeCustody::CgroupHeld),
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: delta
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| AttachedEndpoint {
+                        id: endpoint.id,
+                        object: endpoint.object,
+                        at_ns: attached_ns,
+                    })
+                    .collect(),
+                custody: Some(ScopeCustody::CgroupHeld),
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let mut identity = OriginalNativeIdentity {
             domain,
             aliases: Vec::new(),
@@ -348,17 +351,20 @@ impl ScopedNativeScene {
         let (object, endpoint) = self.witness_target;
         let pid = self.child_id();
         let attached_ns = crate::discovery::caller_registry::now_ns();
-        self.coordinator.note_extend_receipt(&ExtendReceipt {
-            attached: vec![AttachedEndpoint {
-                id: endpoint,
-                object,
-                at_ns: attached_ns,
-            }],
-            custody: Some(ScopeCustody::CgroupHeld),
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        self.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                attached: vec![AttachedEndpoint {
+                    id: endpoint,
+                    object,
+                    at_ns: attached_ns,
+                }],
+                custody: Some(ScopeCustody::CgroupHeld),
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let first_ns = crate::discovery::caller_registry::now_ns();
         assert!(first_ns > attached_ns);
         let mut row = WitnessRow::scripted(domain, ticket, exec, object, endpoint, pid, first_ns);

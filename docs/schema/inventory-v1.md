@@ -88,14 +88,14 @@ A native document adds to `observation`:
     loss itself stays: the `native capture lifecycle evidence lost` gap
     and its demotion apply for the rest of the capture.
 
-The native lane attaches in batches across passes: every pass whose
-extend receipt still holds deferred endpoints stages one gap with
-`subject` `native endpoint attach deferred` per affected module (and
-one run-wide gap for deferred endpoints no module claims), with the
-pass's still-deferred count in `reason`. Calls made through an
+The native lane attaches in batches across passes: the activation
+receipt and every pass receipt still holding deferred endpoints stage
+one gap with `subject` `native endpoint attach deferred` per affected
+module (and one run-wide gap for deferred endpoints no module claims),
+with the receipt's still-deferred count in `reason`. Calls made through an
 endpoint while it is deferred are never counted, so the module's
 counted uses are lower bounds. At stop one summary gap appends per
-module (plus the run-wide one when it applies) while every per-pass
+module (plus the run-wide one when it applies) while every per-receipt
 row stays, so `gaps[]` and the event stream stay append-only with
 equal indices; concise text folds each module's rows under its
 summary to one line. The summary `reason` reads `attach finished
@@ -108,18 +108,17 @@ where `{total}` is the distinct deferred endpoint count and each
 deferred endpoint lands in exactly one outcome (a deferred endpoint
 that later failed counts as failed); when the total exceeds the
 per-pass peak the parenthesis also names it (`peak {max} in one
-pass`). Endpoints the stop folds without any pass receipt behind them
-(a lane backlog no receipt covered) summarize without a pass span or
-peak — no pass measured them: the `reason` reads `attach unfinished
-at stop: {total} endpoint(s) deferred at stop ({still} still deferred
-at stop); counted uses are lower bounds`, attributing where the stop
-folded them. No current lane path produces this shape: the activation
-and every pass receipt are noted before their deferred remainder
-becomes the lane backlog, so every same-host backlog is already
-folded when the stop note runs. The shape is specified defensively
-for stop accounting a future host-pending design ruling may allow.
-Each
-summary otherwise attributes where its receipts did. Endpoints that
+pass`). Only scan-pass receipts count toward the pass span and peak:
+the activation receipt folds ids and stages rows but is not a scan
+pass. Endpoints no pass receipt ever deferred — deferred only by the
+activation receipt — summarize without a pass span or peak: the
+`reason` reads `attach unfinished at stop: {total} endpoint(s)
+deferred at stop ({still} still deferred at stop); counted uses are
+lower bounds` (or the finished-late head when later passes attached
+them all). This shape arises on zero-pass startup stops whose
+activation deferred, and whenever later passes attach everything the
+activation deferred without deferring themselves. Each
+summary attributes where its receipts did. Endpoints that
 failed to attach (sticky, never retried) keep their own gap with
 `subject` `native endpoint attach failed`. Any of these gaps forces a
 `PARTIAL` verdict.

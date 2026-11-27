@@ -251,11 +251,14 @@ fn inventory_original(scene: &mut AdmissionScene) -> InventoryReplay {
     };
     assert_ne!(inventory.domain, scene.lane.as_ref().unwrap().domain());
     scene.coordinator.set_semantic_binding_clock(sight_clock);
-    scene.coordinator.note_extend_receipt(&ExtendReceipt {
-        activated_roots: true,
-        exec_coverage: Some(ExecCoverage::scripted(inventory.domain, 0)),
-        ..ExtendReceipt::default()
-    });
+    scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(inventory.domain, 0)),
+            ..ExtendReceipt::default()
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     assert!(
         witness_wave(
             scene,
@@ -345,11 +348,14 @@ fn run_successor_replay(
     };
     assert_ne!(inventory.domain, scene.lane.as_ref().unwrap().domain());
     scene.coordinator.set_semantic_binding_clock(sight_clock);
-    scene.coordinator.note_extend_receipt(&ExtendReceipt {
-        activated_roots: true,
-        exec_coverage: Some(ExecCoverage::scripted(inventory.domain, 0)),
-        ..ExtendReceipt::default()
-    });
+    scene.coordinator.note_extend_receipt(
+        &ExtendReceipt {
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(inventory.domain, 0)),
+            ..ExtendReceipt::default()
+        },
+        crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+    );
     let at_ns = now_ns();
     let old_inventory = ImageIdentity {
         task_cookie: 41,

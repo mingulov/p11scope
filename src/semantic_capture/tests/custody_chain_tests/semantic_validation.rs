@@ -985,11 +985,14 @@ impl RealScene {
         )
         .unwrap();
         scene.coordinator.set_semantic_binding_clock(sight_clock);
-        scene.coordinator.note_extend_receipt(&ExtendReceipt {
-            activated_roots: true,
-            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
-            ..ExtendReceipt::default()
-        });
+        scene.coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            },
+            crate::discovery::engine::inventory_coordinator::ReceiptKind::Pass,
+        );
         let h0 = SharedH0(Rc::new(RefCell::new(HeldH0 {
             capture: SemanticCapture::in_domain(domain, TickLimits::default()).unwrap(),
             io,

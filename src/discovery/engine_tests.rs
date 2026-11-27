@@ -24955,13 +24955,13 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
 /// ownership (scan pins always file their proving view's ownership
 /// rows); without them view retirement is a no-op and the pin
 /// lifetime below is untestable. Returns the backing dir (kept
-/// alive), the sleeper (reaped by the caller), the engine, the
-/// proof's key and the provider path.
+/// alive), the sleeper (a custody guard, closed or dropped by the
+/// caller), the engine, the proof's key and the provider path.
 fn learned_tables_engine_with(
     decoder_abi: Option<p11scope_manifest::elf::ElfAbi>,
 ) -> (
     tempfile::TempDir,
-    std::process::Child,
+    ParkedSleep,
     Engine,
     ObjectKey,
     String,
@@ -24977,10 +24977,8 @@ fn learned_tables_engine_with(
     let path = backing.to_string_lossy().into_owned();
     record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
     let me = std::process::id();
-    let sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
+    let sleeper =
+        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -25074,7 +25072,7 @@ fn learned_candidate_module_count(engine: &mut Engine) -> usize {
 /// be owned by the proving view id.
 #[test]
 fn learned_tables_survive_proving_view_retirement() {
-    let (_dir, mut sleeper, mut engine, _key, _path) =
+    let (_dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25093,8 +25091,8 @@ fn learned_tables_survive_proving_view_retirement() {
         1,
         "the learned module re-binds after its proving view retires"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A candidate commit must not drop run-persistent learned-table pins
@@ -25104,7 +25102,7 @@ fn learned_tables_survive_proving_view_retirement() {
 /// the next gap tick and retires every slot.
 #[test]
 fn run_learned_harvest_aliases_survive_candidate_commit() {
-    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let (_dir, sleeper, mut engine, key, path) = learned_tables_engine_with(None);
     // Post-clobber steady state: the store kept its module while an
     // earlier commit dropped the reserved aliases.
     assert!(
@@ -25154,8 +25152,8 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
         1,
         "the harvested aliases survive the commit and still bind with no live owner"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// The recycled-id shape: the released proving view id is reused by
@@ -25164,7 +25162,7 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
 #[test]
 fn learned_tables_survive_proving_view_reuse_and_retirement() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
-    let (dir, mut sleeper, mut engine, _key, _path) =
+    let (dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25190,8 +25188,8 @@ fn learned_tables_survive_proving_view_reuse_and_retirement() {
         1,
         "the learned module re-binds after its proving view id is reused and retired"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// The refresh shape: the proving view id is reused and its pins
@@ -25199,7 +25197,7 @@ fn learned_tables_survive_proving_view_reuse_and_retirement() {
 /// learned module must still re-bind.
 #[test]
 fn learned_tables_survive_proving_view_refresh() {
-    let (_dir, mut sleeper, mut engine, _key, _path) =
+    let (_dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25217,8 +25215,8 @@ fn learned_tables_survive_proving_view_refresh() {
         1,
         "the learned module re-binds after its proving view refreshes without it"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A learned module that cannot bind files the dedicated finite
@@ -25226,7 +25224,7 @@ fn learned_tables_survive_proving_view_refresh() {
 /// path-carrying skip that collapses to the generic discovery row.
 #[test]
 fn learned_table_bind_loss_files_the_dedicated_counted_row() {
-    let (_dir, mut sleeper, mut engine, _key, _path) =
+    let (_dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25274,8 +25272,8 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
         projected.reason,
         "a learned provider's tables lost their pinned identity; its calls were not observed"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A learned module whose scan-time decoder ABI disagrees with its
@@ -25284,7 +25282,7 @@ fn learned_table_bind_loss_files_the_dedicated_counted_row() {
 /// path-carrying skip would collapse to the generic discovery row.
 #[test]
 fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
-    let (_dir, mut sleeper, mut engine, _key, _path) =
+    let (_dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25337,8 +25335,8 @@ fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
         projected.reason,
         "a learned provider's tables lost their pinned identity; its calls were not observed"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// The table-harvest cap refuses loudly: past 32 learned table
@@ -25349,7 +25347,7 @@ fn learned_table_abi_mismatch_files_the_dedicated_counted_row() {
 #[test]
 fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
     use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
-    let (dir, mut sleeper, mut engine, _key, _path) =
+    let (dir, sleeper, mut engine, _key, _path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(engine.run_learned_modules.len(), 1);
     let cap = crate::fanotify::LEARNED_FILES_PER_CAPTURE_CAP;
@@ -25431,8 +25429,8 @@ fn run_learned_table_harvest_cap_refusal_is_counted_and_named() {
         "the refusal names the table cap, not the file cap: {:?}",
         engine.counters.object_skips,
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Outside `--pid` a learned-entry misfire is host-wide: only
@@ -25592,7 +25590,7 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
 #[test]
 fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
     use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
-    let (dir, mut sleeper, mut engine, key, path) =
+    let (dir, sleeper, mut engine, key, path) =
         learned_tables_engine_with(Some(p11scope_manifest::elf::ElfAbi::Lp64));
     assert_eq!(
         learned_candidate_module_count(&mut engine),
@@ -25693,8 +25691,8 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
         1,
         "the old generation still binds against its own pins"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A harvested proof past the per-module table cap truncates on entry
@@ -25703,7 +25701,7 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
 #[test]
 fn run_learned_table_merge_cap_overflow_is_counted() {
     use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
-    let (dir, mut sleeper, mut engine, _key, _path) = learned_tables_engine_with(None);
+    let (dir, sleeper, mut engine, _key, _path) = learned_tables_engine_with(None);
     assert_eq!(engine.merge_tables_dropped(), 0);
     let backing = dir.path().join("libtableover.so");
     std::fs::write(&backing, "p11scope-fixture:table-over").expect("write over-cap backing");
@@ -25745,8 +25743,8 @@ fn run_learned_table_merge_cap_overflow_is_counted() {
         .expect("the over-cap proof still files its module");
     assert_eq!(stored.tables.len(), MAX_MERGED_TABLES_PER_MODULE);
     assert_eq!(engine.merge_tables_dropped(), 6);
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A harvest that changes only union flags (here: the decoder ABI
@@ -25755,7 +25753,7 @@ fn run_learned_table_merge_cap_overflow_is_counted() {
 #[test]
 fn run_learned_harvest_dirties_flag_only_union_changes() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
-    let (dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let (dir, sleeper, mut engine, key, path) = learned_tables_engine_with(None);
     assert_eq!(engine.run_learned_modules.len(), 1);
     assert_eq!(engine.run_learned_modules[0].decoder_abi, None);
     engine.learned_unapplied = false;
@@ -25786,8 +25784,8 @@ fn run_learned_harvest_dirties_flag_only_union_changes() {
         "a flag-only union change still owes the frame and the apply"
     );
     let _ = key;
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Fresh learned staging owes prompt table-proving scans: every
@@ -34550,8 +34548,10 @@ fn conservative_replays_under_churn_never_burn_capacity() {
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(child.id());
+    // Custody before readiness: the guard owns kill/reap before the
+    // fallible settle wait runs.
     let _reap = ChildReaper(child);
+    wait_sleep_child_settled(_reap.0.id());
     let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
     let modules = child_provider_modules(&view);
     let busy = with_endpoints(modules[0].clone(), ceiling - 80);
@@ -34674,8 +34674,10 @@ fn named_reserve_ignores_failed_attaches_across_conservative_replays() {
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(child.id());
+    // Custody before readiness: the guard owns kill/reap before the
+    // fallible settle wait runs.
     let _reap = ChildReaper(child);
+    wait_sleep_child_settled(_reap.0.id());
     let view = ProcessView::open(ProcessViewId(3), _reap.0.id()).unwrap();
     let modules = child_provider_modules(&view);
     let busy = with_endpoints(modules[0].clone(), capacity - 100);
@@ -48700,9 +48702,11 @@ fn multi_process_start_retires_views_that_went_stale_during_attach_live() {
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(child.id());
+    // Custody before readiness: the guard owns kill/reap before the
+    // fallible settle wait runs.
     let exiting = std::cell::RefCell::new(ChildReaper(child));
     let exiting_pid = exiting.borrow().0.id();
+    wait_sleep_child_settled(exiting_pid);
     let views = vec![
         ProcessView::open(ProcessViewId(0), exiting_pid).unwrap(),
         crate::process::unprovable_process_view_for_test(ProcessViewId(1), std::process::id())
@@ -77741,9 +77745,12 @@ fn engine_with_accepted_providers(count: usize) -> (Vec<SystemScopeChildGuard>, 
             .die_with_parent()
             .spawn()
             .unwrap();
-        wait_sleep_child_settled(child.id());
-        engine.scope = Scope::Pid(child.id());
-        let view = ProcessView::open(ProcessViewId(3 + index as u32), child.id()).unwrap();
+        // Custody before readiness: wrap first, then settle/open on the
+        // owned pid, so a fallible step never precedes the guard.
+        let guard = SystemScopeChildGuard::new(child);
+        wait_sleep_child_settled(guard.pid());
+        engine.scope = Scope::Pid(guard.pid());
+        let view = ProcessView::open(ProcessViewId(3 + index as u32), guard.pid()).unwrap();
         let modules = child_provider_modules(&view);
         engine.views.push(view);
         let pins = pin_test_modules(&engine.views[index], &modules[..1]);
@@ -77756,7 +77763,7 @@ fn engine_with_accepted_providers(count: usize) -> (Vec<SystemScopeChildGuard>, 
             .apply_candidate(&mut session, candidate, &mut additions, false, &[])
             .unwrap();
         assert!(outcome.accepted(), "provider {index} is accepted whole");
-        guards.push(SystemScopeChildGuard::new(child));
+        guards.push(guard);
     }
     engine.next_view_id = engine.next_view_id.max(3 + count as u32);
     engine.scope = Scope::System;
@@ -77820,20 +77827,22 @@ fn collected_graph_barrier_fences_records_and_assessments() {
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(w_child.id());
+    // Custody before readiness: each guard owns kill/reap before the
+    // fallible settle wait runs; readiness uses the owned pid.
+    let mut w_guard = SystemScopeChildGuard::new(w_child);
+    wait_sleep_child_settled(w_guard.pid());
     let u_child = std::process::Command::new("sleep")
         .arg("600")
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(u_child.id());
-    let w = ProcessView::open(ProcessViewId(4), w_child.id()).unwrap();
-    let u = ProcessView::open(ProcessViewId(5), u_child.id()).unwrap();
+    let mut u_guard = SystemScopeChildGuard::new(u_child);
+    wait_sleep_child_settled(u_guard.pid());
+    let w = ProcessView::open(ProcessViewId(4), w_guard.pid()).unwrap();
+    let u = ProcessView::open(ProcessViewId(5), u_guard.pid()).unwrap();
     let (w_id, u_id) = (w.id(), u.id());
     engine.views.push(w);
     engine.views.push(u);
-    let mut w_guard = SystemScopeChildGuard::new(w_child);
-    let mut u_guard = SystemScopeChildGuard::new(u_child);
     assert!(
         engine
             .dispatch_lifecycle_record(
@@ -77905,24 +77914,25 @@ fn collected_graph_barrier_fences_records_and_assessments() {
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(w_child.id());
+    // Custody before readiness: each guard owns kill/reap before the
+    // fallible settle wait runs; readiness uses the owned pid.
+    let w_guard = SystemScopeChildGuard::new(w_child);
+    wait_sleep_child_settled(w_guard.pid());
     let u_child = std::process::Command::new("sleep")
         .arg("600")
         .die_with_parent()
         .spawn()
         .unwrap();
-    wait_sleep_child_settled(u_child.id());
-    let w_pid = w_child.id();
-    let u_pid = u_child.id();
+    let u_guard = SystemScopeChildGuard::new(u_child);
+    wait_sleep_child_settled(u_guard.pid());
+    let w_pid = w_guard.pid();
+    let u_pid = u_guard.pid();
     let mut second = lifecycle_discovered(vec![
         ProcessView::open(ProcessViewId(4), w_pid).unwrap(),
         ProcessView::open(ProcessViewId(5), u_pid).unwrap(),
     ]);
     second.scope = Scope::System;
-    let mut guards = vec![
-        SystemScopeChildGuard::new(w_child),
-        SystemScopeChildGuard::new(u_child),
-    ];
+    let mut guards = vec![w_guard, u_guard];
     let mut session = ScriptedSession::default();
     assert!(
         second
@@ -80867,8 +80877,10 @@ fn collected_graph_reclaim_refusal_retains_and_finishes() {
         .die_with_parent()
         .spawn()
         .expect("a spare child");
-    wait_sleep_child_settled(spare.id());
+    // Custody before readiness: the guard owns kill/reap before the
+    // fallible settle wait runs.
     let _spare = SystemScopeChildGuard::new(spare);
+    wait_sleep_child_settled(_spare.pid());
     let bare = ProcessViewId(engine.next_view_id);
     engine
         .views
@@ -97875,13 +97887,10 @@ fn mid_scan_exit_race_with_live_group_stays_loud() {
 #[test]
 fn mid_scan_exit_race_with_reused_pid_stays_loud() {
     use crate::discovery::noise::DiscoveryNoiseClass;
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = crate::process::reused_process_view_for_test(ProcessViewId(716), pid).unwrap();
     assert!(
         !view.still_the_same(),
@@ -97917,8 +97926,8 @@ fn mid_scan_exit_race_with_reused_pid_stays_loud() {
         3,
         "loud races keep their class count"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// A proven exit excuses only exit-shaped refusals: a proven reuse

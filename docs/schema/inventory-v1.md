@@ -113,7 +113,12 @@ pass`). Endpoints the stop folds without any pass receipt behind them
 peak — no pass measured them: the `reason` reads `attach unfinished
 at stop: {total} endpoint(s) deferred at stop ({still} still deferred
 at stop); counted uses are lower bounds`, attributing where the stop
-folded them. Each
+folded them. No current lane path produces this shape: the activation
+and every pass receipt are noted before their deferred remainder
+becomes the lane backlog, so every same-host backlog is already
+folded when the stop note runs. The shape is specified defensively
+for stop accounting a future host-pending design ruling may allow.
+Each
 summary otherwise attributes where its receipts did. Endpoints that
 failed to attach (sticky, never retried) keep their own gap with
 `subject` `native endpoint attach failed`. Any of these gaps forces a

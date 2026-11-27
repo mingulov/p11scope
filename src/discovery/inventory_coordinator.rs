@@ -266,7 +266,10 @@ struct DeferralFold {
 /// cooperative stop drains one credit per step and resumes on the next
 /// step until the stash is empty; the blocking stop loops the same
 /// credit. Each id costs one indexed folded-probe plus one indexed
-/// attribution, so a credit is bounded work.
+/// owner lookup; an id several modules claim fans out to each of them,
+/// and total fanout is bounded by the recorded membership table (a
+/// small multiple of the endpoint budget, and no admission runs
+/// between drain slices), so a credit is bounded work.
 const STOP_BACKLOG_IDS_PER_DRAIN: usize = 64;
 
 /// Inserts one deferred endpoint id under every module claiming it
@@ -5391,7 +5394,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// cooperative stop resumes on its next step, the blocking stop
     /// loops, and both finish before `end_capture_coverage` consumes
     /// the folds. Each id costs one indexed folded-probe plus one
-    /// indexed attribution.
+    /// indexed owner lookup, fanning out to every module currently
+    /// claiming it.
     pub(crate) fn drain_stop_backlog(&mut self) -> bool {
         for _ in 0..STOP_BACKLOG_IDS_PER_DRAIN {
             let Some(id) = self.stop_backlog_pending.pop() else {
@@ -23219,6 +23223,121 @@ pub(crate) mod tests {
         assert!(
             !coordinator.drain_stop_backlog(),
             "nothing to drain without capture"
+        );
+    }
+
+    /// Stop-drain fanout: one endpoint two modules claim folds once per
+    /// claiming module — matching what a pass receipt would stage per
+    /// module — never twice per module and never run-wide. The credit
+    /// counts endpoint ids; each id fans out to its currently recorded
+    /// owners.
+    #[test]
+    fn stop_backlog_drain_folds_shared_endpoint_once_per_claiming_module() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let b = fx::provider(&dir, "b.so", "provider-b");
+        let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let shared_offset = fx::offsets(2)[0];
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                &[
+                    fx::module(&pins, &a, &fx::offsets(2)),
+                    fx::module_with_targets(&pins, &b, &[(&a, shared_offset), (&b, 0x4000)]),
+                ],
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let shared = absorbed
+            .delta
+            .endpoints
+            .iter()
+            .find(|target| {
+                coordinator
+                    .attach_set
+                    .modules_with_member(target.id)
+                    .count()
+                    == 2
+            })
+            .copied()
+            .expect("one endpoint both modules claim");
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a, &b], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        // No pass receipt: the shared endpoint reaches the fold only
+        // through the stop note.
+        coordinator.note_stop_backlog(crate::discovery::inventory_attach_set::TargetDelta {
+            endpoints: vec![shared],
+            objects: vec![shared.object],
+            info_revoked: vec![],
+        });
+        assert!(
+            !coordinator.drain_stop_backlog(),
+            "one id drains in one credit"
+        );
+        let holding: Vec<_> = coordinator
+            .deferral_folds
+            .iter()
+            .filter(|(_, fold)| fold.deferred_ids.contains(&shared.id))
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(
+            holding.len(),
+            2,
+            "the shared id folds under both claiming modules: {holding:?}"
+        );
+        assert!(
+            holding.iter().all(|key| key.is_some()),
+            "neither fold reports run-wide: {holding:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let unfinished: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == "native endpoint attach deferred"
+                    && gap.reason.starts_with("attach unfinished at stop:")
+            })
+            .collect();
+        assert_eq!(
+            unfinished.len(),
+            2,
+            "each claiming module folds its own gap: {:?}",
+            coordinator.registry.gaps()
+        );
+        for gap in &unfinished {
+            assert_eq!(
+                gap.reason,
+                "attach unfinished at stop: 1 endpoint(s) deferred at stop (1 still deferred at \
+                 stop); counted uses are lower bounds",
+                "one shared endpoint counts once per module: {gap:?}"
+            );
+        }
+        let modules: std::collections::BTreeSet<_> =
+            unfinished.iter().map(|gap| gap.module).collect();
+        assert_eq!(
+            modules.len(),
+            2,
+            "the two folded gaps attribute to distinct modules: {:?}",
+            unfinished
         );
     }
 

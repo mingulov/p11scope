@@ -1967,7 +1967,8 @@ struct ReceiptHost {
     /// this many times, then reports empty (the cooperative resume
     /// twin scripts this).
     drain_true_remaining: usize,
-    /// Terminal call order (`note_stop_backlog`, `end_capture_coverage`).
+    /// Terminal call order (`note_stop_backlog`, `drain_stop_backlog`
+    /// per call, `end_capture_coverage`).
     order: Vec<&'static str>,
     gaps: Vec<(String, String)>,
 }
@@ -2033,6 +2034,7 @@ impl LaneHost<Pin> for ReceiptHost {
     }
     fn drain_stop_backlog(&mut self) -> bool {
         self.drain_calls += 1;
+        self.order.push("drain_stop_backlog");
         if self.drain_true_remaining > 0 {
             self.drain_true_remaining -= 1;
             true
@@ -3230,12 +3232,15 @@ fn tick_receipt_forwards_only_on_forwardable_progress() {
 /// The stop notes the lane backlog still deferred when it lands — and
 /// nothing else: the host delta stays untouched (no target delta is
 /// taken after the stop). The backlog forms through a real pass (512
-/// attached, 88 deferred), the note precedes the coverage end, and the
-/// blocking stop drains before returning.
+/// attached, 88 deferred). The scripted host reports two resumed
+/// credits before empty, and the blocking stop drains every credit —
+/// note, drain, drain, drain, then the coverage end — instead of
+/// stopping after one credit.
 #[test]
 fn stop_notes_the_lane_backlog_without_taking_the_host_delta() {
     let log = Log::default();
     let mut host = ReceiptHost::with_delta(fabricated_delta(600));
+    host.drain_true_remaining = 2;
     let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
@@ -3266,22 +3271,88 @@ fn stop_notes_the_lane_backlog_without_taking_the_host_delta() {
         3,
         "the host delta stays untouched: no take after the stop"
     );
-    let note_at = host
-        .order
-        .iter()
-        .position(|entry| *entry == "note_stop_backlog");
-    let end_at = host
-        .order
-        .iter()
-        .position(|entry| *entry == "end_capture_coverage");
-    assert!(
-        note_at.is_some_and(|note| end_at.is_some_and(|end| note < end)),
-        "the note precedes the coverage end: {:?}",
-        host.order
+    assert_eq!(
+        host.drain_calls, 3,
+        "two resumed credits plus the empty check"
     );
+    assert_eq!(
+        host.order,
+        vec![
+            "note_stop_backlog",
+            "drain_stop_backlog",
+            "drain_stop_backlog",
+            "drain_stop_backlog",
+            "end_capture_coverage",
+        ],
+        "the final false drain precedes the coverage end"
+    );
+}
+
+/// The blocking stop folds tick-produced INFO counts and a multi-credit
+/// backlog together: a real pass defers hundreds of endpoints, one tick
+/// reports INFO counts, and the blocking stop forwards the receipt and
+/// drains every credit before the coverage ends. The lane stops against
+/// a coordinator that missed the pass receipts (host switch through
+/// public methods only — no private lane state is mutated), the only
+/// way to give a real coordinator an unfolded backlog: every same-host
+/// backlog is receipt-covered by construction (see the receipt-covered
+/// invariant note in the inventory schema).
+#[test]
+fn blocking_stop_folds_tick_info_and_multi_credit_backlog() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(1200));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (512, 688));
+    lane.capture.extend_info = ScriptedExtendInfo {
+        deferred: 3,
+        refused_hazard: 2,
+        revoked: 5,
+        revoke_failed: 1,
+    };
+    lane.tick(&mut host);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    // 688 deferred minus the 64 the tick drained: nine full credits
+    // plus a remainder of 48.
+    assert_eq!(lane.backlog.endpoints.len(), 624);
+    let mut coordinator = info_coordinator();
+    coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+    lane.stop(&mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.gaps.return_deferred, 3,
+        "the stop flush forwards the tick's deferred info returns"
+    );
+    assert_eq!(
+        observations.gaps.return_refused_hazard, 2,
+        "the stop flush forwards the tick's refused-hazard info returns"
+    );
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
     assert!(
-        host.drain_calls >= 1,
-        "the blocking stop drains before returning"
+        gaps.iter().any(|gap| gap.subject.contains("provider info")
+            && gap
+                .reason
+                .contains("info revocation failed for 1 endpoint(s)")),
+        "the stop flush forwards the tick's revocation failure: {gaps:?}"
+    );
+    let summary = gaps.iter().find(|gap| {
+        gap.subject == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+            && gap
+                .reason
+                .contains("624 endpoint(s) with no recorded module")
+    });
+    assert!(
+        summary.is_some(),
+        "the blocking stop folds all ten credits: {gaps:?}"
+    );
+    assert_eq!(
+        summary.unwrap().reason.as_str(),
+        "attach unfinished at stop: 624 endpoint(s) with no recorded module deferred at stop \
+         (624 still deferred at stop); counted uses are lower bounds",
+        "every stashed id reaches the stop summary"
     );
 }
 

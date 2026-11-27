@@ -39484,3 +39484,252 @@ fn key_operation_schema_v7_detail_accepts_mathematical_integers() {
         );
     }
 }
+
+/// Absorb-twin for the incarnation-mint flow: an absorbable
+/// (post-collection) fault absorbs (typed, counted) instead of voiding.
+/// The staged doom still lands on the same seal (typed doom gap), and
+/// with no fence anywhere the dead binding rebinds itself — no fresh
+/// incarnation mints — while fresh bindings bind.
+#[test]
+fn key_operation_absorbable_fault_counts_absorb_without_minting() {
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+    let mut scene = JointScene::new();
+    let doom_get = ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0);
+    let admitted = admit_call_input(&mut scene, &doom_get);
+    let proof = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("doom admission attests");
+    let doom_begin = scene
+        .paired_begins
+        .remove(&admitted.h0_ordinal())
+        .expect("paired BEGIN");
+    scene.ingest(&doom_begin);
+    scene.ingest_ordinary(ordinary_for(&doom_begin, CkRv::SESSION_HANDLE_INVALID.0));
+    let record =
+        decode_journal_record(&doom_begin, &scene.descriptors).expect("paired BEGIN decodes");
+    let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {
+        panic!("BEGIN input")
+    };
+    let abandon = abandon_bytes(
+        scene.thread,
+        native.sequence(),
+        JOURNAL_REASON_EXEC_EXIT,
+        (COOKIE, EXEC),
+    );
+    assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+    let voids_before = scene.adapter.joint_void_diagnosis();
+    let waited = scene.seal_with_fault(7, 8);
+    let voids_after = scene.adapter.joint_void_diagnosis();
+    assert_eq!(
+        voids_after.audit_fault_absorbed_reread,
+        voids_before.audit_fault_absorbed_reread + 1,
+        "the post-collection move absorbs as a reread"
+    );
+    assert_eq!(
+        voids_after.void_audit, voids_before.void_audit,
+        "absorbing voids nothing"
+    );
+    // The claimed abandonment dooms on the first seal: absorb, then doom.
+    assert_eq!(
+        waited.err().expect("the fault seal dooms").gap,
+        JournalGap::DomainTainted,
+        "the staged doom lands typed and fenceless"
+    );
+    assert_eq!(
+        scene.adapter.voided_through_for_test(),
+        0,
+        "no void advances the global cut"
+    );
+    // The dead fenceless binding rebinds itself: no fence mints nothing.
+    let readmit = scene.fixture.admit_function("C_CreateObject");
+    let rebind = scene
+        .adapter
+        .attest_key(&readmit)
+        .expect("the dead binding still attests");
+    assert_eq!(rebind, proof, "no fence mints no incarnation");
+    // A fresh binding binds: the adapter is not stuck.
+    let mut foreign = AttestationFixture::new(ImageIdentity {
+        task_cookie: COOKIE + 1,
+        exec_id: EXEC,
+    });
+    scene
+        .adapter
+        .attest_key(&foreign.admit_function("C_CreateObject"))
+        .expect("a fresh binding binds after the absorb");
+}
+
+/// Absorb-twin for the reseed flow: an absorbable fault ends nothing,
+/// so no rebirth triggers. The live binding rebinds its same key
+/// (never a spurious fresh incarnation), the absorb is counted, and
+/// no void advances the cut.
+#[test]
+fn key_operation_absorbable_fault_rebinds_live_key_without_minting() {
+    let mut scene = JointScene::new();
+    let call = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    let admitted = admit_call_input(&mut scene, &call);
+    let proof = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("call attests");
+    ingest_call(&mut scene, &call, admitted.h0_ordinal());
+    let voids_before = scene.adapter.joint_void_diagnosis();
+    scene
+        .seal_with_fault(7, 8)
+        .expect("the absorbed seal proceeds");
+    let voids_after = scene.adapter.joint_void_diagnosis();
+    assert_eq!(
+        voids_after.audit_fault_absorbed_reread,
+        voids_before.audit_fault_absorbed_reread + 1,
+        "the post-collection move absorbs as a reread"
+    );
+    assert_eq!(
+        voids_after.void_audit, voids_before.void_audit,
+        "absorbing voids nothing"
+    );
+    let readmit = scene.fixture.admit_function("C_CreateObject");
+    let rebind = scene
+        .adapter
+        .attest_key(&readmit)
+        .expect("the live binding rebinds");
+    assert_eq!(
+        rebind, proof,
+        "no ending mints no incarnation for a live binding"
+    );
+}
+
+/// Absorb-twin for quarantine-end: quarantine needs a fence, so an
+/// absorbable fault neither ends it nor lifts it. The tainted image
+/// keeps refusing with its typed refusal, the absorb is counted, and
+/// other images bind fine.
+#[test]
+fn key_operation_absorbable_fault_keeps_quarantine_typed() {
+    let mut scene = JointScene::new();
+    scene.adapter.taint_image_for_test((COOKIE, EXEC));
+    assert!(scene.adapter.image_tainted_for_test((COOKIE, EXEC)));
+    let voids_before = scene.adapter.joint_void_diagnosis();
+    let refused = scene.seal_with_fault(7, 8);
+    let voids_after = scene.adapter.joint_void_diagnosis();
+    assert_eq!(
+        voids_after.audit_fault_absorbed_reread,
+        voids_before.audit_fault_absorbed_reread + 1,
+        "the post-collection move absorbs as a reread"
+    );
+    assert_eq!(
+        refused.err().expect("the tainted seal refuses").gap,
+        JournalGap::ImageTainted,
+        "the tainted image fails the seal closed after the absorb"
+    );
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    assert_eq!(
+        scene.adapter.attest_key(&admitted),
+        Err(crate::semantics_objects::journal::AttestationRefusal::ImageTainted),
+        "the taint refuses without a fence to end it"
+    );
+    assert!(
+        scene.adapter.image_tainted_for_test((COOKIE, EXEC)),
+        "no fence lifts no taint"
+    );
+    let mut foreign = AttestationFixture::new(ImageIdentity {
+        task_cookie: COOKIE + 1,
+        exec_id: EXEC,
+    });
+    scene
+        .adapter
+        .attest_key(&foreign.admit_function("C_CreateObject"))
+        .expect("another image binds through the absorb");
+}
+
+/// Absorb-twin for doom delivery: with an absorbable fault the staged
+/// doom still lands on the same seal (typed doom gap, no fence), and
+/// the fenceless doom failure delivers to the Joint feed, which
+/// degrades or falls back instead of stalling on the wait.
+#[test]
+fn key_operation_absorbable_fault_with_staged_doom_delivers_typed() {
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+    let mut fresh = GuardedScene::new();
+    let bootstrap = fresh.scene.bootstrap();
+    let joint_key = fresh.key(1);
+    assert!(
+        fresh
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = fresh.register(1);
+    let (facts, position) =
+        fresh.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    fresh.observe(&joint_key, position, facts);
+    fresh
+        .registry
+        .publish_with_ledger(fresh.scene.adapter.ledger_mut());
+    let doom_get = ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0);
+    let admitted = admit_call_input(&mut fresh.scene, &doom_get);
+    fresh
+        .scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("doom admission attests");
+    let doom_begin = fresh
+        .scene
+        .paired_begins
+        .remove(&admitted.h0_ordinal())
+        .expect("paired BEGIN");
+    fresh.scene.ingest(&doom_begin);
+    fresh.scene.ingest_ordinary(ordinary_for(
+        &doom_begin,
+        CkRv::SESSION_HANDLE_INVALID.0,
+    ));
+    let record =
+        decode_journal_record(&doom_begin, &fresh.scene.descriptors).expect("paired BEGIN decodes");
+    let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {
+        panic!("BEGIN input")
+    };
+    let abandon = abandon_bytes(
+        fresh.scene.thread,
+        native.sequence(),
+        JOURNAL_REASON_EXEC_EXIT,
+        (COOKIE, EXEC),
+    );
+    assert_eq!(
+        fresh.scene.ingest(&abandon),
+        JournalDisposition::AbandonStaged
+    );
+    let voids_before = fresh.scene.adapter.joint_void_diagnosis();
+    let waited = fresh.scene.seal_with_fault(7, 8);
+    let voids_after = fresh.scene.adapter.joint_void_diagnosis();
+    assert_eq!(
+        voids_after.audit_fault_absorbed_reread,
+        voids_before.audit_fault_absorbed_reread + 1,
+        "the post-collection move absorbs as a reread"
+    );
+    assert_eq!(
+        voids_after.void_audit, voids_before.void_audit,
+        "absorbing voids nothing"
+    );
+    // The claimed abandonment dooms on the first seal: absorb, then doom.
+    let doom = waited.err().expect("the fault seal dooms");
+    assert_eq!(
+        doom.gap,
+        JournalGap::DomainTainted,
+        "the staged doom lands typed and fenceless"
+    );
+    assert!(doom.fence.is_none(), "no void fenced the doom");
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = fresh.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &doom,
+        &mut h3,
+        &fresh.scene.model,
+        fresh.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the fenceless doom degrades or falls the feed back: {outcome:?}"
+    );
+}

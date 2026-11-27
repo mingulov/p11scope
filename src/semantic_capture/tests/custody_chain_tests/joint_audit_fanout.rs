@@ -44263,6 +44263,97 @@ fn joint_failure_yielded_spend_resets_park_cursors_at_delivery() {
     );
 }
 
+/// Absorb-twin for failure batches: an absorbable fault absorbs
+/// (typed, counted) instead of failing, so no failure batch exists
+/// and delivery is trivially ready: nothing stuck, nothing
+/// progressed, no parked cursors, no stuck causes.
+#[test]
+fn joint_failure_absorbed_move_delivers_trivially_ready() {
+    use crate::semantics_objects::journal::joint_audit::DeliverDiagnosis;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    fixture.push_two("C_SignInit", 3);
+    fixture.push_two("C_SignInit", 4);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(6, 6, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let voids_before = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    // The collection moves after the audit: post-collection and clean,
+    // so the seal absorbs it instead of failing.
+    fault.epoch.set(1);
+    assert_eq!(
+        frame.seal_next(&mut ports, &mut births, &fault),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the absorbed seal proceeds"
+    );
+    let mut diagnosis = DeliverDiagnosis::default();
+    let mut remaining = 0;
+    assert_eq!(
+        frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "nothing to deliver is trivially ready"
+    );
+    assert_eq!(diagnosis.f_stuck, 0, "nothing stuck");
+    assert_eq!(diagnosis.f_progress, 0, "nothing progressed");
+    assert_eq!(
+        frame.park_cursors_for_test(),
+        (0, 0),
+        "no parks without a failure"
+    );
+    let stuck_causes = frame.consumer_stuck_causes_for_test();
+    assert_eq!(stuck_causes.len(), 2, "both consumers stay bound");
+    assert!(
+        stuck_causes
+            .iter()
+            .all(|(_, streak, cause)| *streak == 0 && cause.is_none()),
+        "no stuck streaks without a failure: {stuck_causes:?}"
+    );
+    // Delivery reads no fault cell, so the absorb count below is the
+    // seal's alone: exactly one reread absorb, no void.
+    drop(births);
+    drop(ports);
+    let voids_after = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        voids_after.audit_fault_absorbed_reread,
+        voids_before.audit_fault_absorbed_reread + 1,
+        "the post-collection move absorbs as a reread"
+    );
+    assert_eq!(
+        voids_after.void_audit, voids_before.void_audit,
+        "absorbing voids nothing"
+    );
+}
+
 /// Seal-stage diagnostics through the production seal: a stopped
 /// adapter refuses the frame seal and counts exactly the `Stopped`
 /// gate. The Scene twin pins the shared note; this twin pins the

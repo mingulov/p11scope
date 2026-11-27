@@ -15016,7 +15016,11 @@ mod tests {
             let holds = sources[*file].2[*start..=*call]
                 .iter()
                 .any(|line| line.contains("ActualSignalTestGuard::hold()"));
-            if !holds && !helpers.iter().any(|(file, want)| *file == path && *want == name) {
+            if !holds
+                && !helpers
+                    .iter()
+                    .any(|(file, want)| *file == path && *want == name)
+            {
                 misses.push(format!(
                     "{}:{} fn {} calls the installer without the guard",
                     path,
@@ -15091,10 +15095,7 @@ mod tests {
                             index += 1;
                         }
                         StripMode::Code => {
-                            if char == '/'
-                                && index + 1 < chars.len()
-                                && chars[index + 1] == '/'
-                            {
+                            if char == '/' && index + 1 < chars.len() && chars[index + 1] == '/' {
                                 break;
                             }
                             if char == '"' {
@@ -15121,8 +15122,7 @@ mod tests {
                                     && chars[index + 1] == '\\'
                                     && index + 3 < chars.len()
                                     && chars[index + 3] == '\'';
-                                let plain = index + 2 < chars.len()
-                                    && chars[index + 2] == '\'';
+                                let plain = index + 2 < chars.len() && chars[index + 2] == '\'';
                                 if literal {
                                     index += 4;
                                     continue;

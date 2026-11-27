@@ -1567,8 +1567,7 @@ impl PassReclaim {
     /// Tests only: fail the next `n` worker-spawn attempts.
     #[cfg(test)]
     fn fail_next_spawns(&mut self, n: u32) {
-        self.spawn_failures_remaining =
-            self.spawn_failures_remaining.saturating_add(n);
+        self.spawn_failures_remaining = self.spawn_failures_remaining.saturating_add(n);
     }
 
     /// Tests only: consume one injected spawn failure.
@@ -1610,8 +1609,7 @@ impl PassReclaim {
                 // these values can close file descriptors, and a
                 // blocked close must not stop the calling thread.
                 pending.push_front(item);
-                self.counts.unavailable =
-                    self.counts.unavailable.saturating_add(1);
+                self.counts.unavailable = self.counts.unavailable.saturating_add(1);
                 break;
             };
             match sender.try_send(item) {

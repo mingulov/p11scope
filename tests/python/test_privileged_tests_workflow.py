@@ -504,7 +504,11 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         count = re.search(r"full (\d+)-cell gate", body)
         self.assertIsNotNone(count, "closed-set count comment missing")
         self.assertEqual(
-            int(count.group(1)), len(need), "closed-set count comment drifted"
+            int(count.group(1)),
+            len(need),
+            "closed-set count comment drifted: set the `full N-cell gate` comment "
+            "in the public-cli job of .github/workflows/privileged-tests.yml "
+            "to the need-set size",
         )
         host = re.search(
             r"run-cell-script\.sh public-cli-host .*?>(?:\"\$RUNNER_TEMP/qual\.log\")",

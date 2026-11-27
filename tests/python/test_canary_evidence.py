@@ -102,6 +102,9 @@ def owned_metrics_document(bits, calls=30):
     )
     evidence["discovery"][0]["tables"] = subject.version_tables_fixture(
         subject.VERSION_TABLES_SCANNED)
+    evidence["surfaces"] = subject.canary_surface_dicts(
+        evidence["discovery"][0]["path"], subject.MATRIX_SCAN_BASELINE_LP64
+    )
     evidence.update(
         table_entries=1056,
         slots=104,
@@ -3458,6 +3461,9 @@ class VersionCanaryPrefixTests(unittest.TestCase):
 
     def profile(self, bits=64, boundary=None):
         subject = load_capture_checker()
+        # Independently literal: interface[12]'s anonymous page-edge name
+        # is refused under provider-scoped read_name, so it corroborates
+        # (known_prefix, 104) instead of reading exact.
         manifest = [
             ((2, 40), 68, "full"), ((2, 40), 68, "full"),
             ((3, 0), 92, "full"), ((3, 1), 92, "full"),
@@ -3465,7 +3471,7 @@ class VersionCanaryPrefixTests(unittest.TestCase):
             ((4, 0), 68, "known_prefix"), ((3, 2), 104, "known_prefix"),
             ((3, 0), 92, "known_prefix"), ((3, 1), 92, "known_prefix"),
             ((2, 40), 68, "known_prefix"), ((0, 0), 0, "not_walked"),
-            ((3, 2), 104, "full"),
+            ((3, 2), 104, "known_prefix"),
         ]
         raw = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
                ((3, 0), 92, "full")]
@@ -3484,6 +3490,9 @@ class VersionCanaryPrefixTests(unittest.TestCase):
              "file_offset": 4096 * (index + 1)}
             for index, (version, count, _) in enumerate(raw)
         ]
+        baseline = (subject.MATRIX_SCAN_BASELINE_IA32 if bits == 32
+                    else subject.MATRIX_SCAN_BASELINE_LP64)
+        evidence["surfaces"] = subject.canary_surface_dicts(module["path"], baseline)
         if boundary is not None:
             offset, count, walk = boundary
             module["tables"].append({

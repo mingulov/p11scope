@@ -87575,6 +87575,50 @@ fn candidate_carry_with_pin_loss_refuses() {
     );
 }
 
+/// Unmapped omission with a live view files (fail closed): the
+/// victim's view retired through production removal, which drops its
+/// raw link, while an unrelated view lives — the gap discloses the
+/// uncertainty. Pins the multi-view retired-owner limitation: a
+/// spurious but conservative gap, never misattribution.
+#[test]
+fn candidate_build_with_retired_owner_files_fail_closed_gap() {
+    let (mut engine, victim, _healthy, victim_reconciled) =
+        committed_two_provider_engine_with_pin_loss();
+    let victim_view = victim_reconciled.scanned.view;
+    engine
+        .pinned
+        .remove_view_except(victim_view, &BTreeSet::new());
+    engine.views.retain(|view| view.id() != victim_view);
+    let victim_key = engine
+        .plan
+        .modules
+        .iter()
+        .find(|m| m.object == victim)
+        .expect("the victim stays planned")
+        .key;
+    assert!(
+        engine.pinned.raw_owner_views(&victim_key).is_empty(),
+        "retirement drops the raw view link"
+    );
+    let raw_b = overlay_module(overlay_key(87));
+    engine
+        .live_candidate(engine.pinned.clone(), vec![raw_b], Vec::new())
+        .expect("construction admits the degraded candidate");
+    let gaps: Vec<&str> = engine
+        .capture_facts
+        .history
+        .losses
+        .values()
+        .filter(|loss| loss.reason.contains("lost its comparable pin"))
+        .map(|loss| loss.reason.as_str())
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "unmapped omission with a live view files: {gaps:?}"
+    );
+}
+
 /// Candidate preflight with a pinless committed-plan module passes
 /// instead of bailing: only fresh mutation inputs need exact pins.
 /// Fails while preflight refuses the whole candidate on staleness.

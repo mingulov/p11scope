@@ -73,6 +73,14 @@ identity`, single-instant edges, and nothing attached. That output is
 honest; folding the undigested record into the same-key digested
 record is planned for a later release.
 
+### Retired-owner omission gap in multi-view runs
+
+An omitted pinless row whose owner view already retired files a
+conservative `lost its comparable pin` gap while any view is alive:
+retirement drops the raw view link, so the live check cannot tell a
+dead owner's rows from a live view's unattributed rows and discloses
+the uncertainty. Noise only, never misattribution.
+
 ### Same-namespace subreapers shown as launcher
 
 Init, the systemd user manager, container inits, pid-namespace

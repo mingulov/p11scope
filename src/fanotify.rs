@@ -623,12 +623,16 @@ pub(crate) struct MarkOutcome {
 /// later at descendant paths are still visible and are kept; entries
 /// the trigger already hides are dropped with the lower mount.
 pub(crate) fn mounts_for_marks(mountinfo: &str) -> Vec<MountToMark> {
-    // A point-to-index map keeps the overmount lookup linear: a dense
-    // table holds thousands of mounts and the arming pass runs under a
-    // one-second bound, so the per-line scan it replaces would eat the
-    // whole budget on parsing alone. Same result in the same order —
-    // overmounts still update in place, pseudo drops still rebuild —
-    // only the lookup is faster.
+    // A point-to-index map keeps the overmount lookup O(1) amortized
+    // per line: a dense table holds thousands of mounts and the arming
+    // pass runs under a one-second bound, so the per-line scan it
+    // replaces would eat the whole budget on parsing alone. Same result
+    // in the same order — overmounts still update in place — only the
+    // lookup is faster. Each trigger removal that actually drops mounts
+    // still rebuilds the index over the survivors, so a pathological
+    // table with O(n) removing triggers stays O(n²); ordinary tables
+    // (a handful of triggers) parse in linear time, and v0.7.1 was
+    // quadratic on every dense table either way.
     let mut mounts: Vec<MountToMark> = Vec::new();
     let mut index: HashMap<std::path::PathBuf, usize> = HashMap::new();
     for line in mountinfo.lines() {
@@ -3977,6 +3981,42 @@ mod tests {
             marks,
             vec!["/"],
             "paths hidden under the trigger are dropped, not marked through it"
+        );
+    }
+
+    /// A trigger removal keeps the point index consistent for later
+    /// overmount updates: after an `autofs` trigger drops a mount and
+    /// shifts the survivors down, updating a shifted survivor addresses
+    /// its new slot with its new identity — never out of bounds and
+    /// never onto a neighbor's slot. Removing the index rebuild fails
+    /// this twin. (Unprivileged: inline tables, exact vectors.)
+    #[test]
+    fn learn_mount_marks_trigger_removal_keeps_index_consistent() {
+        // Shape 1: /a at 0, /b at 1, trigger at /a drops /a (/b shifts
+        // to 0), then an overmount updates /b. Without the rebuild the
+        // stale index 1 addresses past the one-element vector.
+        let table = "51 23 8:1 / /a rw,relatime - ext4 /dev/sda1 rw\n\
+             68 23 8:2 / /b rw,relatime - ext4 /dev/sda2 rw\n\
+             90 23 0:90 / /a rw,relatime - autofs systemd-1 rw\n\
+             70 23 8:3 / /b rw,relatime - ext4 /dev/sda3 rw\n";
+        assert_eq!(
+            super::mounts_for_marks(table),
+            vec![visible_mount("/b", 70, 8, 3)],
+            "the shifted survivor updates in its new slot"
+        );
+        // Shape 2: same removal, then a new real mount, then the
+        // overmount update. Without the rebuild the stale index 1
+        // addresses the newcomer instead of the survivor and corrupts
+        // its identity while the survivor keeps its old one.
+        let table = "51 23 8:1 / /a rw,relatime - ext4 /dev/sda1 rw\n\
+             68 23 8:2 / /b rw,relatime - ext4 /dev/sda2 rw\n\
+             90 23 0:90 / /a rw,relatime - autofs systemd-1 rw\n\
+             71 23 8:4 / /d rw,relatime - ext4 /dev/sda4 rw\n\
+             70 23 8:3 / /b rw,relatime - ext4 /dev/sda3 rw\n";
+        assert_eq!(
+            super::mounts_for_marks(table),
+            vec![visible_mount("/b", 70, 8, 3), visible_mount("/d", 71, 8, 4),],
+            "the update credits the survivor, never its neighbor"
         );
     }
 

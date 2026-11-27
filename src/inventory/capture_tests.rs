@@ -1800,6 +1800,167 @@ fn activation_extend_carries_pending_prearm_delta() {
     );
 }
 
+/// A provider .so with the given standard-name exports, for pre-arm
+/// pinning with an exact endpoint count.
+fn prearm_provider_with_exports(dir: &tempfile::TempDir, name: &str, exports: &[&str]) -> PathBuf {
+    let src = dir.path().join(format!("{name}.c"));
+    let mut body = String::new();
+    for export in exports {
+        body.push_str(&format!(
+            "unsigned long {export}(void *p){{(void)p;return 0;}}\n"
+        ));
+    }
+    std::fs::write(&src, body).unwrap();
+    let so = dir.path().join(format!("{name}.so"));
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success()
+    );
+    so
+}
+
+/// A scene with pre-armed endpoints pending plus a started lane whose
+/// activation window attaches exactly one of them: the activation
+/// defers the rest, before pass one runs. The tempdir outlives the
+/// lane through the returned handle.
+fn prearmed_start_with_single_entry_window(
+    log: &Log,
+    exports: &[&str],
+) -> (Scene, NativeLane<ScriptedLane>, tempfile::TempDir) {
+    let mut scene = Scene::new(log);
+    let dir = tempfile::tempdir().unwrap();
+    let so = prearm_provider_with_exports(&dir, "prearm-span", exports);
+    let pinning = crate::discovery::identity::pin_prearm_proved_in_views_with_budget(
+        &[so],
+        &[],
+        None,
+        0,
+        0,
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .expect("test pre-arm proves");
+    scene.coordinator.set_prearm_pinning(pinning);
+    scene.coordinator.absorb_prearm_plan(1_000);
+    let mut lane_windows = windows();
+    lane_windows.extend_entries = 1;
+    let lane = NativeLane::start(ScriptedLane::new(log), &mut scene, lane_windows, None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    (scene, lane, dir)
+}
+
+/// Activation deferrals are not scan passes: a zero-pass startup stop
+/// whose activation deferred summarizes without a pass span — never
+/// `deferred over 1 pass` for zero passes. The activation receipt still
+/// stages its per-receipt row.
+#[test]
+fn zero_pass_activation_deferral_summarizes_without_a_pass_span() {
+    use crate::discovery::engine::inventory_coordinator::{
+        DEFERRED_ATTACH_SUBJECT, is_deferral_receipt_reason,
+    };
+    let log = Log::default();
+    let (mut scene, started, _dir) =
+        prearmed_start_with_single_entry_window(&log, &["C_Initialize", "C_GetFunctionList"]);
+    assert_eq!(started.attached, 1, "activation attaches one of two");
+    assert_eq!(
+        started.backlog.endpoints.len(),
+        1,
+        "activation defers one of two"
+    );
+    assert_eq!(started.passes, 0, "no scan pass ran");
+    started.stop_cancelled_unscoped_startup(&mut scene);
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let rows = gaps
+        .iter()
+        .filter(|gap| {
+            gap.subject == DEFERRED_ATTACH_SUBJECT && is_deferral_receipt_reason(&gap.reason)
+        })
+        .count();
+    assert_eq!(rows, 1, "the activation receipt stages its row: {gaps:?}");
+    let summary = gaps.iter().find(|gap| {
+        gap.subject == DEFERRED_ATTACH_SUBJECT
+            && gap.reason.contains("1 endpoint(s)")
+            && gap.reason.contains("still deferred at stop")
+    });
+    assert!(
+        summary.is_some(),
+        "the stop summarizes the activation deferral: {gaps:?}"
+    );
+    assert_eq!(
+        summary.unwrap().reason.as_str(),
+        "attach unfinished at stop: 1 endpoint(s) deferred at stop (1 still deferred at stop); \
+         counted uses are lower bounds",
+        "zero passes never render as a pass span"
+    );
+}
+
+/// Only scan passes count toward the pass span: activation deferrals
+/// join the distinct total, but the span counts the one pass receipt
+/// that deferred, with the per-pass peak beside it.
+#[test]
+fn post_activation_pass_counts_only_scan_passes() {
+    let log = Log::default();
+    let (mut scene, mut lane, _dir) = prearmed_start_with_single_entry_window(
+        &log,
+        &["C_Initialize", "C_GetFunctionList", "C_GetInfo"],
+    );
+    assert_eq!(lane.backlog.endpoints.len(), 2);
+    lane.after_pass(&mut scene);
+    lane.stop(&mut scene);
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let summary = gaps.iter().find(|gap| {
+        gap.subject == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
+            && gap.reason.contains("2 endpoint(s)")
+            && gap.reason.contains("still deferred at stop")
+    });
+    assert!(
+        summary.is_some(),
+        "the stop summarizes activation plus pass deferrals: {gaps:?}"
+    );
+    assert_eq!(
+        summary.unwrap().reason.as_str(),
+        "attach unfinished at stop: 2 endpoint(s) deferred over 1 pass (peak 1 in one pass; 1 \
+         attached by stop; 1 still deferred at stop); counted uses are lower bounds",
+        "the activation receipt is not a pass"
+    );
+}
+
+/// Activation deferrals all attached by later passes finish late
+/// without a pass span: no pass receipt ever deferred them.
+#[test]
+fn activation_deferrals_attached_by_passes_finish_late_without_a_pass_span() {
+    use crate::discovery::engine::inventory_coordinator::{
+        DEFERRED_ATTACH_SUBJECT, is_deferral_folded_reason,
+    };
+    let log = Log::default();
+    let (mut scene, mut lane, _dir) =
+        prearmed_start_with_single_entry_window(&log, &["C_Initialize", "C_GetFunctionList"]);
+    lane.after_pass(&mut scene);
+    lane.stop(&mut scene);
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let summary = gaps.iter().find(|gap| {
+        gap.subject == DEFERRED_ATTACH_SUBJECT && is_deferral_folded_reason(&gap.reason)
+    });
+    assert!(
+        summary.is_some(),
+        "the stop summarizes the late-attached activation deferral: {gaps:?}"
+    );
+    assert_eq!(
+        summary.unwrap().reason.as_str(),
+        "attach finished late: 1 endpoint(s) deferred at stop (all attached by stop); counted \
+         uses are lower bounds",
+        "a pass span needs a pass receipt behind it"
+    );
+}
+
 /// A host that reverses every extend window: the lane must send the
 /// host's drain order, not the merged delta order.
 struct ReverseOrderHost {

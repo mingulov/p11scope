@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # A gate must not mutate the tree it validates: importing the shared
 # row validator must not drop __pycache__ into staged scripts.
 sys.dont_write_bytecode = True
-from result_row import parse_json_strict, validate_row  # noqa: E402
+from result_row import validate_row  # noqa: E402
 
 
 def fail(message):
@@ -164,10 +164,9 @@ def main(argv):
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        try:
-            row = parse_json_strict(line)
-        except ValueError as error:
-            problems.append(f"line {number}: invalid JSON: {error}")
+        row, row_problems = checker.strict_json(line, f"line {number}")
+        if row is checker.PARSE_FAILED:
+            problems.extend(row_problems)
             continue
         row_problems = validate_row(row)
         if row_problems:

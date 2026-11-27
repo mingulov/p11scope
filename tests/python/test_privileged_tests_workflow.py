@@ -196,6 +196,19 @@ def privileged_runner_mirror(temp, runner_source):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+    # The runner preflights its declared inputs before any setup; stage
+    # the declaration and every input it names for the run mode.
+    inputs_spec = importlib.util.spec_from_file_location(
+        "runner_inputs_workflow_test", ROOT / "scripts/runner_inputs.py")
+    inputs_module = importlib.util.module_from_spec(inputs_spec)
+    inputs_spec.loader.exec_module(inputs_module)
+    for relative in (inputs_module.SELF,) + inputs_module.required(
+            "scripts/run-privileged-lib-tests.sh", "run"):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+        if inputs_module.executable(relative):
+            target.chmod(0o755)
     workflow_target = root / ".github/workflows"
     workflow_target.mkdir(parents=True)
     for workflow in (ROOT / ".github/workflows").glob("*.yml"):

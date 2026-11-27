@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-known-failing.py"
+RESULT_ROW = ROOT / "scripts/ci/result_row.py"
 SHA = "a" * 40
 
 
@@ -3417,6 +3418,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 rows_path = temp / "results.jsonl"
@@ -3445,6 +3447,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 rows_path = temp / "results.jsonl"
@@ -3472,6 +3475,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 rows_path = temp / "results.jsonl"
@@ -3494,6 +3498,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 rows_path = temp / "results.jsonl"
@@ -3574,6 +3579,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "tests").mkdir()
                 (temp / "tests/ignored-tests.json").write_text("null\n", encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
@@ -3602,6 +3608,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 rows_path = temp / "results.jsonl"
@@ -3857,6 +3864,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 temp = Path(temporary)
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 script = temp / "scripts/ci/check-cell-results.py"
                 script.write_text(source, encoding="utf-8")
                 module = load_script(script, f"cell_fallback_{label}")
@@ -4117,6 +4125,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "tests").mkdir()
                 (temp / "tests/known-failing.json").write_text('{"schema":"p11scope/known-failing/v1","rows":[]}\n', encoding="utf-8")
                 (temp / ".github/workflows").mkdir(parents=True)
@@ -4196,6 +4205,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 (temp / "scripts/ci").mkdir(parents=True)
                 (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+                (temp / "scripts/ci/result_row.py").write_text(RESULT_ROW.read_text(encoding="utf-8"), encoding="utf-8")
                 (temp / "tests").mkdir()
                 (temp / "tests/known-failing.json").write_text('{"schema":"p11scope/known-failing/v1","rows":[]}\n', encoding="utf-8")
                 (temp / ".github/workflows").mkdir(parents=True)

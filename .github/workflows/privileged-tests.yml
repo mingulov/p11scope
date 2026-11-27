@@ -1301,7 +1301,7 @@ jobs:
             --require daemonset-inventory \
             --require-file "$out/minimal-cells/dynamic-selection.txt"
           # Closed-set qualification and proof check uniformly over every
-          # host and guest public CLI run before the full 41-cell gate.
+          # host and guest public CLI run before the full 42-cell gate.
           python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
             --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
             --expected-failure profile-cgroup --expected-failure trace-cgroup \

@@ -428,7 +428,7 @@ class CheckCellResultsTests(unittest.TestCase):
         )
         result = run_checker([line], "--require", "a")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate key", result.stderr)
+        self.assertIn("duplicate JSON key", result.stderr)
         self.assertNotIn("PASS a", result.stdout)
 
     def test_duplicate_proof_keys_refused(self):
@@ -442,7 +442,7 @@ class CheckCellResultsTests(unittest.TestCase):
         )
         result = run_checker([line])
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate key", result.stderr)
+        self.assertIn("duplicate JSON key", result.stderr)
 
     def test_checker_leaves_no_bytecode_beside_shared_validator(self):
         # A gate must not mutate the tree it validates: importing
@@ -640,8 +640,8 @@ class TypedCellResultsTests(unittest.TestCase):
     def test_conflicting_outcome_declarations_must_not_overlap(self):
         for options in (
                 ("--allow-nonqualifying", "cell", "--expected-failure", "cell"),
-                ("--allow-nonqualifying", "cell", "--intermittent-failure", "cell"),
-                ("--expected-failure", "cell", "--intermittent-failure", "cell")):
+                ("--allow-nonqualifying", "cell", "--intermittent-failure", "cell=lane"),
+                ("--expected-failure", "cell", "--intermittent-failure", "cell=lane")):
             with self.subTest(options=options):
                 result, _document = run_typed_checker(
                     [row("cell", False, "nonqualifying", "smoke")], *options)
@@ -684,6 +684,7 @@ class TypedCellResultsTests(unittest.TestCase):
     def load_registry_case(self, temp, registry_text):
         (temp / "scripts/ci").mkdir(parents=True)
         shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+        shutil.copy2(ROOT / "scripts/ci/result_row.py", temp / "scripts/ci/result_row.py")
         shutil.copy2(ROOT / "scripts/check-known-failing.py",
                      temp / "scripts/check-known-failing.py")
         (temp / "tests").mkdir()
@@ -726,6 +727,7 @@ class TypedCellResultsTests(unittest.TestCase):
             temp = Path(tmp)
             (temp / "scripts/ci").mkdir(parents=True)
             shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/ci/result_row.py", temp / "scripts/ci/result_row.py")
             shutil.copy2(ROOT / "scripts/check-known-failing.py",
                          temp / "scripts/check-known-failing.py")
             module = load_script(temp / "scripts/ci/check-cell-results.py",
@@ -749,6 +751,7 @@ class TypedCellResultsTests(unittest.TestCase):
             temp = Path(tmp)
             (temp / "scripts/ci").mkdir(parents=True)
             shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/ci/result_row.py", temp / "scripts/ci/result_row.py")
             shutil.copy2(ROOT / "scripts/check-known-failing.py",
                          temp / "scripts/check-known-failing.py")
             (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -838,6 +841,7 @@ class TypedCellResultsTests(unittest.TestCase):
             temp = Path(tmp)
             (temp / "scripts/ci").mkdir(parents=True)
             shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/ci/result_row.py", temp / "scripts/ci/result_row.py")
             shutil.copy2(ROOT / "scripts/check-known-failing.py",
                          temp / "scripts/check-known-failing.py")
             (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -866,6 +870,7 @@ class TypedCellResultsTests(unittest.TestCase):
                 temp = Path(tmp)
                 (temp / "scripts/ci").mkdir(parents=True)
                 shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+                shutil.copy2(ROOT / "scripts/ci/result_row.py", temp / "scripts/ci/result_row.py")
                 shutil.copy2(ROOT / "scripts/check-known-failing.py",
                              temp / "scripts/check-known-failing.py")
                 (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")

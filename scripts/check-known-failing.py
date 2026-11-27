@@ -852,7 +852,11 @@ def validate_cell_runner_declarations(root, rows):
         allowed_always = legacy_always | {row["test"] for row in runner_rows if row["mode"] == "always"}
         allowed_intermittent = legacy_intermittent | {row["test"] for row in runner_rows if row["mode"] == "intermittent"}
         extra_always = sorted(set(first["expected"]) - allowed_always)
-        extra_intermittent = sorted(set(first["intermittent"]) - allowed_intermittent)
+        # Workflow declarations name the owning lane (CELL=LANE); the
+        # ledger rows name the cell. Compare cell names; the runtime
+        # checker already refuses a lane-less declaration.
+        declared_intermittent = {value.partition("=")[0] for value in first["intermittent"]}
+        extra_intermittent = sorted(declared_intermittent - allowed_intermittent)
         if extra_always:
             problems.append(f"{runner} declarations have undeclared expected cells: " + ", ".join(extra_always))
         if extra_intermittent:

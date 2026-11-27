@@ -888,12 +888,12 @@ pub(crate) fn loader_exe_for_pidfd(
 /// fds, releasing their mount pins) leaves the detached group with
 /// nothing queued behind it — no unbounded kernel queue, no pinned
 /// mounts — before the duplicate is closed. The `mark` closure
-/// receives the group and the cancel flag; production marks every
-/// visible filesystem, tests inject a stalled pass.
-fn arm_with_bound(
+/// receives the group and the cancel flag; production drives the
+/// pre-shed slices, tests inject a stalled pass.
+fn arm_with_bound<T: Send + 'static>(
     group: OwnedFd,
-    mark: impl FnOnce(&OwnedFd, &AtomicBool) -> MarkPassOutcome + Send + 'static,
-) -> Option<(OwnedFd, MarkPassOutcome)> {
+    mark: impl FnOnce(&OwnedFd, &AtomicBool) -> T + Send + 'static,
+) -> Option<(OwnedFd, T)> {
     let dup = group.try_clone().ok();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_helper = Arc::clone(&cancel);
@@ -1050,13 +1050,14 @@ impl FileLearner {
         // through a duplicate while the startup grant is still held,
         // it places no further marks once cancelled, and it closes
         // the group when the hang clears) and learning is unavailable
-        // — a named gap, never a hung start.
+        // — a named gap, never a hung start. The helper drives
+        // repeated charged slices pre-shed (each with a fresh
+        // production budget, threading the resume cursor) until the
+        // rotation wraps, so a large-but-under-cap table keeps the
+        // coverage v0.7.1 kept; the post-shed periodic only retains.
         let pass = arm_with_bound(group, |group, cancel| {
-            mark_visible_filesystems(
+            drive_startup_slices(
                 std::path::Path::new("/proc/self/mountinfo"),
-                &BTreeSet::new(),
-                None,
-                &mut pass_budget(),
                 |point, mounts| {
                     if cancel.load(Ordering::Acquire) {
                         return MarkOutcome {
@@ -1066,44 +1067,37 @@ impl FileLearner {
                     }
                     try_mark_filesystem(group, point, mounts)
                 },
+                || cancel.load(Ordering::Acquire),
             )
         });
-        let Some((group, outcome)) = pass else {
+        let Some((group, drive)) = pass else {
             return Err(LearnAbsent {
                 reason: "mark pass did not finish within the hung-mount bound".to_string(),
             });
         };
-        let covered = outcome.covered;
-        let uncovered = outcome.uncovered;
+        let covered_len = drive.outcome.covered.len();
+        let uncovered = drive.outcome.uncovered;
         // An identity-less fallback mount that marked successfully
         // leaves the retained set empty with nothing uncovered: that
         // is still a working learner, re-decided at the next pass.
-        if covered.is_empty() && uncovered > 0 {
+        if drive.outcome.covered.is_empty() && uncovered > 0 {
             return Err(LearnAbsent {
                 reason: format!("no filesystem could be marked ({uncovered} skipped)"),
             });
         }
         if crate::run::capture_diagnostics_on() {
             eprintln!(
-                "p11scope: file learning active: {} filesystems marked ({uncovered} skipped), FIONREAD unit {fionread_unit} B/event",
-                covered.len()
+                "p11scope: file learning active: {covered_len} filesystems marked ({uncovered} skipped), FIONREAD unit {fionread_unit} B/event",
             );
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(LEARN_CHANNEL_DEPTH);
         let state = Arc::new(LearnShutdownState::default());
+        let pending = pending_arming_from_drive(group, tx, drive, fionread_unit, fionread_exact);
         Ok((
             Self {
                 state,
                 thread: None,
-                pending: Some(PendingArming {
-                    group,
-                    tx,
-                    covered,
-                    initial_gap_owed: uncovered > 0,
-                    remark_cursor: outcome.resume_after,
-                    fionread_unit,
-                    fionread_exact,
-                }),
+                pending: Some(pending),
             },
             rx,
         ))
@@ -1125,19 +1119,11 @@ impl FileLearner {
         };
         let worker_state = Arc::clone(&self.state);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (group, tx, remark, fionread) = drain_args_from_pending(arming);
         match std::thread::Builder::new()
             .name("p11scope-learn".to_string())
             .spawn(move || {
-                drain_loop(
-                    arming.group,
-                    arming.tx,
-                    worker_state,
-                    arming.covered,
-                    arming.initial_gap_owed,
-                    arming.remark_cursor,
-                    arming.fionread_unit,
-                    arming.fionread_exact,
-                );
+                drain_loop(group, tx, worker_state, remark, fionread);
                 let _ = done_tx.send(());
             }) {
             Ok(thread) => {
@@ -1857,6 +1843,231 @@ fn pass_budget() -> impl FnMut() -> bool {
             true
         }
     }
+}
+
+/// One production mark slice with the finite [`MARK_PASS_BUDGET`]
+/// allowance: the single owner for both the startup arming slices
+/// and the periodic re-mark. Production and the wiring twins share
+/// this; replacing its budget with unlimited fails
+/// `learn_production_mark_slice_is_finite_and_exact`.
+fn production_mark_slice(
+    mountinfo: &std::path::Path,
+    previously_covered: &BTreeSet<MountIdentity>,
+    resume_after: Option<&std::path::Path>,
+    mark: impl FnMut(&std::path::Path, &[MountToMark]) -> MarkOutcome,
+) -> MarkPassOutcome {
+    let mut budget = pass_budget();
+    mark_visible_filesystems(
+        mountinfo,
+        previously_covered,
+        resume_after,
+        &mut budget,
+        mark,
+    )
+}
+
+/// How many charged slices the startup arming may spend pre-shed:
+/// enough to cover the retained set ([`MARK_COVERAGE_CAP`]) with the
+/// per-slice allowance ([`MARK_PASS_BUDGET`]) minus the table-read
+/// cost, plus one for the table itself. Realistic under-cap tables
+/// (≈7500 mounts at 140 B/line) need two; three also completes the
+/// oversized-test prefix (10485). Derived, never raised.
+fn startup_slice_limit() -> usize {
+    MARK_COVERAGE_CAP.div_ceil(MARK_PASS_BUDGET) + 1
+}
+
+/// The typed outcome of the pre-shed startup arming: the final
+/// [`MarkPassOutcome`] plus how many charged slices it spent. Checked
+/// by exact equality: the slice count proves the budget was finite
+/// (unlimited would finish in one), the final outcome proves full
+/// coverage for under-cap tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupDriveOutcome {
+    outcome: MarkPassOutcome,
+    slices: usize,
+}
+
+/// Drives the pre-shed startup arming to completion: repeated charged
+/// slices with fresh production budgets, threading the resume cursor,
+/// until the rotation wraps (`spent == false`), the slice limit is
+/// reached, or `should_stop` fires between slices. Each slice is
+/// charged; the total attempted is summed, the table gap OR-ed. The
+/// startup grant is still held here, so every slice can place marks;
+/// the post-shed periodic only retains. Production `start()` and the
+/// shed twin share this; dropping the cursor or using an unlimited
+/// budget fails `learn_startup_shed_resume_keeps_full_coverage_like_v071`
+/// and `learn_startup_drive_threads_cursor_across_slices`.
+fn drive_startup_slices(
+    mountinfo: &std::path::Path,
+    mut mark: impl FnMut(&std::path::Path, &[MountToMark]) -> MarkOutcome,
+    mut should_stop: impl FnMut() -> bool,
+) -> StartupDriveOutcome {
+    let mut covered = BTreeSet::new();
+    let mut cursor: Option<std::path::PathBuf> = None;
+    let mut total_attempted = 0usize;
+    let mut table_gap = false;
+    let mut slices = 0usize;
+    let limit = startup_slice_limit();
+    loop {
+        let outcome = production_mark_slice(mountinfo, &covered, cursor.as_deref(), &mut mark);
+        slices += 1;
+        let MarkPassOutcome {
+            covered: next_covered,
+            uncovered,
+            attempted,
+            spent,
+            resume_after,
+            table_gap: slice_gap,
+        } = outcome;
+        total_attempted += attempted;
+        table_gap = table_gap || slice_gap;
+        covered = next_covered;
+        if !spent {
+            return StartupDriveOutcome {
+                outcome: MarkPassOutcome {
+                    covered,
+                    uncovered,
+                    attempted: total_attempted,
+                    spent: false,
+                    resume_after: None,
+                    table_gap,
+                },
+                slices,
+            };
+        }
+        cursor = resume_after;
+        if slices >= limit || should_stop() {
+            return StartupDriveOutcome {
+                outcome: MarkPassOutcome {
+                    covered,
+                    uncovered,
+                    attempted: total_attempted,
+                    spent: true,
+                    resume_after: cursor,
+                    table_gap,
+                },
+                slices,
+            };
+        }
+    }
+}
+
+/// Builds the pending arming from a driven startup outcome: the
+/// covered set, whether the final uncovered count owes the finite
+/// unavailable-learning gap, and where the first periodic re-mark
+/// resumes. Production `start()` and the wiring twin share this;
+/// dropping the cursor or the gap fails
+/// `learn_startup_adoption_preserves_cursor_and_gap`.
+fn pending_arming_from_drive(
+    group: OwnedFd,
+    tx: SyncSender<LearnMsg>,
+    drive: StartupDriveOutcome,
+    fionread_unit: usize,
+    fionread_exact: bool,
+) -> PendingArming {
+    PendingArming {
+        group,
+        tx,
+        covered: drive.outcome.covered,
+        initial_gap_owed: drive.outcome.uncovered > 0,
+        remark_cursor: drive.outcome.resume_after,
+        fionread_unit,
+        fionread_exact,
+    }
+}
+
+/// This kernel's measured `FIONREAD` bytes per event (which the
+/// drain's tail and shed divide their snapshots by), and whether that
+/// unit was exactly measured (`true`) or fell back (`false`). Bundled
+/// so the drain takes a context, not eight loose arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FionreadUnit {
+    bytes: usize,
+    exact: bool,
+}
+
+/// The drain's mark-coverage state: the retained covered set, where
+/// the next periodic re-mark resumes, and whether a gap is already
+/// owed. The single owner for the periodic cursor threading;
+/// production drain and twins share its methods. Dropping the cursor,
+/// forgetting the gap, or spending an unlimited budget fails
+/// `learn_remark_state_*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemarkState {
+    covered: BTreeSet<MountIdentity>,
+    cursor: Option<std::path::PathBuf>,
+    gap_owed: bool,
+}
+
+impl RemarkState {
+    /// The initial periodic state from a pending arming: the startup
+    /// covered set, the startup cursor, and the startup gap. Used by
+    /// `drain_args_from_pending`; dropping any field fails
+    /// `learn_drain_handoff_preserves_cursor`.
+    fn from_pending(pending: &PendingArming) -> Self {
+        Self {
+            covered: pending.covered.clone(),
+            cursor: pending.remark_cursor.clone(),
+            gap_owed: pending.initial_gap_owed,
+        }
+    }
+
+    /// Adopts a landed re-mark result: the next covered set, the next
+    /// resume cursor, and the gap OR-ed (once owed, always owed). Both
+    /// drain adopt sites share this.
+    fn adopt(&mut self, outcome: MarkPassOutcome) {
+        self.covered = outcome.covered;
+        self.cursor = outcome.resume_after;
+        self.gap_owed = self.gap_owed || outcome.uncovered > 0;
+    }
+
+    /// Records a re-mark that could not start (spawn failure) or was
+    /// still pending from the previous period: coverage unproven,
+    /// which files the unavailable-learning gap.
+    fn note_spawn_failure(&mut self) {
+        self.gap_owed = true;
+    }
+
+    /// Where the next periodic pass resumes, if anywhere.
+    fn resume_for_next(&self) -> Option<&std::path::Path> {
+        self.cursor.as_deref()
+    }
+
+    /// One periodic slice for an explicit previous set (the spawn's
+    /// snapshot): the shared production allowance, resuming after the
+    /// state's cursor. Production periodic and the wiring twin share
+    /// this; an unlimited budget or a reset cursor fails
+    /// `learn_remark_state_slice_uses_cursor_and_finite_budget`.
+    fn run_slice_for_prev(
+        &self,
+        mountinfo: &std::path::Path,
+        prev: &BTreeSet<MountIdentity>,
+        mark: impl FnMut(&std::path::Path, &[MountToMark]) -> MarkOutcome,
+    ) -> MarkPassOutcome {
+        production_mark_slice(mountinfo, prev, self.resume_for_next(), mark)
+    }
+}
+
+/// Splits a pending arming into the drain's owned inputs: the group,
+/// the channel, the initial remark state, and the FIONREAD unit.
+/// Production `begin_drain` and the handoff twin share this; dropping
+/// the cursor fails `learn_drain_handoff_preserves_cursor`.
+fn drain_args_from_pending(
+    pending: PendingArming,
+) -> (OwnedFd, SyncSender<LearnMsg>, RemarkState, FionreadUnit) {
+    let remark = RemarkState::from_pending(&pending);
+    let PendingArming {
+        group,
+        tx,
+        fionread_unit,
+        fionread_exact,
+        ..
+    } = pending;
+    let fionread = FionreadUnit {
+        bytes: fionread_unit,
+        exact: fionread_exact,
+    };
+    (group, tx, remark, fionread)
 }
 
 /// Reads the `Pid:` of a pidfd from its fdinfo: the pid belongs to the
@@ -2893,19 +3104,12 @@ fn store_final_stats(state: &LearnShutdownState, stats: &DrainStats) {
 /// tallies and overflow. Never blocks the engine; the engine never
 /// blocks it past the bounded channel (then the kernel queue absorbs,
 /// then overflow names the loss).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the drain's fixed context, threaded once from the arming"
-)]
 fn drain_loop(
     group: OwnedFd,
     tx: SyncSender<LearnMsg>,
     state: Arc<LearnShutdownState>,
-    mut covered: BTreeSet<MountIdentity>,
-    initial_gap_owed: bool,
-    mut remark_cursor: Option<std::path::PathBuf>,
-    fionread_unit: usize,
-    fionread_exact: bool,
+    mut remark: RemarkState,
+    fionread: FionreadUnit,
 ) {
     // Scheduling note: loader processes live ~15 ms, so the drain
     // wants prompt scheduling to name them (files still stage via
@@ -2926,8 +3130,8 @@ fn drain_loop(
         tx: &tx,
         state: &state,
         self_pid: std::process::id(),
-        fionread_unit,
-        fionread_exact,
+        fionread_unit: fionread.bytes,
+        fionread_exact: fionread.exact,
         cache: LearnCache::new(),
         stats: DrainStats::default(),
         ignore_marks: 0,
@@ -2941,7 +3145,7 @@ fn drain_loop(
     // The startup pass already left a visible filesystem uncovered:
     // name that partial coverage now, once (data-always), instead of
     // letting traffic on the covered filesystems stand in for it.
-    if initial_gap_owed {
+    if remark.gap_owed {
         unavailable_sent = true;
         if !send_learn(&tx, &state, LearnMsg::Unavailable) {
             return;
@@ -2958,10 +3162,10 @@ fn drain_loop(
         // A landed re-mark result is adopted on the tick it lands (the
         // spawn never waits for it), so coverage stays fresh without
         // the drain ever blocking on a mount.
-        if let Some(outcome) = adopt_remark_result(&covered, &mut pending_remark) {
-            covered = outcome.covered;
-            remark_cursor = outcome.resume_after;
-            if outcome.uncovered > 0 && !unavailable_sent {
+        if let Some(outcome) = adopt_remark_result(&remark.covered, &mut pending_remark) {
+            let newly_owed = outcome.uncovered > 0;
+            remark.adopt(outcome);
+            if newly_owed && !unavailable_sent {
                 unavailable_sent = true;
                 if !send_learn(&tx, &state, LearnMsg::Unavailable) {
                     break 'drain;
@@ -3011,35 +3215,35 @@ fn drain_loop(
             // and the tick would otherwise file a false gap (the spawn
             // sees it still pending): adopt again before spawning, so
             // only a pass still running after ~30 s is unproven.
-            if let Some(outcome) = adopt_remark_result(&covered, &mut pending_remark) {
-                covered = outcome.covered;
-                remark_cursor = outcome.resume_after;
-                if outcome.uncovered > 0 && !unavailable_sent {
+            if let Some(outcome) = adopt_remark_result(&remark.covered, &mut pending_remark) {
+                let newly_owed = outcome.uncovered > 0;
+                remark.adopt(outcome);
+                if newly_owed && !unavailable_sent {
                     unavailable_sent = true;
                     if !send_learn(&tx, &state, LearnMsg::Unavailable) {
                         break 'drain;
                     }
                 }
             }
-            let resume = remark_cursor.clone();
+            let snapshot = remark.clone();
             if !spawn_remark_pass(
                 &shared_group,
-                &covered,
+                &remark.covered,
                 &mut pending_remark,
                 move |shared, prev| {
-                    mark_visible_filesystems(
+                    snapshot.run_slice_for_prev(
                         std::path::Path::new("/proc/self/mountinfo"),
                         &prev,
-                        resume.as_deref(),
-                        &mut pass_budget(),
                         |point, mounts| try_mark_filesystem_shared(&shared, point, mounts),
                     )
                 },
-            ) && !unavailable_sent
-            {
-                unavailable_sent = true;
-                if !send_learn(&tx, &state, LearnMsg::Unavailable) {
-                    break 'drain;
+            ) {
+                remark.note_spawn_failure();
+                if !unavailable_sent {
+                    unavailable_sent = true;
+                    if !send_learn(&tx, &state, LearnMsg::Unavailable) {
+                        break 'drain;
+                    }
                 }
             }
             // The join prints the final line from the last store, so
@@ -4612,10 +4816,626 @@ mod tests {
             &mut super::pass_budget(),
             |_, _| marked(51, 8, 1),
         );
-        assert_eq!(outcome.spent, false, "4086 mounts fit the allowance");
+        assert!(!outcome.spent, "4086 mounts fit the allowance");
         assert_eq!(outcome.resume_after, None, "the rotation completes");
         assert_eq!(outcome.uncovered, 0);
         assert_eq!(outcome.attempted, 4086);
+    }
+
+    /// A large-but-under-cap table must not lose coverage across the
+    /// capability shed: 4100 mounts (410 KB, under the 1 MiB cap) with
+    /// a pre-shed slice, a shed (further marks fail EPERM), then a
+    /// resume. v0.7.1 (unlimited, pre-shed) keeps full coverage; the
+    /// resume must match it. (Unprivileged: generated fixture, the
+    /// shed is an injected EPERM mark.)
+    #[test]
+    fn learn_startup_shed_resume_keeps_full_coverage_like_v071() {
+        let lines = |count: u64| -> String {
+            let mut text = String::new();
+            for id in 51..51 + count {
+                let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+                while line.len() < 99 {
+                    line.push(' ');
+                }
+                line.push('\n');
+                assert_eq!(line.len(), 100);
+                text.push_str(&line);
+            }
+            text
+        };
+        // The mount id rides in the point name, so each mark resolves
+        // to its own mount's identity (distinct filesystems).
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        std::fs::write(&table, lines(4100)).unwrap();
+        assert!(
+            std::fs::metadata(&table).unwrap().len() < 1024 * 1024,
+            "the 4100-mount table stays under the read cap"
+        );
+        // v0.7.1: one unbounded pre-shed pass offers every mount.
+        let baseline = super::mark_visible_filesystems(
+            &table,
+            &std::collections::BTreeSet::new(),
+            None,
+            &mut || true,
+            |point, _| marked(id_of(point), 8, 1),
+        );
+        assert_eq!(baseline.uncovered, 0, "v0.7.1 keeps full coverage");
+        assert_eq!(baseline.covered.len(), 4100);
+        assert!(!baseline.spent);
+        assert_eq!(baseline.resume_after, None);
+        assert!(!baseline.table_gap);
+        // The startup arming resumes pre-shed to the same coverage.
+        let driven =
+            super::drive_startup_slices(&table, |point, _| marked(id_of(point), 8, 1), || false);
+        assert_eq!(
+            driven.outcome.covered, baseline.covered,
+            "the resumed startup matches v0.7.1 coverage"
+        );
+        assert_eq!(driven.outcome.uncovered, 0);
+        assert!(!driven.outcome.spent);
+        assert_eq!(driven.outcome.resume_after, None);
+        assert!(!driven.outcome.table_gap);
+        assert_eq!(driven.outcome.attempted, 4100);
+        assert_eq!(driven.slices, 2, "4086 + 14 across two charged slices");
+        // Post-shed, new marks fail EPERM but retained coverage stays:
+        // the periodic resume re-covers for free and owes no new gap.
+        let post = super::mark_visible_filesystems(
+            &table,
+            &driven.outcome.covered,
+            driven.outcome.resume_after.as_deref(),
+            &mut super::pass_budget(),
+            |point, _| failed(id_of(point), 8, 1),
+        );
+        assert_eq!(post.uncovered, 0, "retained coverage survives the shed");
+        assert_eq!(post.covered.len(), 4100);
+        assert!(!post.spent, "retained mounts spend nothing");
+    }
+
+    /// The startup driver owes the table gap for an oversized table and
+    /// still completes its parsed prefix in three charged slices (the
+    /// slice limit): the unseen remainder counts once, never silent.
+    /// (Unprivileged: generated 10485-line fixture, injected marks.)
+    #[test]
+    fn learn_startup_drive_owes_table_gap_for_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        let mut text = String::new();
+        for id in 51..10600u64 {
+            let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+            while line.len() < 99 {
+                line.push(' ');
+            }
+            line.push('\n');
+            assert_eq!(line.len(), 100);
+            text.push_str(&line);
+        }
+        assert!(text.len() > 1024 * 1024, "the fixture exceeds the read cap");
+        std::fs::write(&table, &text).unwrap();
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        let driven =
+            super::drive_startup_slices(&table, |point, _| marked(id_of(point), 8, 1), || false);
+        assert_eq!(driven.slices, 3, "10485 prefix in three charged slices");
+        assert!(
+            driven.outcome.table_gap,
+            "the unseen remainder owes the gap"
+        );
+        assert!(!driven.outcome.spent, "the parsed prefix completes");
+        assert_eq!(driven.outcome.resume_after, None);
+        // The prefix holds 10485 mounts; the retained set caps at 8192,
+        // the rest plus the table-gap unit count uncovered.
+        assert_eq!(driven.outcome.covered.len(), 8192);
+        assert_eq!(driven.outcome.uncovered, 10485 - 8192 + 1);
+        assert_eq!(driven.outcome.attempted, 10485);
+    }
+
+    /// The production mark slice spends the finite pass allowance and
+    /// threads the cursor: a 4100-mount table attempts exactly 4086
+    /// with the cursor on the last offer, and the resume completes the
+    /// tail. Pins the allowance and the coverage cap (never raised).
+    /// (Unprivileged: generated fixture, injected marks.)
+    #[test]
+    fn learn_production_mark_slice_is_finite_and_exact() {
+        assert_eq!(
+            super::MARK_PASS_BUDGET,
+            4096,
+            "the pass allowance never moves"
+        );
+        assert_eq!(
+            super::MARK_COVERAGE_CAP,
+            8192,
+            "the retained coverage cap never moves"
+        );
+        assert_eq!(
+            super::startup_slice_limit(),
+            3,
+            "two slices plus one for the table"
+        );
+        // The budget itself grants exactly the allowance, then refuses.
+        let mut budget = super::pass_budget();
+        for _ in 0..super::MARK_PASS_BUDGET {
+            assert!(budget(), "the allowance grants");
+        }
+        assert!(!budget(), "the allowance refuses past 4096");
+        // The shared production slice bounds the pathological table.
+        let lines = |count: u64| -> String {
+            let mut text = String::new();
+            for id in 51..51 + count {
+                let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+                while line.len() < 99 {
+                    line.push(' ');
+                }
+                line.push('\n');
+                assert_eq!(line.len(), 100);
+                text.push_str(&line);
+            }
+            text
+        };
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, lines(4100)).unwrap();
+        // Each mark resolves to its own mount's identity (distinct
+        // filesystems), so the head retains and the tail completes.
+        let first = super::production_mark_slice(
+            &big,
+            &std::collections::BTreeSet::new(),
+            None,
+            |point, _| marked(id_of(point), 8, 1),
+        );
+        assert_eq!(first.uncovered, 14);
+        assert_eq!(first.attempted, 4086);
+        assert!(first.spent);
+        assert_eq!(
+            first.resume_after,
+            Some(std::path::PathBuf::from("/mnt/m4136")),
+            "10 table credits leave exactly 4086 mount attempts"
+        );
+        assert_eq!(first.covered.len(), 4086, "the head marks distinctly");
+        assert!(!first.table_gap);
+        // The resume completes the tail through the same production
+        // slice (the cursor is threaded, not reset).
+        let second = super::production_mark_slice(
+            &big,
+            &first.covered,
+            first.resume_after.as_deref(),
+            |point, _| marked(id_of(point), 8, 1),
+        );
+        assert!(!second.spent, "the tail fits the second allowance");
+        assert_eq!(second.resume_after, None);
+        assert_eq!(second.attempted, 14);
+        assert_eq!(second.uncovered, 0);
+        assert_eq!(second.covered.len(), 4100, "head retained plus tail marked");
+    }
+
+    /// The startup driver threads the resume cursor across slices: a
+    /// head that failed (nothing retained) is not re-offered — the
+    /// next slice counts it uncovered without spending and attempts
+    /// what follows. Dropping the cursor re-spends the allowance on
+    /// the failed head and never reaches the tail within the limit.
+    /// (Unprivileged: constructed mounts, injected marks.)
+    #[test]
+    fn learn_startup_drive_threads_cursor_across_slices() {
+        // Ten mounts, one credit each, but the driver spends the
+        // production allowance (4096): to force several slices with a
+        // small fixture, fail the head so nothing retains and the
+        // rotation must advance by cursor alone. With the cursor, two
+        // production slices still suffice for ten mounts; without it
+        // the driver would re-offer the failed head forever. Instead
+        // exercise the cursor directly through two production slices
+        // with a tiny injected allowance, proving the threading the
+        // driver relies on.
+        let visible: Vec<super::MountToMark> = (0..6)
+            .map(|n| visible_mount(&format!("/mnt/m{n}"), 51 + n as u64, 8, 1))
+            .collect();
+        // First slice: 3 credits, the head fails, the cursor advances.
+        let mut remaining = 3;
+        let first = super::evaluate_mark_coverage(
+            &std::collections::BTreeSet::new(),
+            &visible,
+            |point| {
+                if point.as_os_str() == "/mnt/m1" {
+                    failed(52, 8, 1)
+                } else {
+                    let id: u64 = point
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix('m'))
+                        .and_then(|id| id.parse().ok())
+                        .expect("fixture points carry their mount id");
+                    marked(51 + id, 8, 1)
+                }
+            },
+            &mut || {
+                if remaining == 0 {
+                    false
+                } else {
+                    remaining -= 1;
+                    true
+                }
+            },
+            None,
+        );
+        assert_eq!(first.attempted, 3);
+        assert_eq!(
+            first.resume_after,
+            Some(std::path::PathBuf::from("/mnt/m2"))
+        );
+        assert!(first.spent);
+        // Second slice resumes after the cursor: the failed head
+        // counts without an offer, the tail attempts.
+        let mut offered = Vec::new();
+        let mut remaining = 3;
+        let second = super::evaluate_mark_coverage(
+            &first.covered,
+            &visible,
+            |point: &std::path::Path| {
+                offered.push(point.to_path_buf());
+                let id: u64 = point
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix('m'))
+                    .and_then(|id| id.parse().ok())
+                    .expect("fixture points carry their mount id");
+                marked(51 + id, 8, 1)
+            },
+            &mut || {
+                if remaining == 0 {
+                    false
+                } else {
+                    remaining -= 1;
+                    true
+                }
+            },
+            first.resume_after.as_deref(),
+        );
+        assert_eq!(
+            offered,
+            vec![
+                std::path::PathBuf::from("/mnt/m3"),
+                std::path::PathBuf::from("/mnt/m4"),
+                std::path::PathBuf::from("/mnt/m5"),
+            ],
+            "the resume offers what follows the cursor, never the head again"
+        );
+        assert!(!second.spent);
+        assert_eq!(second.resume_after, None);
+        // The driver threads the same cursor across production slices:
+        // a 4100-mount table whose head fails (nothing retained) still
+        // completes in two slices — the second counts the failed head
+        // without re-offering it and attempts the tail. A driver that
+        // reset the cursor would re-spend its allowance on the failed
+        // head, need all three slices, and never reach the tail.
+        let lines = |count: u64| -> String {
+            let mut text = String::new();
+            for id in 51..51 + count {
+                let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+                while line.len() < 99 {
+                    line.push(' ');
+                }
+                line.push('\n');
+                assert_eq!(line.len(), 100);
+                text.push_str(&line);
+            }
+            text
+        };
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("mountinfo");
+        std::fs::write(&table, lines(4100)).unwrap();
+        // The head (first 4086) fails, the tail (last 14) succeeds.
+        let driven = super::drive_startup_slices(
+            &table,
+            |point, _| {
+                let id = id_of(point);
+                if id <= 4136 {
+                    failed(id, 8, 1)
+                } else {
+                    marked(id, 8, 1)
+                }
+            },
+            || false,
+        );
+        assert_eq!(driven.slices, 2, "the resume skips the failed head");
+        assert_eq!(driven.outcome.covered.len(), 14, "only the tail marks");
+        assert_eq!(
+            driven.outcome.uncovered, 4086,
+            "the failed head counts once"
+        );
+        assert_eq!(driven.outcome.attempted, 4100);
+        assert!(!driven.outcome.spent);
+        assert_eq!(driven.outcome.resume_after, None);
+    }
+
+    /// The startup adoption preserves the driven cursor and gap: the
+    /// pending arming carries the final covered set, owes the gap
+    /// exactly when the final uncovered count is nonzero, and resumes
+    /// the first periodic exactly where the startup stopped. Dropping
+    /// either fails this test. (Unprivileged: dummy group fd.)
+    #[test]
+    fn learn_startup_adoption_preserves_cursor_and_gap() {
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        // A spent drive with a cursor and a gap.
+        let drive = super::StartupDriveOutcome {
+            outcome: super::MarkPassOutcome {
+                covered: covered.clone(),
+                uncovered: 14,
+                attempted: 4086,
+                spent: true,
+                resume_after: Some(std::path::PathBuf::from("/mnt/m4136")),
+                table_gap: false,
+            },
+            slices: 1,
+        };
+        let pending = super::pending_arming_from_drive(group, tx, drive, 64, true);
+        assert_eq!(pending.covered, covered);
+        assert!(pending.initial_gap_owed, "14 uncovered owes the gap");
+        assert_eq!(
+            pending.remark_cursor,
+            Some(std::path::PathBuf::from("/mnt/m4136")),
+            "the first periodic resumes after the startup cursor"
+        );
+        assert_eq!(pending.fionread_unit, 64);
+        assert!(pending.fionread_exact);
+        // A wrapped drive with full coverage owes no gap and resets.
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let drive = super::StartupDriveOutcome {
+            outcome: super::MarkPassOutcome {
+                covered: covered.clone(),
+                uncovered: 0,
+                attempted: 4100,
+                spent: false,
+                resume_after: None,
+                table_gap: false,
+            },
+            slices: 2,
+        };
+        let pending = super::pending_arming_from_drive(group, tx, drive, 64, false);
+        assert_eq!(pending.covered, covered);
+        assert!(!pending.initial_gap_owed, "full coverage owes no gap");
+        assert_eq!(pending.remark_cursor, None, "a wrapped rotation resets");
+    }
+
+    /// The drain handoff preserves the startup cursor, gap and
+    /// FIONREAD unit: the pending arming splits into the drain's owned
+    /// inputs without dropping any field. (Unprivileged: dummy group.)
+    #[test]
+    fn learn_drain_handoff_preserves_cursor() {
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let pending = super::PendingArming {
+            group,
+            tx,
+            covered: covered.clone(),
+            initial_gap_owed: true,
+            remark_cursor: Some(std::path::PathBuf::from("/mnt/m4136")),
+            fionread_unit: 96,
+            fionread_exact: false,
+        };
+        // The borrowed constructor preserves every field.
+        let borrowed = super::RemarkState::from_pending(&pending);
+        assert_eq!(borrowed.covered, covered);
+        assert_eq!(
+            borrowed.cursor,
+            Some(std::path::PathBuf::from("/mnt/m4136")),
+            "the drain resumes where the startup stopped"
+        );
+        assert!(borrowed.gap_owed, "the startup gap carries into the drain");
+        // The owned split moves the same fields plus the FIONREAD unit.
+        let (_group, _tx, remark, fionread) = super::drain_args_from_pending(pending);
+        assert_eq!(remark, borrowed, "the owned split matches the borrow");
+        assert_eq!(
+            fionread,
+            super::FionreadUnit {
+                bytes: 96,
+                exact: false
+            },
+            "the FIONREAD unit carries exactly"
+        );
+    }
+
+    /// The remark state adopts landed results exactly: the next covered
+    /// set, the next cursor, and the gap OR-ed (once owed, always
+    /// owed). A spawn failure owes the gap. Dropping any update fails.
+    /// (Unprivileged: constructed outcomes.)
+    #[test]
+    fn learn_remark_state_adopts_cursor_and_gap() {
+        let covered: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1)].into_iter().collect();
+        let mut state = super::RemarkState {
+            covered: covered.clone(),
+            cursor: Some(std::path::PathBuf::from("/mnt/m4136")),
+            gap_owed: false,
+        };
+        assert_eq!(
+            state.resume_for_next(),
+            Some(std::path::Path::new("/mnt/m4136")),
+            "the next pass resumes after the cursor"
+        );
+        // A landed pass with a gap adopts every field.
+        let next: std::collections::BTreeSet<super::MountIdentity> =
+            [mnt(51, 8, 1), mnt(52, 8, 1)].into_iter().collect();
+        state.adopt(super::MarkPassOutcome {
+            covered: next.clone(),
+            uncovered: 1,
+            attempted: 14,
+            spent: false,
+            resume_after: None,
+            table_gap: false,
+        });
+        assert_eq!(state.covered, next);
+        assert_eq!(state.cursor, None, "a wrapped pass resets the cursor");
+        assert!(state.gap_owed, "one uncovered owes the gap");
+        assert_eq!(state.resume_for_next(), None);
+        // A clean pass keeps the gap owed (OR, never cleared).
+        state.adopt(super::MarkPassOutcome {
+            covered: next.clone(),
+            uncovered: 0,
+            attempted: 0,
+            spent: false,
+            resume_after: None,
+            table_gap: false,
+        });
+        assert!(state.gap_owed, "the gap stays owed once filed");
+        // A spent pass adopts its cursor (not None, not the old one).
+        let mut spent = super::RemarkState {
+            covered: std::collections::BTreeSet::new(),
+            cursor: None,
+            gap_owed: false,
+        };
+        spent.adopt(super::MarkPassOutcome {
+            covered: next.clone(),
+            uncovered: 14,
+            attempted: 4086,
+            spent: true,
+            resume_after: Some(std::path::PathBuf::from("/mnt/m4136")),
+            table_gap: false,
+        });
+        assert_eq!(
+            spent.cursor,
+            Some(std::path::PathBuf::from("/mnt/m4136")),
+            "a spent pass resumes after its last offer"
+        );
+        assert!(spent.gap_owed);
+        // A spawn failure owes the gap even with no outcome.
+        let mut fresh = super::RemarkState {
+            covered: next,
+            cursor: None,
+            gap_owed: false,
+        };
+        fresh.note_spawn_failure();
+        assert!(fresh.gap_owed, "an unstarted pass leaves coverage unproven");
+    }
+
+    /// The remark state's periodic slice spends the shared production
+    /// allowance and resumes after the state's cursor: with an empty
+    /// covered set it bounds the 4100-mount table exactly like the
+    /// startup slice, and with the first slice's cursor it completes
+    /// the tail. An unlimited budget or a reset cursor fails.
+    /// (Unprivileged: generated fixture, injected marks.)
+    #[test]
+    fn learn_remark_state_slice_uses_cursor_and_finite_budget() {
+        let lines = |count: u64| -> String {
+            let mut text = String::new();
+            for id in 51..51 + count {
+                let mut line = format!("{id} 23 8:1 / /mnt/m{id} rw,relatime - ext4 /dev/sda1 rw");
+                while line.len() < 99 {
+                    line.push(' ');
+                }
+                line.push('\n');
+                assert_eq!(line.len(), 100);
+                text.push_str(&line);
+            }
+            text
+        };
+        fn id_of(point: &std::path::Path) -> u64 {
+            point
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('m'))
+                .and_then(|id| id.parse().ok())
+                .expect("fixture points carry their mount id")
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, lines(4100)).unwrap();
+        // Empty state bounds the table: the production allowance is
+        // finite, not unlimited (which would attempt all 4100). Each
+        // mark resolves to its own mount's identity (distinct).
+        let empty = super::RemarkState {
+            covered: std::collections::BTreeSet::new(),
+            cursor: None,
+            gap_owed: false,
+        };
+        let prev = empty.covered.clone();
+        let first = empty.run_slice_for_prev(&big, &prev, |point, _| marked(id_of(point), 8, 1));
+        assert_eq!(
+            first.attempted, 4086,
+            "the periodic spends the finite allowance"
+        );
+        assert_eq!(first.uncovered, 14);
+        assert!(first.spent);
+        assert_eq!(
+            first.resume_after,
+            Some(std::path::PathBuf::from("/mnt/m4136"))
+        );
+        // The adopted cursor completes the tail through the state's
+        // explicit-previous slice (the spawn's snapshot path).
+        let mut state = empty;
+        state.adopt(first);
+        assert_eq!(
+            state.resume_for_next(),
+            Some(std::path::Path::new("/mnt/m4136"))
+        );
+        assert_eq!(state.covered.len(), 4086, "the head marks distinctly");
+        assert!(state.gap_owed, "14 unattempted owes the gap");
+        let prev = state.covered.clone();
+        let second = state.run_slice_for_prev(&big, &prev, |point, _| marked(id_of(point), 8, 1));
+        assert_eq!(second.attempted, 14, "the resume offers the tail only");
+        assert_eq!(second.uncovered, 0);
+        assert!(!second.spent);
+        assert_eq!(second.resume_after, None);
+        assert_eq!(second.covered.len(), 4100, "head retained plus tail marked");
+        // A failed head (nothing retained) proves the cursor is used:
+        // with the cursor the head counts without offers and the tail
+        // attempts; resetting the cursor to None would re-spend the
+        // allowance on the failed head and never reach the tail.
+        let failed_head = super::RemarkState {
+            covered: std::collections::BTreeSet::new(),
+            cursor: Some(std::path::PathBuf::from("/mnt/m4136")),
+            gap_owed: true,
+        };
+        let prev = failed_head.covered.clone();
+        let resumed = failed_head.run_slice_for_prev(&big, &prev, |point, _| {
+            let id = id_of(point);
+            if id <= 4136 {
+                failed(id, 8, 1)
+            } else {
+                marked(id, 8, 1)
+            }
+        });
+        assert_eq!(resumed.attempted, 14, "only the tail is offered");
+        assert_eq!(resumed.uncovered, 4086, "the failed head counts once");
+        assert!(!resumed.spent);
+        assert_eq!(resumed.covered.len(), 14, "only the tail marks");
     }
 
     /// The held descriptor's mount identity takes the snapshot

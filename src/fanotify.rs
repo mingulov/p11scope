@@ -1846,9 +1846,11 @@ fn pass_budget() -> impl FnMut() -> bool {
 }
 
 /// One production mark slice with the finite [`MARK_PASS_BUDGET`]
-/// allowance: the single owner for both the startup arming slices
-/// and the periodic re-mark. Production and the wiring twins share
-/// this; replacing its budget with unlimited fails
+/// allowance: the owner of the periodic re-mark's read-and-mark pass
+/// (the table is re-read each period because mounts change across
+/// periods). The startup arming instead reads once and rotates over
+/// the snapshot through [`drive_startup_slices`]. Production and the
+/// wiring twins share this; replacing its budget with unlimited fails
 /// `learn_production_mark_slice_is_finite_and_exact`.
 fn production_mark_slice(
     mountinfo: &std::path::Path,
@@ -1866,67 +1868,66 @@ fn production_mark_slice(
     )
 }
 
-/// How many charged slices the startup arming may spend pre-shed:
-/// enough to cover the retained set ([`MARK_COVERAGE_CAP`]) with the
-/// per-slice allowance ([`MARK_PASS_BUDGET`]) minus the table-read
-/// cost, plus one for the table itself. Realistic under-cap tables
-/// (≈7500 mounts at 140 B/line) need two; three also completes the
-/// oversized-test prefix (10485). Derived, never raised.
-fn startup_slice_limit() -> usize {
-    MARK_COVERAGE_CAP.div_ceil(MARK_PASS_BUDGET) + 1
-}
-
 /// The typed outcome of the pre-shed startup arming: the final
 /// [`MarkPassOutcome`] plus how many charged slices it spent. Checked
-/// by exact equality: the slice count proves the budget was finite
-/// (unlimited would finish in one), the final outcome proves full
-/// coverage for under-cap tables.
+/// by exact equality: the slice count proves each slice was finite
+/// (an unlimited budget would finish in one), the final outcome proves
+/// the rotation completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupDriveOutcome {
     outcome: MarkPassOutcome,
     slices: usize,
 }
 
-/// Drives the pre-shed startup arming to completion: repeated charged
-/// slices with fresh production budgets, threading the resume cursor,
-/// until the rotation wraps (`spent == false`), the slice limit is
-/// reached, or `should_stop` fires between slices. Each slice is
-/// charged; the total attempted is summed, the table gap OR-ed. The
-/// startup grant is still held here, so every slice can place marks;
-/// the post-shed periodic only retains. Production `start()` and the
-/// shed twin share this; dropping the cursor or using an unlimited
-/// budget fails `learn_startup_shed_resume_keeps_full_coverage_like_v071`
-/// and `learn_startup_drive_threads_cursor_across_slices`.
+/// Drives the pre-shed startup arming to completion over a single
+/// mount-table snapshot: the table is read once (charged to the first
+/// slice's budget — exactly one render of the table), then charged
+/// mark slices with fresh production budgets rotate over that fixed
+/// snapshot, threading the resume cursor, until the rotation wraps
+/// (`spent == false`) or `should_stop` fires between slices. There is
+/// no fixed slice cap: every slice that spends advances the cursor
+/// past the mounts it offered, so on a fixed snapshot the rotation
+/// always completes; the existing worker bound plus cancel bounds the
+/// wall time. The total attempted is summed and the table gap is
+/// decided once from the single read. Native work matches an
+/// unbounded single pass (one table read, every parsed mount offered
+/// once), so coverage matches it too — while every slice stays within
+/// its own allowance. The startup grant is still held here, so every
+/// slice can place marks; the post-shed periodic only retains.
+/// Production `start()` and the shed twin share this; dropping the
+/// cursor, stopping after a fixed count, or using an unlimited budget
+/// fails `learn_startup_shed_resume_keeps_full_coverage_like_v071`,
+/// `learn_dense_under_cap_table_completes_startup_rotation` and
+/// `learn_startup_drive_threads_cursor_across_slices`.
 fn drive_startup_slices(
     mountinfo: &std::path::Path,
     mut mark: impl FnMut(&std::path::Path, &[MountToMark]) -> MarkOutcome,
     mut should_stop: impl FnMut() -> bool,
 ) -> StartupDriveOutcome {
+    let mut budget = pass_budget();
+    let table = read_mount_table(mountinfo, MOUNTINFO_CAP, &mut budget);
+    let table_gap = table.outcome != MountTableOutcome::Complete;
+    let gap_unit = usize::from(table_gap);
     let mut covered = BTreeSet::new();
     let mut cursor: Option<std::path::PathBuf> = None;
     let mut total_attempted = 0usize;
-    let mut table_gap = false;
     let mut slices = 0usize;
-    let limit = startup_slice_limit();
     loop {
-        let outcome = production_mark_slice(mountinfo, &covered, cursor.as_deref(), &mut mark);
+        let outcome = evaluate_mark_coverage(
+            &covered,
+            &table.mounts,
+            |point| mark(point, &table.mounts),
+            &mut budget,
+            cursor.as_deref(),
+        );
         slices += 1;
-        let MarkPassOutcome {
-            covered: next_covered,
-            uncovered,
-            attempted,
-            spent,
-            resume_after,
-            table_gap: slice_gap,
-        } = outcome;
-        total_attempted += attempted;
-        table_gap = table_gap || slice_gap;
-        covered = next_covered;
-        if !spent {
+        total_attempted += outcome.attempted;
+        covered = outcome.covered;
+        if !outcome.spent {
             return StartupDriveOutcome {
                 outcome: MarkPassOutcome {
                     covered,
-                    uncovered,
+                    uncovered: outcome.uncovered + gap_unit,
                     attempted: total_attempted,
                     spent: false,
                     resume_after: None,
@@ -1935,12 +1936,13 @@ fn drive_startup_slices(
                 slices,
             };
         }
-        cursor = resume_after;
-        if slices >= limit || should_stop() {
+        cursor = outcome.resume_after;
+        let uncovered = outcome.uncovered;
+        if should_stop() {
             return StartupDriveOutcome {
                 outcome: MarkPassOutcome {
                     covered,
-                    uncovered,
+                    uncovered: uncovered + gap_unit,
                     attempted: total_attempted,
                     spent: true,
                     resume_after: cursor,
@@ -1949,6 +1951,7 @@ fn drive_startup_slices(
                 slices,
             };
         }
+        budget = pass_budget();
     }
 }
 
@@ -4979,9 +4982,10 @@ mod tests {
     }
 
     /// The startup driver owes the table gap for an oversized table and
-    /// still completes its parsed prefix in three charged slices (the
-    /// slice limit): the unseen remainder counts once, never silent.
-    /// (Unprivileged: generated 10485-line fixture, injected marks.)
+    /// still completes its parsed prefix (three charged slices for the
+    /// 10485-mount prefix): the unseen remainder counts once, never
+    /// silent. (Unprivileged: generated 10485-line fixture, injected
+    /// marks.)
     #[test]
     fn learn_startup_drive_owes_table_gap_for_oversized() {
         let dir = tempfile::tempdir().unwrap();
@@ -5038,11 +5042,6 @@ mod tests {
             super::MARK_COVERAGE_CAP,
             8192,
             "the retained coverage cap never moves"
-        );
-        assert_eq!(
-            super::startup_slice_limit(),
-            3,
-            "two slices plus one for the table"
         );
         // The budget itself grants exactly the allowance, then refuses.
         let mut budget = super::pass_budget();

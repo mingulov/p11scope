@@ -1094,10 +1094,13 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
 #endif
 """
 
-# Reviewed patch table: intended (old, new, reason) deltas from the pinned
-# bytes to the live fixture. Empty today: the pin is exactly the live file.
-# Each entry applies exactly once, in order; a missing or ambiguous old
-# text fails loudly instead of silently skipping.
+# Consumed copy of the reviewed patch table: intended (old, new, reason)
+# deltas from the pinned bytes to the live fixture. Empty today: the pin
+# is exactly the live file. The test-owned owner of record lives in
+# MatrixBuildFlagsTests.TEST_MATRIX_FIXTURE_PATCHES, pinned exactly equal
+# there; record future changes there first, under review, then mirror them
+# here. Each entry applies exactly once, in order; a missing or ambiguous
+# old text fails loudly instead of silently skipping.
 MATRIX_FIXTURE_PATCHES = ()
 
 
@@ -4107,12 +4110,11 @@ def version_canary_scan_shape(evidence, target_bits):
     require(len(evidence["discovery"]) == 1, "version fixture needs one provider")
     module = evidence["discovery"][0]
     tables = module["tables"]
+    # Strict typed rows before any derivation: the signature and geometry
+    # below index version/entries/offset, so an untyped row must be refused
+    # here, never crash a Counter or a tuple() downstream.
     for table in tables:
-        version = table["version"]
-        require(isinstance(version, list) and len(version) == 2
-                and all(type(part) is int and 0 <= part <= 255 for part in version),
-                "invalid version fixture table metadata")
-        require(u64(table["entries"]), "invalid version fixture table extent")
+        exact_table_row(table)
     base_tables = (VERSION_TABLES_SCANNED_IA32 if target_bits == 32
                    else VERSION_TABLES_SCANNED)
     base_surfaces = (VERSION_SURFACES_SCANNED_IA32 if target_bits == 32
@@ -4220,12 +4222,8 @@ def exact_matrix_observation(
     together, never apart."""
     exact_shape(evidence, *shape)
     exact_canary_surface_records(evidence, MATRIX_MANIFEST_RECORDS, scan_records)
-    require(
-        table_signature(evidence) == tables,
-        f"unexpected discovery tables: {evidence['discovery']}",
-    )
     exact_matrix_table_rows(
-        evidence, scan_baseline=scan_baseline, word=word, extras=extras
+        evidence, tables, scan_baseline=scan_baseline, word=word, extras=extras
     )
 
 
@@ -4342,58 +4340,90 @@ def exact_table_row(table):
         f"matrix table row has a bad version: {table!r}",
     )
     require(
-        type(table["entries"]) is int and table["entries"] >= 0
+        u64(table["entries"])
         and type(table["source"]) is str
         and type(table["linkage"]) is str
         and (table["file_offset"] is None or type(table["file_offset"]) is int)
         and (table["exports_agreeing"] is None
-             or type(table["exports_agreeing"]) is int),
+             or u64(table["exports_agreeing"])),
         f"matrix table row has untyped fields: {table!r}",
+    )
+    require(
+        table["file_offset"] is None or u64(table["file_offset"]),
+        f"matrix table row file_offset outside u64: {table!r}",
     )
 
 
-def exact_matrix_table_rows(evidence, *, scan_baseline, word, extras):
-    """Full typed table evidence: manifest rows ordered-exact, scan rows
-    exact per-row with adaptive offsets. `scan_baseline` is the ordered
-    [(version, entries)] baseline; `extras` is None (forbidden: induced
-    lanes) or "canary" (terminal/paired views allowed under extra rules).
-    Malformed, extra, missing or misordered rows fail."""
+def exact_scan_baseline_row(table, key):
+    """One baseline scan row: linkage in its allowed set, agreement exact."""
+    linkages, agreeing = MATRIX_SCAN_ROW_CONTRACT[key]
+    require(
+        table["linkage"] in SCAN_LINKAGE_VOCABULARY
+        and table["linkage"] in linkages,
+        f"matrix scan table has unallowed linkage: {table!r}",
+    )
+    require(
+        table["exports_agreeing"] == agreeing,
+        f"matrix scan table has wrong export agreement: {table!r}",
+    )
+
+
+def exact_scan_extra_row(table):
+    """One adaptive extra row: sweep-only linkage, agreement 0/1/3."""
+    require(
+        table["linkage"] in SCAN_LINKAGE_VOCABULARY
+        and table["linkage"] == "heuristic",
+        f"matrix scan extra has unallowed linkage: {table!r}",
+    )
+    require(
+        table["exports_agreeing"] in EXTRA_SCAN_AGREEING,
+        f"matrix scan extra has wrong export agreement: {table!r}",
+    )
+
+
+def exact_matrix_table_rows(evidence, wanted, *, scan_baseline, word, extras):
+    """Full typed table evidence: every row strict-typed; the array runs
+    scan block then manifest block (producer order); manifest rows
+    ordered-exact; scan baseline rows exact per-row; scan offsets
+    present, aligned, strictly ascending and non-overlapping (induced
+    lanes, exact shape) or multiset-matched with adaptive extras
+    (canary lanes, whose extras interleave). `extras` is None
+    (forbidden) or "canary". Malformed, extra, missing, misordered or
+    misplaced rows fail."""
     require(len(evidence["discovery"]) == 1, "matrix tables need one provider")
     tables = evidence["discovery"][0]["tables"]
     for table in tables:
         exact_table_row(table)
     require(
-        all(table["source"] in ("scan", "manifest") for table in tables),
-        f"matrix table has a bad source: {tables!r}",
+        table_signature(evidence) == wanted,
+        f"unexpected discovery tables: {evidence['discovery']}",
     )
+    # No source-vocabulary assert: the signature keys include the source,
+    # so any row outside scan/manifest already failed as a Counter
+    # mismatch; the partition below only ever sees known sources.
     require(
         all(key in MATRIX_SCAN_ROW_CONTRACT for key in scan_baseline),
         f"matrix scan baseline escapes the row contract: {scan_baseline!r}",
     )
+    scan = [table for table in tables if table["source"] == "scan"]
     manifest = [table for table in tables if table["source"] == "manifest"]
+    require(
+        [table["source"] for table in tables]
+        == ["scan"] * len(scan) + ["manifest"] * len(manifest),
+        f"matrix tables misordered across sources: {[table['source'] for table in tables]!r}",
+    )
     require(
         manifest == MATRIX_MANIFEST_TABLES,
         f"matrix manifest tables differ: {manifest!r}",
     )
-    scan = [table for table in tables if table["source"] == "scan"]
     scan_keys = [(tuple(table["version"]), table["entries"]) for table in scan]
     if extras is None:
         require(
             scan_keys == scan_baseline,
             f"matrix scan tables differ: {scan_keys!r}",
         )
-        for table in scan:
-            key = (tuple(table["version"]), table["entries"])
-            linkages, agreeing = MATRIX_SCAN_ROW_CONTRACT[key]
-            require(
-                table["linkage"] in SCAN_LINKAGE_VOCABULARY
-                and table["linkage"] in linkages,
-                f"matrix scan table has unallowed linkage: {table!r}",
-            )
-            require(
-                table["exports_agreeing"] == agreeing,
-                f"matrix scan table has wrong export agreement: {table!r}",
-            )
+        for table, key in zip(scan, scan_baseline):
+            exact_scan_baseline_row(table, key)
         offsets = [table["file_offset"] for table in scan]
         require(
             all(type(offset) is int for offset in offsets),
@@ -4404,13 +4434,13 @@ def exact_matrix_table_rows(evidence, *, scan_baseline, word, extras):
             f"matrix scan tables misaligned: {offsets!r}",
         )
         require(
-            len(set(offsets)) == len(offsets),
-            f"matrix scan tables share offsets: {offsets!r}",
+            all(first < second for first, second in zip(offsets, offsets[1:])),
+            f"matrix scan tables not in offset order: {offsets!r}",
         )
-        extents = sorted(
+        extents = [
             (offset, offset + word * (table["entries"] + 1))
             for offset, table in zip(offsets, scan)
-        )
+        ]
         require(
             all(left[1] <= right[0] for left, right in zip(extents, extents[1:])),
             f"matrix scan tables overlap: {extents!r}",
@@ -4419,34 +4449,18 @@ def exact_matrix_table_rows(evidence, *, scan_baseline, word, extras):
     require(extras == "canary", f"unknown scan extras mode: {extras!r}")
     remaining = list(scan)
     for key in scan_baseline:
-        matches = [
+        # table_signature's exact multiset equality (which runs first, with the
+        # full baseline inside wanted) guarantees every baseline key is present,
+        # so next() always finds its row by construction.
+        table = next(
             table
             for table in remaining
             if (tuple(table["version"]), table["entries"]) == key
-        ]
-        require(matches, f"matrix scan baseline row missing: {key!r}")
-        table = matches[0]
+        )
         remaining.remove(table)
-        linkages, agreeing = MATRIX_SCAN_ROW_CONTRACT[key]
-        require(
-            table["linkage"] in SCAN_LINKAGE_VOCABULARY
-            and table["linkage"] in linkages,
-            f"matrix scan table has unallowed linkage: {table!r}",
-        )
-        require(
-            table["exports_agreeing"] == agreeing,
-            f"matrix scan table has wrong export agreement: {table!r}",
-        )
+        exact_scan_baseline_row(table, key)
     for table in remaining:
-        require(
-            table["linkage"] in SCAN_LINKAGE_VOCABULARY
-            and table["linkage"] == "heuristic",
-            f"matrix scan extra has unallowed linkage: {table!r}",
-        )
-        require(
-            table["exports_agreeing"] in EXTRA_SCAN_AGREEING,
-            f"matrix scan extra has wrong export agreement: {table!r}",
-        )
+        exact_scan_extra_row(table)
 
 
 def entry_skips(evidence):
@@ -6168,18 +6182,8 @@ def kernel_control_fixture():
 
 
 def version_tables_fixture(counter):
-    manifest_need = Counter(
-        (tuple(version), entries)
-        for (source, version, entries), count in counter.items()
-        if source == "manifest"
-        for _ in range(count)
-    )
+    # Producer order: the scan block first, then the manifest block.
     tables = []
-    for row in MATRIX_MANIFEST_TABLES:
-        key = (tuple(row["version"]), row["entries"])
-        if manifest_need[key] > 0:
-            manifest_need[key] -= 1
-            tables.append(dict(row))
     scan_rows = []
     for key, count in counter.items():
         if key[0] != "scan":
@@ -6205,6 +6209,17 @@ def version_tables_fixture(counter):
                 "exports_agreeing": agreeing,
             }
         )
+    manifest_need = Counter(
+        (tuple(version), entries)
+        for (source, version, entries), count in counter.items()
+        if source == "manifest"
+        for _ in range(count)
+    )
+    for row in MATRIX_MANIFEST_TABLES:
+        key = (tuple(row["version"]), row["entries"])
+        if manifest_need[key] > 0:
+            manifest_need[key] -= 1
+            tables.append(dict(row))
     return tables
 
 
@@ -7954,25 +7969,39 @@ def self_test():
             settle_fixture_verdict(bad)
             rejected(lambda bad=bad: validate_canary(lane, bad, bits))
     print("object canary requires exact 30-call function/RV ledger and target ABI: OK")
+
+    def last_scan_table(document):
+        scan = [
+            table
+            for table in document["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        ]
+        require(scan, "fixture lost its scan tables")
+        return scan[-1]
+
+    def drop_last_scan_table(document):
+        tables = document["evidence"]["discovery"][0]["tables"]
+        tables.remove(last_scan_table(document))
+
+    def duplicate_last_scan_table(document):
+        tables = document["evidence"]["discovery"][0]["tables"]
+        victim = last_scan_table(document)
+        tables.insert(tables.index(victim) + 1, dict(victim))
+
     for label, mutate in (
-        ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
-        (
-            "duplicate ia32 future-minor scan table",
-            lambda d: d["evidence"]["discovery"][0]["tables"].append(
-                {"source": "scan", "version": [3, 9], "entries": 104}
-            ),
-        ),
+        ("missing ia32 scan table", drop_last_scan_table),
+        ("duplicate ia32 future-minor scan table", duplicate_last_scan_table),
         (
             "relabeled ia32 scan table",
-            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
+            lambda d: last_scan_table(d).update(source="manifest"),
         ),
         (
             "wrong ia32 future-minor version",
-            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 8]),
+            lambda d: last_scan_table(d).update(version=[3, 8]),
         ),
         (
             "wrong ia32 future-minor entry count",
-            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(entries=92),
+            lambda d: last_scan_table(d).update(entries=92),
         ),
         ("missing ia32 future-minor surface", lambda d: d["evidence"]["surfaces"].pop()),
         (
@@ -9125,6 +9154,334 @@ def self_test():
         else:
             raise AssertionError(f"induced {lane} missed the extra row")
         print(f"induced {lane} rejects the extra scan table row: OK")
+    # Domain kills: file offsets outside u64 fail in the row parser.
+    for lane in ("G4", "G5"):
+        for label, offset in (("negative", -4096), ("overflow", 1 << 64)):
+            bad = copy.deepcopy(induced[lane])
+            victim = next(
+                table
+                for table in bad["evidence"]["discovery"][0]["tables"]
+                if table["source"] == "scan"
+            )
+            victim["file_offset"] = offset
+            settle_fixture_verdict(bad)
+            try:
+                validate_induced(lane, bad)
+            except AssertionError as error:
+                require(
+                    str(error).startswith("matrix table row file_offset outside u64"),
+                    f"induced {lane} {label} offset rejected elsewhere: {error}",
+                )
+            else:
+                raise AssertionError(f"induced {lane} missed the {label} offset")
+            print(f"induced {lane} rejects the {label} file offset: OK")
+    # Order kills: the producer emits the scan block (offset ascending)
+    # then the manifest block; same-key swaps and cross-source inversions
+    # fail.
+    for lane in ("G4", "G5"):
+        bad = copy.deepcopy(induced[lane])
+        tables = bad["evidence"]["discovery"][0]["tables"]
+        first = next(
+            table for table in tables if table["source"] == "scan"
+        )
+        second = next(
+            table
+            for table in tables
+            if table["source"] == "scan" and table is not first
+        )
+        first["file_offset"], second["file_offset"] = (
+            second["file_offset"],
+            first["file_offset"],
+        )
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan tables not in offset order"),
+                f"induced {lane} swapped offsets rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the swapped offsets")
+        print(f"induced {lane} rejects swapped scan offsets: OK")
+        bad = copy.deepcopy(induced[lane])
+        tables = bad["evidence"]["discovery"][0]["tables"]
+        scan = [table for table in tables if table["source"] == "scan"]
+        manifest = [table for table in tables if table["source"] == "manifest"]
+        tables[:] = manifest + scan
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                "misordered across sources" in str(error),
+                f"induced {lane} inversion rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the inverted order")
+        print(f"induced {lane} rejects the inverted table order: OK")
+        bad = copy.deepcopy(induced[lane])
+        tables = bad["evidence"]["discovery"][0]["tables"]
+        scan = [table for table in tables if table["source"] == "scan"]
+        manifest_at = next(
+            i for i, table in enumerate(tables) if table["source"] == "manifest"
+        )
+        tables[manifest_at - 1], tables[manifest_at - 2] = (
+            tables[manifest_at - 2],
+            tables[manifest_at - 1],
+        )
+        require(
+            len(scan) == 3 and scan[0] is not tables[manifest_at - 1],
+            f"induced {lane} fixture lost its scan order",
+        )
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan tables differ"),
+                f"induced {lane} reordered scans rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the reordered scans")
+        print(f"induced {lane} rejects reordered scan tables: OK")
+    # Per-assertion kills for the typed row rules: manifest linkage and
+    # offset fields, baseline linkage sets, baseline agreement values.
+    for lane in ("G4", "G5"):
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "manifest"
+        )
+        victim["linkage"] = "heuristic"
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix manifest tables differ"),
+                f"induced {lane} manifest linkage rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the manifest linkage")
+        print(f"induced {lane} rejects manifest linkage drift: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "manifest"
+        )
+        victim["file_offset"] = 0
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix manifest tables differ"),
+                f"induced {lane} manifest offset rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the manifest offset")
+        print(f"induced {lane} rejects manifest offset drift: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan" and table["version"] == [2, 40]
+        )
+        victim["linkage"] = "live_return"
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan table has unallowed linkage"),
+                f"induced {lane} baseline linkage rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the baseline linkage")
+        print(f"induced {lane} rejects baseline linkage drift: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan" and table["version"] == [2, 40]
+        )
+        victim["exports_agreeing"] = 2
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan table has wrong export agreement"),
+                f"induced {lane} baseline agreement rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the baseline agreement")
+        print(f"induced {lane} rejects baseline agreement drift: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        )
+        victim["file_offset"] = 4097
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan tables misaligned"),
+                f"induced {lane} misaligned offset rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the misaligned offset")
+        print(f"induced {lane} rejects misaligned scan offsets: OK")
+        bad = copy.deepcopy(induced[lane])
+        scans = [
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        ]
+        scans[1]["file_offset"] = scans[0]["file_offset"] + 8
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan tables overlap"),
+                f"induced {lane} overlapping offset rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the overlapping offset")
+        print(f"induced {lane} rejects overlapping scan offsets: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        )
+        victim["file_offset"] = None
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix scan tables lack file offsets"),
+                f"induced {lane} missing offset rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the missing offset")
+        print(f"induced {lane} rejects missing scan offsets: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        )
+        victim["version"] = [3]
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix table row has a bad version"),
+                f"induced {lane} malformed version rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the malformed version")
+        print(f"induced {lane} rejects malformed scan versions: OK")
+        bad = copy.deepcopy(induced[lane])
+        victim = next(
+            table
+            for table in bad["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"
+        )
+        victim["junk"] = 1
+        settle_fixture_verdict(bad)
+        try:
+            validate_induced(lane, bad)
+        except AssertionError as error:
+            require(
+                str(error).startswith("matrix table row is not a typed record"),
+                f"induced {lane} extra key rejected elsewhere: {error}",
+            )
+        else:
+            raise AssertionError(f"induced {lane} missed the extra key")
+        print(f"induced {lane} rejects extra scan row keys: OK")
+
+    # A null version must be refused, not crash tuple() in the signature:
+    # only AssertionError is caught, so a TypeError would fail the self-test.
+    bad = copy.deepcopy(induced["G4"])
+    victim = next(
+        table
+        for table in bad["evidence"]["discovery"][0]["tables"]
+        if table["source"] == "scan"
+    )
+    victim["version"] = None
+    settle_fixture_verdict(bad)
+    try:
+        validate_induced("G4", bad)
+    except AssertionError as error:
+        require(
+            str(error).startswith("matrix table row has a bad version"),
+            f"induced G4 null version rejected elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("induced G4 missed the null version")
+    print("induced G4 refuses null scan versions: OK")
+    bad = copy.deepcopy(induced["G4"])
+    victim = next(
+        table
+        for table in bad["evidence"]["discovery"][0]["tables"]
+        if table["source"] == "scan"
+    )
+    victim["entries"] = 2**64
+    settle_fixture_verdict(bad)
+    try:
+        validate_induced("G4", bad)
+    except AssertionError as error:
+        require(
+            str(error).startswith("matrix table row has untyped fields"),
+            f"induced G4 overflowing entries rejected elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("induced G4 missed the overflowing entries")
+    print("induced G4 rejects overflowing scan entries: OK")
+    bad = copy.deepcopy(induced["G4"])
+    victim = next(
+        table
+        for table in bad["evidence"]["discovery"][0]["tables"]
+        if table["source"] == "scan"
+    )
+    victim["exports_agreeing"] = -1
+    settle_fixture_verdict(bad)
+    try:
+        validate_induced("G4", bad)
+    except AssertionError as error:
+        require(
+            str(error).startswith("matrix table row has untyped fields"),
+            f"induced G4 negative agreement rejected elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("induced G4 missed the negative agreement")
+    print("induced G4 rejects negative scan agreement: OK")
+    bad = copy.deepcopy(induced["G4"])
+    tables = bad["evidence"]["discovery"][0]["tables"]
+    victim = next(table for table in tables if table["source"] == "scan")
+    tables.remove(victim)
+    settle_fixture_verdict(bad)
+    try:
+        validate_induced("G4", bad)
+    except AssertionError as error:
+        require(
+            str(error).startswith("unexpected discovery tables"),
+            f"induced G4 missing table rejected elsewhere: {error}",
+        )
+    else:
+        raise AssertionError("induced G4 missed the missing table")
+    print("induced G4 rejects a missing scan table: OK")
 
     bad = copy.deepcopy(induced["G3"])
     bad["evidence"]["rv_update_failures"] = 1

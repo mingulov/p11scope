@@ -5526,6 +5526,24 @@ mod tests {
         assert_eq!(pending.covered, covered);
         assert!(!pending.initial_gap_owed, "full coverage owes no gap");
         assert_eq!(pending.remark_cursor, None, "a wrapped rotation resets");
+        // The boundary: a single uncovered mount — exactly the
+        // table-gap-only shape — still owes the gap.
+        let dummy = std::fs::File::open("/dev/null").unwrap();
+        let group = std::os::fd::OwnedFd::from(dummy);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let drive = super::StartupDriveOutcome {
+            outcome: super::MarkPassOutcome {
+                covered,
+                uncovered: 1,
+                attempted: 1,
+                spent: false,
+                resume_after: None,
+                table_gap: true,
+            },
+            slices: 1,
+        };
+        let pending = super::pending_arming_from_drive(group, tx, drive, 64, true);
+        assert!(pending.initial_gap_owed, "one uncovered mount owes the gap");
     }
 
     /// The startup arming composition drives a dense fixture through

@@ -2468,6 +2468,37 @@ class ProducerMutationSweepTests(unittest.TestCase):
                "signature": {"cell": "X", "branch": "B"}, "extra": 1}],
              [],
              1),
+            ("python-selection-test-nonempty",
+             'and type(item.get("test")) is str and item["test"]',
+             'and type(item.get("test")) is str',
+             [{"test": ""}],
+             [],
+             [],
+             0),
+            ("python-result-test-nonempty",
+             'or type(item.get("test")) is not str or not item["test"]',
+             'or type(item.get("test")) is not str',
+             [{"test": "Sample.test_x"}],
+             [{"test": "", "state": "failed",
+               "signature": {"cell": "X", "branch": "B"}}],
+             [],
+             1),
+            ("python-result-state-nonempty",
+             'or type(item.get("state")) is not str or not item["state"]',
+             'or type(item.get("state")) is not str',
+             [{"test": "Sample.test_x"}],
+             [{"test": "Sample.test_x", "state": "",
+               "signature": {"cell": "X", "branch": "B"}}],
+             [],
+             0),
+            ("python-event-name-nonempty",
+             'and type(event.get("event")) is str and event["event"]',
+             'and type(event.get("event")) is str',
+             [{"test": "Sample.test_pass"}],
+             [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+             [{"event": "", "state": "error",
+               "signature": {"branch": "error"}}],
+             1),
             ("python-result-invalid",
              "                invalid = True\n"
              "                complete = False\n"
@@ -3425,7 +3456,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 52
+        total = 56
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

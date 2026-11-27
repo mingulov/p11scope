@@ -45,24 +45,32 @@ def ignored_scanner_module():
 
 
 def rust_token_index():
-    """Map Rust identifier tokens to source files, ignoring comments/strings."""
+    """Map Rust identifier tokens to source files, ignoring comments/strings.
+
+    Returns (index, problems): every *.rs file outside the excluded
+    segments is either indexed or reported. An unreadable source
+    refuses the conversion instead of silently shrinking the token
+    set, which could turn an ambiguous token unique.
+    """
     scanner = ignored_scanner_module()
     index = {}
+    problems = []
     for base_name in ("src", "tests", "crates"):
         base = ROOT / base_name
         if not base.is_dir():
             continue
-        for path in base.rglob("*.rs"):
+        for path in sorted(base.rglob("*.rs")):
             if any(segment in scanner.EXCLUDED_SEGMENTS for segment in path.parts):
                 continue
             try:
                 stripped = scanner.strip_code(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as exc:
+                problems.append(f"cannot read Rust source {path.relative_to(ROOT).as_posix()}: {exc}")
                 continue
             relative = path.relative_to(ROOT).as_posix()
             for token in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", stripped)):
                 index.setdefault(token, set()).add(relative)
-    return index
+    return index, problems
 
 
 def typed_sidecar_signature(path_text):
@@ -119,10 +127,13 @@ def main(argv):
     if registry_problems:
         print(f"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}", file=sys.stderr)
         return 1
+    index, index_problems = rust_token_index()
+    if index_problems:
+        print(f"privileged-lib-results: {'; '.join(index_problems)}", file=sys.stderr)
+        return 1
     missing = [name for _path, name in
                ((files.get(name), name) for name in verdict_names) if _path is None]
     if missing:
-        index = rust_token_index()
         for name in missing:
             leaf = name.rsplit("::", 1)[-1]
             candidates = index.get(leaf, set())

@@ -87,7 +87,13 @@ through strict typed JSON: duplicate keys, wrong types and
 undecodable bytes are typed refusals, and a missing or unreadable
 required file fails closed with a named error instead of an empty
 mapping. The ignored-test inventory validator reads through the
-same strict loader.
+same strict loader. Every directory the gate scans accounts for
+every file in its population: `.github/workflows` admits only
+`.yml`/`.yaml` files (anything else is refused), every
+`tests/python/test_*.py` file must be registered, and every scanned
+`.rs` source must decode. The suite registry is parsed as data, so
+`RUN` in `scripts/run-python-suites.py` must stay a top-level
+literal list of `(name, args)` pairs.
 
 ## Known-issue registry block (exact format)
 

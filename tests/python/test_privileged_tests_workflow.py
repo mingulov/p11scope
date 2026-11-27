@@ -190,7 +190,8 @@ def privileged_runner_mirror(temp, runner_source):
     script.parent.mkdir(parents=True)
     script.write_text(runner_source, encoding="utf-8")
     script.chmod(0o755)
-    for relative in ("scripts/check-known-failing.py", "scripts/ci/privileged-lib-results.py",
+    for relative in ("scripts/check-known-failing.py", "scripts/check-ignored-tests.py",
+                     "scripts/ci/privileged-lib-results.py",
                      "tests/ignored-tests.json", "tests/known-failing.json"):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)

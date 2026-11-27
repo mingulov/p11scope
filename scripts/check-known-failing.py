@@ -58,6 +58,7 @@ Usage:
 """
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -515,21 +516,59 @@ def test_exists(root, row):
     return False
 
 
+def registry_run_entries(registry_path):
+    """The RUN membership list parsed as data, or None when unreadable.
+
+    The suite registry is never executed here: the production runner
+    needs module globals (`__file__`) at import time, so executing it
+    in a probe namespace crashes on the valid real file. The RUN
+    assignment is a plain literal; anything else refuses the row.
+    """
+    try:
+        text = registry_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    run_value = None
+    run_seen = False
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "RUN" for target in node.targets):
+            continue
+        run_seen = True
+        try:
+            run_value = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError, RecursionError):
+            run_value = None
+    if not run_seen or not isinstance(run_value, list):
+        return None
+    return run_value
+
+
 def python_suite_registered(root, row):
     if row["runner"] != "python-suite":
         return True
     prefix = "tests/python/"
     if not row["path"].startswith(prefix):
         return False
-    registry_path = root / "scripts/run-python-suites.py"
-    try:
-        namespace = {}
-        exec(compile(registry_path.read_text(encoding="utf-8"), str(registry_path), "exec"), namespace)
-    except (OSError, SyntaxError, UnicodeDecodeError):
+    entries = registry_run_entries(root / "scripts/run-python-suites.py")
+    if entries is None:
         return False
     name = row["path"][len(prefix):]
     invocation = row_invocation(row)
-    return any(entry == name and list(args) == invocation for entry, args in namespace.get("RUN", []))
+    for item in entries:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        entry, args = item
+        if not isinstance(args, (list, tuple)):
+            return False
+        if entry == name and list(args) == invocation:
+            return True
+    return False
 
 
 def shell_string_array(text, name):
@@ -664,7 +703,10 @@ def workflow_invocations(root):
     problems = []
     if not workflow_dir.is_dir():
         return [], [f"{workflow_dir}: missing workflow directory"]
-    for path in sorted(workflow_dir.glob("*.yml")):
+    for path in sorted(workflow_dir.iterdir()):
+        if path.suffix not in (".yml", ".yaml") or not path.is_file():
+            problems.append(f"{path}: unknown workflow directory entry: only .yml and .yaml files are workflows")
+            continue
         try:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:

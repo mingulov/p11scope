@@ -602,10 +602,14 @@ def merge_typed_fragments(fragment_specs, output, host):
         "selection": selection,
         "results": results,
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(output)
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(output)
+    except OSError as exc:
+        print(f"run-python-suites: cannot write typed results {output}: {exc}", file=sys.stderr)
+        return None
     return process_problems
 
 
@@ -644,6 +648,8 @@ def run_suites(selected):
                 return [*failed, "typed-result configuration"]
             output = Path(typed_output)
             process_problems = merge_typed_fragments(fragments, output, typed_host)
+            if process_problems is None:
+                return [*failed, "typed-result output"]
             checker = subprocess.run(
                 [sys.executable, "-I", "scripts/check-known-failing.py", "--results", str(output)],
                 cwd=ROOT,

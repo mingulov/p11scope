@@ -23808,10 +23808,10 @@ fn unwind_drops_a_constructed_guard_before_proof() {
 /// wait saw instead of re-reading (which could race a shell exit).
 fn wait_sh_wrapped_sleep_spawned(pid: u32) -> String {
     for _ in 0..500 {
-        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-            if !children.trim().is_empty() {
-                return children;
-            }
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            && !children.trim().is_empty()
+        {
+            return children;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -100397,7 +100397,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
     // child — the same spawn-anchored shape as the parked quads, for
     // settled (not parked) fixtures. Custody is pinned separately
     // in `guard_ctors`; order here pins readiness.
-    let settle_opens: [(&str, &[(&str, &str)], &str); 60] = [
+    let settle_opens: [ParkedGroup; 60] = [
         (
             "tick_does_not_remark_lingering_zombie_of_tracked_generation",
             &[(

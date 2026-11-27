@@ -131,6 +131,23 @@ MATRIX_MANIFEST_ROWS = [
 ]
 
 
+def scan_block_end(tables):
+    """Index just past the last scan row. Producer order runs the scan
+    block first, then the manifest block; extras live inside the scan
+    block, never appended past the manifest rows."""
+    scan = [i for i, table in enumerate(tables) if table["source"] == "scan"]
+    assert scan, "fixture lost its scan tables"
+    expect = ["scan"] * len(scan) + ["manifest"] * (len(tables) - len(scan))
+    assert [t["source"] for t in tables] == expect, "tables not in producer order"
+    return scan[-1] + 1
+
+
+def scan_tables_of(document):
+    """Live references to the document's scan rows in array order."""
+    return [table for table in document["evidence"]["discovery"][0]["tables"]
+            if table["source"] == "scan"]
+
+
 def typed_matrix_surfaces(module_path, manifest, scan):
     """Surface dicts from test-owned literals: manifest is thirteen
     ((major, minor), functions, walk) rows in fixture order, scan is
@@ -3436,6 +3453,15 @@ class MatrixBuildFlagsTests(unittest.TestCase):
     # expectation. Lives here, not in the checker: a staged script must not
     # reference a build script (the staging closure would walk it
     # transitively and demand it as a runner).
+    #
+    # The reviewed patch table, owned by the test: every intended
+    # (old, new, reason) delta from the checker's pinned fixture bytes to
+    # the live file. Empty today (the pin is exactly the live file). Future
+    # fixture changes are recorded here first, under review, and mirrored
+    # into the checker's consumed copy; the pin below fails loudly on any
+    # drift between the two. The checker cannot own this list: the oracle
+    # expectation must not come from the implementation under test.
+    TEST_MATRIX_FIXTURE_PATCHES = ()
     BUILD_SCRIPTS = (
         "scripts/verify-canaries.sh",
         "scripts/verify-induced-gaps.sh",
@@ -3483,6 +3509,11 @@ class MatrixBuildFlagsTests(unittest.TestCase):
         self.assertEqual(set(discovered), set(self.GUARDED_BUILDS))
         self.assertEqual(discovered, self.GUARDED_BUILDS)
 
+    def test_checker_patch_table_matches_reviewed_owner(self):
+        subject = load_capture_checker()
+        self.assertEqual(
+            subject.MATRIX_FIXTURE_PATCHES, self.TEST_MATRIX_FIXTURE_PATCHES)
+
 
 class VersionCanaryPrefixTests(unittest.TestCase):
     def recovered_profile(self):
@@ -3494,10 +3525,20 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         # aligned448 bytes apart in the terminal file-backed page.
         for table, offset in zip(raw, (21024, 21472, 21920, 22368, 22816, 23264)):
             table['file_offset'] = offset
+        # Live IA32 order interleaves the (3,2,68) view after (3,1,92);
+        # the (4,0) pair trails the scan block.
         for version, count, offset, anchors in (
                 ([3, 2], 68, 24160, 1), ([4, 0], 68, 23712, 1), ([4, 0], 92, 23712, 3)):
-            module['tables'].append(dict(source='scan', version=version, entries=count,
-                file_offset=offset, linkage='heuristic', exports_agreeing=anchors))
+            row = dict(source='scan', version=version, entries=count,
+                       file_offset=offset, linkage='heuristic',
+                       exports_agreeing=anchors)
+            if (version, count) == ([3, 2], 68):
+                anchor = next(i for i, table in enumerate(module['tables'])
+                              if table['source'] == 'scan'
+                              and table['version'] == [3, 1])
+                module['tables'].insert(anchor + 1, row)
+            else:
+                module['tables'].insert(scan_block_end(module['tables']), row)
             evidence['surfaces'].append(dict(source=module['path'] + f' table {version[0]}.{version[1]}',
                 acquisition='ok', walk='known_prefix', functions=count))
         return subject, document
@@ -3517,8 +3558,9 @@ class VersionCanaryPrefixTests(unittest.TestCase):
                 subject, document = self.profile(boundary=(offset, count, 'known_prefix'))
                 evidence = document['evidence']
                 module = evidence['discovery'][0]
-                module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
-                module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+                scan_tables_of(document)[-1].update(linkage='heuristic', exports_agreeing=3)
+                module['tables'].insert(scan_block_end(module['tables']),
+                    dict(source='scan', version=[3, 1], entries=68,
                     file_offset=offset, linkage='heuristic', exports_agreeing=1))
                 evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
                     acquisition='ok', walk='known_prefix', functions=68))
@@ -3533,8 +3575,9 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         subject, document = self.profile(boundary=(offset, 69, 'known_prefix'))
         evidence = document['evidence']
         module = evidence['discovery'][0]
-        module['tables'][-1].update(linkage='heuristic', exports_agreeing=3)
-        module['tables'].append(dict(source='scan', version=[3, 1], entries=68,
+        scan_tables_of(document)[-1].update(linkage='heuristic', exports_agreeing=3)
+        module['tables'].insert(scan_block_end(module['tables']),
+            dict(source='scan', version=[3, 1], entries=68,
             file_offset=offset, linkage='heuristic', exports_agreeing=1))
         evidence['surfaces'].append(dict(source=module['path'] + ' table 3.1',
             acquisition='ok', walk='known_prefix', functions=68))
@@ -3545,19 +3588,21 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         subject, healthy = self.recovered_profile()
         subject.validate_canary('default-safe-profile', healthy, 32)
         mutations = [
-            lambda d: d['evidence']['discovery'][0]['tables'].append(
-                dict(d['evidence']['discovery'][0]['tables'][-1])),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=23716),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(file_offset=7 * 4096),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(entries=104),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(version=[3, 0]),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(source='manifest'),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=1),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(exports_agreeing=True),
-            lambda d: d['evidence']['discovery'][0]['tables'][-1].update(linkage='exports'),
-            lambda d: d['evidence']['discovery'][0]['tables'][-2].update(file_offset=23713),
-            lambda d: d['evidence']['discovery'][0]['tables'][-3].update(file_offset=23712),
-            lambda d: d['evidence']['discovery'][0]['tables'].pop(-2),
+            lambda d: d['evidence']['discovery'][0]['tables'].insert(
+                scan_block_end(d['evidence']['discovery'][0]['tables']),
+                dict(scan_tables_of(d)[-1])),
+            lambda d: scan_tables_of(d)[-1].update(file_offset=23716),
+            lambda d: scan_tables_of(d)[-1].update(file_offset=7 * 4096),
+            lambda d: scan_tables_of(d)[-1].update(entries=104),
+            lambda d: scan_tables_of(d)[-1].update(version=[3, 0]),
+            lambda d: scan_tables_of(d)[-1].update(source='manifest'),
+            lambda d: scan_tables_of(d)[-1].update(exports_agreeing=1),
+            lambda d: scan_tables_of(d)[-1].update(exports_agreeing=True),
+            lambda d: scan_tables_of(d)[-1].update(linkage='exports'),
+            lambda d: scan_tables_of(d)[-2].update(file_offset=23713),
+            lambda d: scan_tables_of(d)[-3].update(file_offset=23712),
+            lambda d: d['evidence']['discovery'][0]['tables'].pop(
+                scan_block_end(d['evidence']['discovery'][0]['tables']) - 2),
             lambda d: d['evidence']['surfaces'][-1].update(walk='full'),
             lambda d: d['evidence']['surfaces'][-1].update(source='unrelated table 4.0'),
             lambda d: d['evidence'].update(table_entries=1812),
@@ -3600,22 +3645,22 @@ class VersionCanaryPrefixTests(unittest.TestCase):
             surfaces, sources=("scan", "manifest"), discovery_skipped=0)
         module = evidence["discovery"][0]
         module["tables"] = [
-            {"source": "manifest", "version": list(version), "entries": count,
-             "file_offset": None, "linkage": "manifest",
-             "exports_agreeing": None}
-            for version, count, _ in manifest
-        ] + [
             {"source": "scan", "version": list(version), "entries": count,
              "file_offset": 4096 * (index + 1), "linkage": linkage,
              "exports_agreeing": agreeing}
             for index, (version, count, _, linkage, agreeing) in enumerate(raw)
+        ] + [
+            {"source": "manifest", "version": list(version), "entries": count,
+             "file_offset": None, "linkage": "manifest",
+             "exports_agreeing": None}
+            for version, count, _ in manifest
         ]
         evidence["surfaces"] = typed_matrix_surfaces(
             module["path"], manifest,
             [(version, count, walk) for version, count, walk, _, _ in raw])
         if boundary is not None:
             offset, count, walk = boundary
-            module["tables"].append({
+            module["tables"].insert(scan_block_end(module["tables"]), {
                 "source": "scan", "version": [3, 1], "entries": count,
                 "file_offset": offset, "linkage": "heuristic",
                 "exports_agreeing": 3 if count > 68 else (1 if count > 3 else 0),
@@ -3661,22 +3706,26 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         subject.validate_canary("default-safe-profile", healthy)
         # Bind each loop value before storing a mutation.
         mutations = [
-            (lambda d, n=n: d["evidence"]["discovery"][0]["tables"][-1].update(entries=n))
+            (lambda d, n=n: scan_tables_of(d)[-1].update(entries=n))
             for n in (0, -1, 93, True, 1.5, 58)
         ] + [
-            (lambda d, value=value: d["evidence"]["discovery"][0]["tables"][-1].update(file_offset=value))
+            (lambda d, value=value: scan_tables_of(d)[-1].update(file_offset=value))
             for value in (None, -8, True, 8.0, offset + 1, (1 << 64) - 8)
         ] + [
-            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(version=[3, 2]),
-            lambda d: d["evidence"]["discovery"][0]["tables"][-1].update(source="manifest"),
-            lambda d: d["evidence"]["discovery"][0]["tables"].append(
-                dict(d["evidence"]["discovery"][0]["tables"][-1])),
+            lambda d: scan_tables_of(d)[-1].update(version=[3, 2]),
+            lambda d: scan_tables_of(d)[-1].update(source="manifest"),
+            lambda d: scan_tables_of(d)[-1].update(exports_agreeing=2),
+            lambda d: scan_tables_of(d)[-1].update(linkage="live_return"),
+            lambda d: d["evidence"]["discovery"][0]["tables"].insert(
+                scan_block_end(d["evidence"]["discovery"][0]["tables"]),
+                dict(scan_tables_of(d)[-1])),
             lambda d: d["evidence"]["surfaces"][-1].update(walk="full"),
             lambda d: d["evidence"]["surfaces"][-1].update(source="unrelated table 3.1"),
             lambda d: d["evidence"]["surfaces"].append(dict(d["evidence"]["surfaces"][-1])),
-            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset - 8),
-            lambda d: d["evidence"]["discovery"][0]["tables"][-2].update(file_offset=offset + 4096),
-            lambda d: d["evidence"]["discovery"][0]["tables"].pop(-2),
+            lambda d: scan_tables_of(d)[-2].update(file_offset=offset - 8),
+            lambda d: scan_tables_of(d)[-2].update(file_offset=offset + 4096),
+            lambda d: d["evidence"]["discovery"][0]["tables"].pop(
+                scan_block_end(d["evidence"]["discovery"][0]["tables"]) - 2),
             lambda d: next(t for t in d["evidence"]["discovery"][0]["tables"]
                            if t["source"] == "manifest" and t["version"] == [4, 0]).update(entries=0),
             lambda d: next(s for s in d["evidence"]["surfaces"]

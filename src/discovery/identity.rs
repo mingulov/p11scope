@@ -33,9 +33,10 @@ use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, H
 use super::refresh_queue::RetirementProof;
 use crate::discovery::scan::{
     COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, MOUNTINFO_BYTE_STRIDE, MOUNTINFO_STRIDE, SCAN_CLOCK_REASON,
-    SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule, Skipped, TABLE_WINDOW_CEILING_REASON,
-    WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo, standard_function_names,
+    InspectedFileKey, MOUNTINFO_BYTE_STRIDE, MOUNTINFO_PARK_REFUSED_REASON, MOUNTINFO_STRIDE,
+    SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule, Skipped,
+    TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
+    standard_function_names,
 };
 
 #[cfg(test)]
@@ -12134,6 +12135,11 @@ pub(crate) enum UnprovenCause {
 /// Why a pin waits for a fresh pass (one closed cause per stop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitCause {
+    /// The capture resource pool refused to hold a mount-table park
+    /// ([`MOUNTINFO_PARK_REFUSED_REASON`], ruling N2): the read was
+    /// discarded and restarts next pass. A resource refusal, never
+    /// target unreadability.
+    ParkRefused,
     /// open(2) failed with EMFILE/ENFILE (fix6 A3).
     HandleExhaustion,
     /// The tick's fd-reserve snapshot cannot cover the next open.
@@ -12216,11 +12222,16 @@ impl PinOutcome {
 
     /// A pre-copy-up pin whose mount-table read failed: a healable
     /// budget stop keeps its exact mount-table text, so the outer
-    /// classifier waits on it with its exact cause (17:27 I3); anything
-    /// else is missing evidence with today's fixed text, byte for byte.
+    /// classifier waits on it with its exact cause (17:27 I3); a named
+    /// pool park refusal waits as the resource refusal it is (ruling
+    /// N2), never target unreadability; anything else is missing
+    /// evidence with today's fixed text, byte for byte.
     fn for_pre_copy_up_mountinfo_error(view: &ProcessView, error: String) -> Self {
         if mountinfo_detail_is_healable_stop(&error) {
             return Self::for_view_error(view, error);
+        }
+        if mountinfo_detail_is_park_refusal(&error) {
+            return Self::wait(WaitCause::ParkRefused, error);
         }
         Self::for_mountinfo_unreadable()
     }
@@ -12258,9 +12269,14 @@ impl PinOutcome {
         )
     }
 
-    /// Classifies a view-level read failure: gone under a dead view,
-    /// missing evidence under a live one.
+    /// Classifies a view-level read failure: a named pool park refusal
+    /// waits first (a resource refusal preempts liveness, like handle
+    /// exhaustion); gone under a dead view, missing evidence under a
+    /// live one.
     fn for_view_error(view: &ProcessView, error: String) -> Self {
+        if mountinfo_detail_is_park_refusal(&error) {
+            return Self::wait(WaitCause::ParkRefused, error);
+        }
         if !view.still_the_same() {
             return Self::gone(error);
         }
@@ -12269,13 +12285,23 @@ impl PinOutcome {
 
     /// The map_files fallback's typed arms, preserving its exact gap
     /// composition: only a handle-exhaustion wait keeps the outer
-    /// gap prefix; unproven and refused arms keep their own text.
+    /// gap prefix; unproven and refused arms keep their own text. A
+    /// named pool park refusal inside an unproven detail waits as the
+    /// resource refusal it is instead of filing fallback-unproven.
     fn for_map_files_refusal(gap_reason: String, refusal: PinMapFilesRefusal) -> Self {
         match refusal {
             PinMapFilesRefusal::Wait(detail) => Self::wait(
                 WaitCause::HandleExhaustion,
                 format!("{gap_reason} (map_files fallback: {detail})"),
             ),
+            PinMapFilesRefusal::Unproven(detail)
+                if mountinfo_detail_is_park_refusal(&detail) =>
+            {
+                Self::wait(
+                    WaitCause::ParkRefused,
+                    format!("{gap_reason} (map_files fallback: {detail})"),
+                )
+            }
             PinMapFilesRefusal::Unproven(detail) => Self::unproven(
                 UnprovenCause::FallbackUnproven,
                 format!("{gap_reason} (map_files fallback: {detail})"),
@@ -12390,6 +12416,23 @@ fn mountinfo_detail_is_healable_stop(error: &str) -> bool {
                 | INTERFACE_WINDOW_CEILING_REASON
         )
     })
+}
+
+/// Whether a mount-table error is the named pool park refusal, exactly:
+/// the bare refusal sentence or the exact mount-table wrapper around it.
+/// Prefix-anchored like the healable matcher above, never a substring
+/// match: producer advice embeds shell-quoted pathnames, and a path
+/// containing the sentence must not classify as a refusal.
+fn mountinfo_detail_is_park_refusal(error: &str) -> bool {
+    fn is_refusal(detail: &str) -> bool {
+        detail == MOUNTINFO_PARK_REFUSED_REASON
+            || detail
+                .strip_prefix(MOUNTINFO_PARK_REFUSED_REASON)
+                .is_some_and(|tail| tail.starts_with(" ("))
+    }
+    is_refusal(error)
+        || crate::discovery::scan::parse_mount_table_read_reason(error)
+            .is_some_and(|(_, detail)| is_refusal(detail))
 }
 
 impl UnprovenCause {
@@ -23213,6 +23256,13 @@ mod tests {
             wrapped(crate::discovery::scan::MOUNTINFO_RESUME_REASON),
             wrapped(crate::discovery::scan::MOUNTINFO_GENERATION_CHANGED_REASON),
             "synthetic stop nobody latches".to_string(),
+            // The refusal sentence embedded mid-text never classifies:
+            // matching is prefix-anchored, never substring.
+            format!("prefix {}", crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON),
+            wrapped(&format!(
+                "prefix {}",
+                crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON
+            )),
         ] {
             assert_eq!(
                 PinOutcome::for_pre_copy_up_mountinfo_error(&view, error),
@@ -23220,6 +23270,99 @@ mod tests {
                 "non-healable input keeps the fixed text"
             );
         }
+        // A named pool park refusal waits as the resource refusal it is
+        // (ruling N2), bare or mount-table-wrapped, never the fixed
+        // unreadable text.
+        let refused = |bytes: usize| {
+            format!(
+                "{} ({} bytes read so far)",
+                crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+                bytes
+            )
+        };
+        for error in [refused(18), wrapped(&refused(1048577))] {
+            assert_eq!(
+                PinOutcome::for_pre_copy_up_mountinfo_error(&view, error.clone()),
+                PinOutcome::Wait {
+                    cause: WaitCause::ParkRefused,
+                    retry: RetryOwner::ViewRescan,
+                    reason: error,
+                },
+                "a park refusal waits with its exact text"
+            );
+        }
+    }
+
+    /// The merged-path view classifier gives the named pool park refusal
+    /// its typed wait on live and dead views alike: a resource refusal
+    /// preempts liveness, like handle exhaustion.
+    #[test]
+    fn view_error_park_refusal_waits_on_live_and_dead_views() {
+        let live = ProcessView::open(ProcessViewId(242), std::process::id()).unwrap();
+        assert!(live.still_the_same());
+        let dead =
+            crate::process::reused_process_view_for_test(ProcessViewId(243), std::process::id())
+                .unwrap();
+        assert!(!dead.still_the_same());
+        let error = format!(
+            "{} ({} bytes read so far)",
+            crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+            7
+        );
+        for view in [&live, &dead] {
+            assert_eq!(
+                PinOutcome::for_view_error(view, error.clone()),
+                PinOutcome::Wait {
+                    cause: WaitCause::ParkRefused,
+                    retry: RetryOwner::ViewRescan,
+                    reason: error.clone(),
+                },
+                "a park refusal waits whatever the view's liveness"
+            );
+        }
+        assert_eq!(
+            PinOutcome::for_view_error(&live, "mount table unreadable".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "mount table unreadable".into(),
+            },
+            "other view errors keep their missing-evidence shape"
+        );
+    }
+
+    /// The map_files fallback routes a park refusal inside its unproven
+    /// detail to the typed wait (keeping the composed gap text) instead
+    /// of filing fallback-unproven; other details are unchanged.
+    #[test]
+    fn map_files_refusal_park_refusal_waits() {
+        let detail = format!(
+            "{} ({} bytes read so far)",
+            crate::discovery::scan::MOUNTINFO_PARK_REFUSED_REASON,
+            3
+        );
+        assert_eq!(
+            PinOutcome::for_map_files_refusal(
+                "gap".into(),
+                PinMapFilesRefusal::Unproven(detail.clone())
+            ),
+            PinOutcome::Wait {
+                cause: WaitCause::ParkRefused,
+                retry: RetryOwner::ViewRescan,
+                reason: format!("gap (map_files fallback: {detail})"),
+            },
+            "a park refusal waits with the composed gap text"
+        );
+        assert_eq!(
+            PinOutcome::for_map_files_refusal(
+                "gap".into(),
+                PinMapFilesRefusal::Unproven("VMA identity unreadable: probe".into())
+            ),
+            PinOutcome::unproven(
+                UnprovenCause::FallbackUnproven,
+                "gap (map_files fallback: VMA identity unreadable: probe)".into()
+            ),
+            "other unproven details keep their shape"
+        );
     }
 
     /// Twin: a Gone pin loss files its gap without rejecting the key,

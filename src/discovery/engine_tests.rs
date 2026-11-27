@@ -60477,6 +60477,11 @@ fn defer_whole_tail_names_the_typed_wait_cause() {
         DeferWholeTail::Cause(IoCeiling)
     );
     assert_eq!(
+        defer_whole_tail(&[ParkRefused]),
+        DeferWholeTail::Cause(ParkRefused),
+        "a refused park names its own tail, never the handles text"
+    );
+    assert_eq!(
         defer_whole_tail(&[WorkCeiling, BudgetStop]),
         DeferWholeTail::Cause(WorkCeiling)
     );
@@ -60612,6 +60617,10 @@ fn defer_whole_cause_head_names_each_cause() {
         ),
         (ReserveStop, "capture file-descriptor reserve exhausted"),
         (BudgetStop, "capture library-handle budget exhausted"),
+        (
+            ParkRefused,
+            "capture resource pool refused the mount-table park",
+        ),
     ] {
         assert_eq!(defer_whole_cause_head(cause), head, "{cause:?}");
     }

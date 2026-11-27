@@ -9124,6 +9124,7 @@ fn defer_whole_cause_head(cause: WaitCause) -> &'static str {
         WaitCause::HandleExhaustion => "fd table exhausted while opening a library",
         WaitCause::ReserveStop => "capture file-descriptor reserve exhausted",
         WaitCause::BudgetStop => "capture library-handle budget exhausted",
+        WaitCause::ParkRefused => "capture resource pool refused the mount-table park",
     }
 }
 

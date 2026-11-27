@@ -12614,8 +12614,10 @@ fn capture_trace(
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
                     let identity_recheck = context.0.pinned().check_unchanged();
-                    // Short-circuits after the first failure: the latch
-                    // already filed the gap and failed closed.
+                    // A revalidation failure files the gap once and fails
+                    // closed (the latched flag keeps the report non-clean);
+                    // the check itself re-reads the current pins rather
+                    // than short-circuiting on that flag.
                     let pinned_after_error = if pinned_before_error.is_none() {
                         terminal_identity_or_gap(
                             || context.0.note_terminal_identity_check_failed(),

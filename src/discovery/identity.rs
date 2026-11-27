@@ -2015,9 +2015,9 @@ pub struct PinnedObjects {
     /// live scan on one side): the pin rotated in place, so the key
     /// stays routable and the attach races on. Carried through absorb
     /// and the conservative copy like the rejected set; the content
-    /// comparison skips it (entry diffs already distinguish superseded
-    /// sets). The engine-side pending set covers candidates that never
-    /// commit.
+    /// comparison covers it (`same_pin_content` compares the sets, so
+    /// entry diffs distinguish a superseded state from a merged one).
+    /// The engine-side pending set covers candidates that never commit.
     superseded_keys: BTreeSet<ObjectKey>,
     /// Transient pin-failure marks per viewing process: refused
     /// observations never reject by themselves, but two views refusing
@@ -4744,10 +4744,16 @@ impl PinnedObjects {
         self.changed.get()
     }
 
-    /// Latches the provider as changed when an identity revalidation
-    /// itself failed (fail closed): the report must not read clean on
-    /// unproven identity. Sticky like a detected change, so a later
-    /// check short-circuits instead of filing a second gap.
+    /// Latches the provider-changed report flag when an identity
+    /// revalidation itself failed (fail closed): the report must not
+    /// read clean on unproven identity. Report-only: the live gate
+    /// (`check_unchanged`) re-judges the current pins on every call and
+    /// never consults this flag, so this cannot refuse a later check.
+    /// The sole production producer is the terminal path
+    /// (`engine::note_terminal_identity_check_failed`, from run.rs
+    /// terminal checks via `terminal_identity_or_gap`, `Err`-only),
+    /// after which no live attach occurs; the gap it files beside the
+    /// flag is the disclosure.
     pub fn note_check_failed(&self) {
         self.changed.set(true);
     }
@@ -5117,13 +5123,13 @@ impl PinnedObjects {
 
     /// Rotate the pin in place when `entry` re-observes the single
     /// observation kept under `key` at a newer generation: same kernel
-    /// file, equal hashed bytes, same mount view and observation path,
-    /// strictly newer ctime, a live scan on one side. The kept id
-    /// survives with the fresh pin and the merged raws, so live views
-    /// keep routing and no slot retires; the rotation is recorded.
-    /// Returns the kept id. A stale look (same shape, older ctime)
-    /// merges its raw silently without rotating. Anything else keeps
-    /// today's rejection (`None`).
+    /// file, equal hashed bytes, same mount view, an observation path
+    /// exactly matching a retained alias spelling, strictly newer
+    /// ctime, a live scan on one side. The kept id survives with the
+    /// fresh pin and the merged raws, so live views keep routing and
+    /// no slot retires; the rotation is recorded. Returns the kept id.
+    /// A stale look (same shape, older ctime) merges its raw silently
+    /// without rotating. Anything else keeps today's rejection (`None`).
     fn rotate_same_file_generation(
         &mut self,
         key: ObjectKey,
@@ -5139,27 +5145,40 @@ impl PinnedObjects {
             return None;
         }
         let kept_id = same_key[0];
-        // Scan involvement is judged over every raw alias filed under the
-        // kept id, not only its representative: a pre-arm proof with a
-        // same-generation scan merged onto it is scan-covered, and its
-        // scan custody must survive the next staging. One pass over the
-        // raw index, like the same-key scan. The observation path below
-        // stays the representative's (never loosened by an alias).
-        let kept_scanned = self
-            .raw_to_id
-            .iter()
-            .any(|(raw, id)| *id == kept_id && raw.mount_namespace.is_some());
+        // Scan involvement and observation-path compatibility are judged
+        // over every raw alias filed under the kept id, not only its
+        // representative: a pre-arm proof with a same-generation scan
+        // merged onto it is scan-covered, and its scan custody must
+        // survive the next staging — including a staging that arrives
+        // under the scan's divergent spelling (`/lib` vs `/usr/lib`;
+        // the run-learned dedupe allows the divergence, engine.rs).
+        // One pass over the raw index, like the same-key scan. The
+        // incoming path must exactly match a currently retained
+        // spelling; a path matching none still fails closed (a rename),
+        // as does a kept id with no filed alias.
+        let mut kept_scanned = false;
+        let mut path_retained = false;
+        for (raw, id) in self.raw_to_id.iter() {
+            if *id == kept_id {
+                kept_scanned |= raw.mount_namespace.is_some();
+                path_retained |= raw.path == entry.raw.path;
+                if kept_scanned && path_retained {
+                    break;
+                }
+            }
+        }
         if !(incoming_scan_only || kept_scanned) {
             return None;
         }
         // The kept observation must be the same kernel file with the
-        // same hashed bytes under the same mount view and observation
-        // path. A rewrite, a distinct file, an unhashed, cross-view or
-        // moved-path side, or a proven pre fails closed instead. Neither
-        // side may be an overlayfs open: a copy-up keeps the overlay
-        // `(dev, ino)`, bytes and path while only ctime moves, and the
-        // fd identity cannot tell the lower-backed fd from the upper
-        // file, so an overlay ctime step needs the kernel proof.
+        // same hashed bytes under the same mount view and a retained
+        // observation-path spelling. A rewrite, a distinct file, an
+        // unhashed, cross-view or moved-path side, or a proven pre
+        // fails closed instead. Neither side may be an overlayfs open:
+        // a copy-up keeps the overlay `(dev, ino)`, bytes and path
+        // while only ctime moves, and the fd identity cannot tell the
+        // lower-backed fd from the upper file, so an overlay ctime
+        // step needs the kernel proof.
         let rotation = !entry.overlay
             && self.by_id.get(&kept_id).is_some_and(|kept| {
                 !kept.overlay
@@ -5168,7 +5187,7 @@ impl PinnedObjects {
                     && kept.sha256 == entry.sha256
                     && kept.mapping == entry.mapping
                     && kept.fd_dev == entry.fd_dev
-                    && kept.raw.path == entry.raw.path
+                    && path_retained
                     && same_kernel_file(&kept.file, &entry.file)
             });
         if !rotation {
@@ -21654,6 +21673,125 @@ mod tests {
         reback(&mut second, &file);
         assert!(!acc.absorb(second).is_empty());
         assert!(acc.rejects(key), "proof versus proof fails closed");
+    }
+
+    /// Drives the divergent-spelling rotation shape: the pre-arm proof
+    /// files generation 1 under `prearm_spelling`, a same-generation
+    /// scan merges under `scan_spelling`, and generation 2 stages under
+    /// the scan spelling. The rotation accepts the incoming path (it
+    /// exactly matches a filed alias of the kept id) and keeps the scan
+    /// custody; the representative stays the pre-arm alias throughout.
+    fn assert_rotation_accepts_a_retained_scan_spelling(
+        prearm_spelling: &str,
+        scan_spelling: &str,
+    ) {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        repath_single_pin(&mut staged, prearm_spelling);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let kept = acc.pinned().next().unwrap().id;
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut scan, &file);
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repath_single_pin(&mut scan, scan_spelling);
+        assert!(acc.absorb(scan).is_empty(), "generation 1 merges");
+        let spellings: std::collections::BTreeSet<String> = acc
+            .raw_to_id
+            .iter()
+            .filter(|(_, id)| **id == kept)
+            .map(|(raw, _)| raw.path.clone())
+            .collect();
+        assert_eq!(spellings.len(), 2, "both spellings file under the kept id");
+        assert!(
+            spellings.contains(prearm_spelling) && spellings.contains(scan_spelling),
+            "the filed spellings are the divergent pair: {spellings:?}"
+        );
+        assert!(
+            acc.by_id.get(&kept).unwrap().raw.mount_namespace.is_none(),
+            "the representative stays the pre-arm alias"
+        );
+        let mut second = plain_prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut second, &file);
+        second.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repath_single_pin(&mut second, scan_spelling);
+        let skipped = acc.absorb(second);
+        assert!(!acc.rejects(key), "scan custody must not be evicted");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(acc.supersedes(key), "the rotation is recorded");
+        assert!(acc.by_id.contains_key(&kept), "the id is stable");
+        assert_eq!(
+            acc.by_id.get(&kept).unwrap().pin.test_parts().2,
+            (2, 7),
+            "generation 2 rotates in"
+        );
+        assert!(
+            acc.raw_to_id.iter().any(|(raw, id)| *id == kept
+                && raw.mount_namespace.is_some()
+                && raw.path == scan_spelling),
+            "the scan spelling keeps routing to the kept id"
+        );
+    }
+
+    #[test]
+    fn absorbing_rotation_accepts_a_retained_scan_spelling_lib() {
+        // Pre-arm representative `/usr/lib`, scan and incoming `/lib`.
+        assert_rotation_accepts_a_retained_scan_spelling(
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/lib/softhsm/libsofthsm2.so",
+        );
+    }
+
+    #[test]
+    fn absorbing_rotation_accepts_a_retained_scan_spelling_usr_lib() {
+        // The inverse order: pre-arm representative `/lib`, scan and
+        // incoming `/usr/lib`.
+        assert_rotation_accepts_a_retained_scan_spelling(
+            "/lib/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+        );
+    }
+
+    #[test]
+    fn absorbing_rotation_under_an_unretained_spelling_still_rejects() {
+        // True rename in the alias context: the pre-arm proof files
+        // under `/usr/lib`, the same-generation scan merges under
+        // `/lib`, and generation 2 stages under a third spelling that
+        // matches no retained alias. The rotation fails closed through
+        // the collision path instead of superseding.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut staged = plain_prearm_pin(key, "aaaaaaaa", 1);
+        reback(&mut staged, &file);
+        repath_single_pin(&mut staged, "/usr/lib/softhsm/libsofthsm2.so");
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(staged).is_empty());
+        let staged_mapping = acc.by_id.values().next().unwrap().mapping;
+        let mut scan = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut scan, &file);
+        scan.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repath_single_pin(&mut scan, "/lib/softhsm/libsofthsm2.so");
+        assert!(acc.absorb(scan).is_empty(), "generation 1 merges");
+        let mut second = plain_prearm_pin(key, "aaaaaaaa", 2);
+        reback(&mut second, &file);
+        second.by_id.values_mut().next().unwrap().mapping = staged_mapping;
+        repath_single_pin(&mut second, "/opt/renamed/libsofthsm2.so");
+        let skipped = acc.absorb(second);
+        assert!(acc.rejects(key), "an unretained spelling fails closed");
+        assert!(!acc.supersedes(key), "no supersede across a rename");
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rejection is disclosed");
     }
 
     #[test]

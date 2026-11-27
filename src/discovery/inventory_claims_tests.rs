@@ -1585,6 +1585,127 @@ fn restore_start_publication_preserves_pin_shared_with_a_carried_view() {
 }
 
 #[test]
+fn restore_start_publication_preserves_dependency_pin_referenced_by_a_carried_view() {
+    // Rollback twin for the dependency closure: R binds a self entry
+    // plus an entry in a distinct dependency object X owns; R is
+    // carried, then X's view departs mid-attempt. Restoring the failed
+    // start must preserve the dependency pin (the rollback keep covers
+    // bound entry targets, not just provider objects): R's dependency
+    // entry stays bound over a live raw route and keeps its active
+    // endpoint, while the removed view's own modules are gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let mut module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let dep_entry = crate::discovery::scan::ScannedEntry {
+        name: "C_Initialize",
+        object: providers[2].key,
+        object_path: providers[2].path.clone(),
+        file_offset: providers[2].tables[0].entries[0].file_offset,
+    };
+    module_r.tables[0].entries.push(dep_entry);
+    let module_x = mo_reassign(providers[2].clone(), fixture.view_x);
+    let module_l = mo_reassign(providers[1].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    seed_claims(
+        &mut fixture.engine,
+        fixture.view_r,
+        std::slice::from_ref(&module_r),
+    );
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    let dep_object = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_x)
+        .expect("X's module seeded")
+        .object;
+    mo_carry_r(&mut fixture);
+    assert!(
+        fixture.engine.pinned.summary(dep_object).is_some(),
+        "the dependency is resolvable before restore"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .pinned
+            .id_for_scanned(&module_r, providers[2].key, &providers[2].path),
+        Some(dep_object),
+        "the dependency raw route resolves before restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == dep_object }),
+        "the dependency has an active endpoint before restore"
+    );
+    let snapshot = crate::discovery::engine::StartPublicationSnapshot {
+        plan: fixture.engine.plan.clone(),
+        pinned: fixture.engine.pinned.clone(),
+        discovery: fixture.engine.discovery.clone(),
+        modules: fixture.engine.modules.clone(),
+        corroboration: fixture.engine.counters.corroboration.clone(),
+        manifest_fallbacks: fixture.engine.counters.manifest_fallbacks.clone(),
+        views: fixture.engine.views.iter().map(|view| view.id()).collect(),
+        next_selection_binding_id: fixture.engine.next_selection_binding_id,
+        selection_bindings: fixture.engine.selection_bindings.clone(),
+        selection_claims: fixture.engine.selection_claims.clone(),
+        selection_tables: fixture.engine.selection_tables.clone(),
+    };
+    fixture
+        .engine
+        .views
+        .retain(|view| view.id() != fixture.view_x);
+    fixture.engine.restore_start_publication(snapshot);
+    assert!(
+        fixture.engine.pinned.summary(dep_object).is_some(),
+        "the carried module's dependency object survives the restore"
+    );
+    let r_entries_after: Vec<_> = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's retained carried module still rides after restore")
+        .entry_objects
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert!(
+        r_entries_after.contains(&dep_object),
+        "R's dependency entry stays bound after restore"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .pinned
+            .id_for_scanned(&module_r, providers[2].key, &providers[2].path),
+        Some(dep_object),
+        "R's dependency raw route survives the restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { fixture.engine.plan.is_active(slot.index) && slot.object == dep_object }),
+        "the carried dependency keeps an active endpoint after restore"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the restore dropped the removed view's modules"
+    );
+}
+
+#[test]
 fn merge_ownership_e8_release_drained_pin_keeps_no_active_slots() {
     // Slot-focused twin for the sole-owner drain: X owns a distinct
     // file and is released. The only assertion family is slot state:

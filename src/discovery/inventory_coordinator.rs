@@ -261,12 +261,22 @@ struct DeferralFold {
     deferred_ids: BTreeSet<EndpointId>,
 }
 
+/// Stop-backlog fold credit (INV-2, 64 units per credit, never raised):
+/// endpoint ids one drain call folds into the deferral folds. The
+/// cooperative stop drains one credit per step and resumes on the next
+/// step until the stash is empty; the blocking stop loops the same
+/// credit. Each id costs one indexed folded-probe plus one indexed
+/// attribution, so a credit is bounded work.
+const STOP_BACKLOG_IDS_PER_DRAIN: usize = 64;
+
 /// Inserts one deferred endpoint id under every module claiming it
-/// (or the run-wide fold when none does). Pass receipts and the stop
-/// note share this so both attribute identically; the stop summary
-/// splits each fold's own ids, never reattributed.
+/// (or the run-wide fold when none does), and records it in the
+/// folded union. Pass receipts and the stop-backlog drain share this
+/// so both attribute identically; the stop summary splits each fold's
+/// own ids, never reattributed.
 fn fold_deferred_id(
     folds: &mut BTreeMap<Option<AttachModuleKey>, DeferralFold>,
+    folded_ids: &mut BTreeSet<EndpointId>,
     attach_set: &InventoryAttachSet,
     id: EndpointId,
 ) {
@@ -278,6 +288,7 @@ fn fold_deferred_id(
             folds.entry(Some(key)).or_default().deferred_ids.insert(id);
         }
     }
+    folded_ids.insert(id);
 }
 
 /// The caller-registry key for an attach-set module key (O1 gap
@@ -738,6 +749,17 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// consumed once by the stop-time fold. Bounded: one entry per
     /// module with a deferral, one id per deferred endpoint.
     deferral_folds: BTreeMap<Option<AttachModuleKey>, DeferralFold>,
+    /// Union of every fold's deferred ids, maintained with each insert
+    /// and cleared with the stop-time take: the stop-backlog drain's
+    /// already-folded probe is one indexed lookup, never a scan over
+    /// the folds. Bounded like the folds themselves.
+    folded_deferral_ids: BTreeSet<EndpointId>,
+    /// Stop-backlog endpoint ids awaiting the fold, stashed by the
+    /// terminal note and drained [`STOP_BACKLOG_IDS_PER_DRAIN`] per
+    /// call (popped from the end; fold order is irrelevant — folds are
+    /// sets). Bounded by the endpoint demand; empty except between the
+    /// note and the completed drain.
+    stop_backlog_pending: Vec<EndpointId>,
     /// The last coverage projection's inputs per edge, for the stop
     /// replay: every [`Self::stage_capture_coverage`] call records its
     /// edge here (last projection wins). The stop replays them with the
@@ -2422,6 +2444,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             info_stop_evidence_rows: 0,
             capture: None,
             deferral_folds: BTreeMap::new(),
+            folded_deferral_ids: BTreeSet::new(),
+            stop_backlog_pending: Vec::new(),
             stop_reprojection: BTreeMap::new(),
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
@@ -5293,7 +5317,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     fold.max_deferred = fold.max_deferred.max(deferred_here_count);
                 }
                 for id in &deferred_here {
-                    fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+                    fold_deferred_id(
+                        &mut self.deferral_folds,
+                        &mut self.folded_deferral_ids,
+                        &self.attach_set,
+                        *id,
+                    );
                 }
             }
         }
@@ -5332,38 +5361,52 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 fold.max_deferred = fold.max_deferred.max(unclaimed_deferred_count);
             }
             for id in &unclaimed_deferred {
-                fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+                fold_deferred_id(
+                    &mut self.deferral_folds,
+                    &mut self.folded_deferral_ids,
+                    &self.attach_set,
+                    *id,
+                );
             }
         }
     }
 
-    /// Terminal accounting for the lane backlog still deferred when the
-    /// stop lands. Folds whatever no receipt covered so the stop summary
-    /// names it still deferred; ids already folded gain no second row
-    /// and the pass count stays honest (rows count pass receipts, and
-    /// the stop is not one). Runs before `end_capture_coverage`
-    /// consumes the folds.
+    /// Stashes the lane backlog still deferred when the stop lands for
+    /// the paced fold below. The stash itself is a linear move; the
+    /// per-id folded-probe and attribution run in the drain, one
+    /// [`STOP_BACKLOG_IDS_PER_DRAIN`] credit per call, so no single
+    /// stop step scans the backlog. Dropped (not stashed) without
+    /// capture: an abandoned capture stages no deferral accounting.
     pub(crate) fn note_stop_backlog(&mut self, backlog: TargetDelta) {
-        let deferred: BTreeSet<EndpointId> = backlog
-            .endpoints
-            .iter()
-            .map(|endpoint| endpoint.id)
-            .collect();
-        if deferred.is_empty() {
-            return;
-        }
         if self.capture.is_none() {
             return;
         }
-        for id in &deferred {
-            let folded = self
-                .deferral_folds
-                .values()
-                .any(|fold| fold.deferred_ids.contains(id));
-            if !folded {
-                fold_deferred_id(&mut self.deferral_folds, &self.attach_set, *id);
+        self.stop_backlog_pending
+            .extend(backlog.endpoints.iter().map(|endpoint| endpoint.id));
+    }
+
+    /// Folds up to one credit of stashed stop-backlog ids, skipping ids
+    /// a receipt already folded (their original attribution stands,
+    /// even if membership changed since). True while ids remain: the
+    /// cooperative stop resumes on its next step, the blocking stop
+    /// loops, and both finish before `end_capture_coverage` consumes
+    /// the folds. Each id costs one indexed folded-probe plus one
+    /// indexed attribution.
+    pub(crate) fn drain_stop_backlog(&mut self) -> bool {
+        for _ in 0..STOP_BACKLOG_IDS_PER_DRAIN {
+            let Some(id) = self.stop_backlog_pending.pop() else {
+                break;
+            };
+            if !self.folded_deferral_ids.contains(&id) {
+                fold_deferred_id(
+                    &mut self.deferral_folds,
+                    &mut self.folded_deferral_ids,
+                    &self.attach_set,
+                    id,
+                );
             }
         }
+        !self.stop_backlog_pending.is_empty()
     }
 
     /// Stop-time deferral summaries: one appended gap per key with
@@ -5386,6 +5429,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return false;
         }
         let folds = std::mem::take(&mut self.deferral_folds);
+        self.folded_deferral_ids.clear();
         let Some(capture) = self.capture.as_ref() else {
             return false;
         };
@@ -22836,8 +22880,9 @@ pub(crate) mod tests {
             ..ExtendReceipt::default()
         });
         // The stop note carries both endpoints — the receipt-covered one
-        // and the never-extended one — but folds only the latter.
+        // and the never-extended one — but the drain folds only the latter.
         coordinator.note_stop_backlog(absorbed.delta);
+        while coordinator.drain_stop_backlog() {}
         coordinator.commit_batch(false).unwrap();
         coordinator.end_capture_coverage(1000);
         coordinator.commit_batch(false).unwrap();
@@ -22882,6 +22927,361 @@ pub(crate) mod tests {
             folded[0].module.is_some(),
             "the claimed fold attributes its module: {:?}",
             folded[0]
+        );
+    }
+
+    /// Stop-backlog pacing (INV-2, 64 units per credit): a stash of more
+    /// than one credit folds one credit per drain call and reports more
+    /// work until the stash empties, so the cooperative stop resumes on
+    /// its next step instead of folding a backlog in one unbounded scan.
+    #[test]
+    fn stop_backlog_drain_folds_one_credit_per_call() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        // Ghost ids no module claims (evicted before the note): 130 of
+        // them, two full credits plus a remainder of two.
+        let template = absorbed.delta.endpoints[0];
+        let ghost = |id: u32| crate::discovery::inventory_attach_set::AttachEndpoint {
+            id: crate::discovery::inventory_attach_set::EndpointId(id),
+            ..template
+        };
+        let endpoints: Vec<_> = (10000..10130).map(ghost).collect();
+        let objects: Vec<_> = endpoints.iter().map(|target| target.object).collect();
+        coordinator.note_stop_backlog(crate::discovery::inventory_attach_set::TargetDelta {
+            endpoints,
+            objects,
+            info_revoked: vec![],
+        });
+        assert_eq!(
+            coordinator.stop_backlog_pending.len(),
+            130,
+            "the note stashes the whole backlog without folding"
+        );
+        assert!(
+            coordinator.drain_stop_backlog(),
+            "the first credit reports more work"
+        );
+        assert_eq!(coordinator.stop_backlog_pending.len(), 66);
+        assert_eq!(
+            coordinator.folded_deferral_ids.len(),
+            64,
+            "one credit folds exactly 64 ids"
+        );
+        assert!(
+            coordinator.drain_stop_backlog(),
+            "the second credit reports more work"
+        );
+        assert_eq!(coordinator.stop_backlog_pending.len(), 2);
+        assert_eq!(coordinator.folded_deferral_ids.len(), 128);
+        assert!(
+            !coordinator.drain_stop_backlog(),
+            "the remainder credit reports empty"
+        );
+        assert!(coordinator.stop_backlog_pending.is_empty());
+        assert_eq!(coordinator.folded_deferral_ids.len(), 130);
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "one run-wide summary covers all 130: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "attach unfinished at stop: 130 endpoint(s) with no recorded module deferred at stop \
+             (130 still deferred at stop); counted uses are lower bounds"
+        );
+    }
+
+    /// Stop-only folds name no pass span and no per-pass peak: ids the
+    /// stop note folds without any pass receipt behind them summarize
+    /// under their module as `deferred at stop`, with no per-receipt
+    /// row (rows count pass receipts, and the stop is not one).
+    #[test]
+    fn stop_only_fold_summarizes_without_a_pass_span() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        // No pass receipt: both endpoints reach the fold only through
+        // the stop note.
+        coordinator.note_stop_backlog(absorbed.delta);
+        while coordinator.drain_stop_backlog() {}
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "one module summary, no per-receipt row: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert!(
+            is_deferral_folded_reason(&gaps[0].reason),
+            "the stop-only summary folds like any summary: {}",
+            gaps[0].reason
+        );
+        assert_eq!(
+            gaps[0].reason,
+            "attach unfinished at stop: 2 endpoint(s) deferred at stop (2 still deferred at \
+             stop); counted uses are lower bounds"
+        );
+        assert!(
+            gaps[0].module.is_some(),
+            "the stop-only fold attributes its module: {:?}",
+            gaps[0]
+        );
+    }
+
+    /// Exactly-once stop attribution across a membership shrink: an
+    /// endpoint a pass receipt deferred under the wide module keeps its
+    /// original fold when the stop note re-carries it after the module
+    /// re-lowers without it — never a second run-wide fold no receipt
+    /// ever staged. Removing the drain's already-folded guard folds it
+    /// run-wide too and fails this test.
+    #[test]
+    fn stop_backlog_drain_keeps_fold_attribution_across_membership_shrink() {
+        use crate::attach::capture::ExtendReceipt;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let verdicts = absorbed.verdicts;
+        let pid = std::process::id();
+        let _caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let generation = Some(crate::inspect_system::MemberGeneration {
+            start_time: crate::process::process_start_time(pid).ok(),
+            exe: crate::discovery::caller_registry::read_exe_identity(pid),
+        });
+        let catalog = capture_catalog(&pins, &[&a], pid, generation);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.project_catalog(&catalog, &verdicts, 60);
+        coordinator.registry.publish();
+        let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
+        let shrunk = endpoint(1);
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: vec![shrunk],
+                objects: vec![shrunk.object],
+                info_revoked: vec![],
+            },
+            ..ExtendReceipt::default()
+        });
+        // Membership revised before stop: the module re-lowers with
+        // only the kept endpoint, so the deferred one is unindexed when
+        // the stop note re-carries it from the lane backlog.
+        let repolicy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(1))),
+                &pins,
+                repolicy,
+            ),
+            &pins,
+        );
+        assert_eq!(
+            coordinator
+                .attach_set
+                .modules_with_member(shrunk.id)
+                .count(),
+            0,
+            "the trigger is armed: the deferred endpoint is unindexed at note time"
+        );
+        coordinator.note_stop_backlog(crate::discovery::inventory_attach_set::TargetDelta {
+            endpoints: vec![shrunk],
+            objects: vec![shrunk.object],
+            info_revoked: vec![],
+        });
+        while coordinator.drain_stop_backlog() {}
+        assert!(
+            !coordinator.deferral_folds.contains_key(&None),
+            "no run-wide fold for an endpoint a receipt folded under its module: {:?}",
+            coordinator.deferral_folds.keys().collect::<Vec<_>>()
+        );
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let unfinished: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == "native endpoint attach deferred"
+                    && gap.reason.starts_with("attach unfinished at stop:")
+            })
+            .collect();
+        assert_eq!(
+            unfinished.len(),
+            1,
+            "one module summary, never a run-wide duplicate: {:?}",
+            coordinator.registry.gaps()
+        );
+        assert_eq!(
+            unfinished[0].reason,
+            "attach unfinished at stop: 1 endpoint(s) deferred over 1 pass (1 still deferred at \
+             stop); counted uses are lower bounds"
+        );
+        assert!(
+            unfinished[0].module.is_some(),
+            "the folded gap keeps its original module: {:?}",
+            unfinished[0]
+        );
+    }
+
+    /// Abandoned captures stage no stop accounting: without coverage
+    /// the note drops the backlog instead of stashing it, so no fold
+    /// can stage for a capture that never ran.
+    #[test]
+    fn note_stop_backlog_drops_without_capture() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        coordinator.note_stop_backlog(absorbed.delta);
+        assert!(
+            coordinator.stop_backlog_pending.is_empty(),
+            "no stash without capture"
+        );
+        assert!(
+            !coordinator.drain_stop_backlog(),
+            "nothing to drain without capture"
+        );
+    }
+
+    /// Folds never mutate attach-set attribution: the memberships read
+    /// before any receipt or stop note folds are identical after the
+    /// stop summary consumes the folds.
+    #[test]
+    fn folds_never_mutate_attach_set_attribution() {
+        use crate::attach::capture::{AttachedEndpoint, ExtendReceipt};
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        let owners = |coordinator: &InventoryCoordinator<OsProcessSource>| {
+            absorbed
+                .delta
+                .endpoints
+                .iter()
+                .map(|endpoint| {
+                    coordinator
+                        .attach_set
+                        .modules_with_member(endpoint.id)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = owners(&coordinator);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        let first = absorbed.delta.endpoints[0];
+        let second = absorbed.delta.endpoints[1];
+        coordinator.note_extend_receipt(&ExtendReceipt {
+            attached: vec![AttachedEndpoint {
+                id: first.id,
+                object: first.object,
+                at_ns: 100,
+            }],
+            deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                endpoints: vec![second],
+                objects: vec![second.object],
+                info_revoked: vec![],
+            },
+            ..ExtendReceipt::default()
+        });
+        coordinator.note_stop_backlog(absorbed.delta.clone());
+        while coordinator.drain_stop_backlog() {}
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            owners(&coordinator),
+            before,
+            "receipt folds, the stop drain and the summary leave attribution untouched"
         );
     }
 

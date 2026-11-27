@@ -556,10 +556,15 @@ pub(crate) trait LaneHost<Pin> {
     fn abandon_capture_coverage(&mut self);
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
     /// Terminal accounting for the lane backlog still deferred when the
-    /// stop lands. The coordinator folds whatever no receipt covered so
-    /// the stop summary names it still deferred. Default: ignore (hosts
-    /// without a fold).
+    /// stop lands. The coordinator stashes it for the paced fold below.
+    /// Default: ignore (hosts without a fold).
     fn note_stop_backlog(&mut self, _backlog: TargetDelta) {}
+    /// Folds up to one stop-backlog credit into the deferral folds.
+    /// True while ids remain: the cooperative stop resumes on its next
+    /// step, the blocking stop loops. Default: nothing pending.
+    fn drain_stop_backlog(&mut self) -> bool {
+        false
+    }
     /// The lane's initial attach completed: stamp the tick cutover new
     /// callers are measured against. Default: ignore (test hosts set
     /// the cutover explicitly when they need it).
@@ -636,6 +641,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_stop_backlog(&mut self, backlog: TargetDelta) {
         InventoryCoordinator::note_stop_backlog(self, backlog);
+    }
+
+    fn drain_stop_backlog(&mut self) -> bool {
+        InventoryCoordinator::drain_stop_backlog(self)
     }
 
     fn note_attach_ticks(&mut self) {
@@ -988,6 +997,9 @@ fn merge_tick_receipt(
 /// pass receipt carries custody anyway, and exhaustion re-probes on the
 /// next pass). The destructure is exhaustive on purpose — no `..` rest —
 /// so a new receipt field fails to compile here until it chooses a side.
+/// The `deferred.*` arms below are safe-direction placeholders: the
+/// merge never buffers deferred, so they cannot fire today, but a
+/// receipt that ever carried deferred must forward rather than drop it.
 fn tick_receipt_forwards(receipt: &ExtendReceipt) -> bool {
     let ExtendReceipt {
         activated_roots,
@@ -1313,12 +1325,13 @@ impl<L> NativeLane<L> {
         }
     }
 
-    /// Notes the lane backlog still deferred when the stop lands. Fires
-    /// only on the terminal stops (never mid-run, where the next pass
-    /// extends the backlog); the take makes repeated calls no-ops. The
-    /// coordinator folds only what no receipt covered, so already-folded
-    /// endpoints gain no second row. Must precede `end_capture_coverage`
-    /// so the stop summary splits the folded ids. Never touches the host
+    /// Notes the lane backlog still deferred when the stop lands, for
+    /// the coordinator's paced fold. Fires only on the terminal stops
+    /// (never mid-run, where the next pass extends the backlog); the
+    /// take makes repeated calls no-ops. The drain folds only what no
+    /// receipt covered, so already-folded endpoints gain no second row.
+    /// Both drivers finish the drain before `end_capture_coverage` so
+    /// the stop summary splits the folded ids. Never touches the host
     /// delta: no target delta is taken after the stop (F9).
     fn note_stop_backlog<Pin, H>(&mut self, host: &mut H)
     where
@@ -1803,9 +1816,11 @@ impl<L> NativeLane<L> {
         // Tick attach progress buffered before the stop forwards first
         // (evidence of links already held, not new work after the latch).
         self.flush_tick_progress(host);
-        // Whatever is still deferred folds now, before the coverage ends:
-        // no pass will extend it after the latch.
+        // Whatever is still deferred folds now, one credit per drain
+        // call, before the coverage ends: no pass will extend it after
+        // the latch.
         self.note_stop_backlog(host);
+        while host.drain_stop_backlog() {}
         let mut events = std::mem::take(&mut self.pending_events);
         // Nothing is held after a pass; staged first all the same.
         // (The startup drain can hold INFO before the first pass; it
@@ -2359,8 +2374,15 @@ impl<L> NativeStop<L> {
                 }
             }
             NativeStopPhase::EndCoverage => {
-                self.phase = NativeStopPhase::BeginRetirement;
-                host.end_capture_coverage(now_ns());
+                // The stop-backlog fold drains here, one credit per
+                // step, before the coverage ends: the stop summary must
+                // split every folded id. Empty backlogs advance at once.
+                if host.drain_stop_backlog() {
+                    self.phase = NativeStopPhase::EndCoverage;
+                } else {
+                    self.phase = NativeStopPhase::BeginRetirement;
+                    host.end_capture_coverage(now_ns());
+                }
             }
             NativeStopPhase::BeginRetirement => {
                 self.phase = NativeStopPhase::RetirementPoll;

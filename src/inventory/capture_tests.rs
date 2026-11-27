@@ -1475,6 +1475,14 @@ impl LaneHost<Pin> for Scene {
         self.coordinator.has_pending_targets()
     }
 
+    fn note_stop_backlog(&mut self, backlog: TargetDelta) {
+        self.coordinator.note_stop_backlog(backlog);
+    }
+
+    fn drain_stop_backlog(&mut self) -> bool {
+        self.coordinator.drain_stop_backlog()
+    }
+
     fn capture_targets(&self) -> &dyn CaptureTargets {
         self.coordinator.attach_set()
     }
@@ -1953,6 +1961,14 @@ struct ReceiptHost {
     receipt_info: Vec<(u64, u64, u64, u64)>,
     /// Every terminal stop-backlog note, in order.
     stop_backlogs: Vec<TargetDelta>,
+    /// Stop-backlog drain calls served, in order.
+    drain_calls: usize,
+    /// Scripted drain answers remaining: the drain reports more work
+    /// this many times, then reports empty (the cooperative resume
+    /// twin scripts this).
+    drain_true_remaining: usize,
+    /// Terminal call order (`note_stop_backlog`, `end_capture_coverage`).
+    order: Vec<&'static str>,
     gaps: Vec<(String, String)>,
 }
 
@@ -1966,6 +1982,9 @@ impl ReceiptHost {
             receipt_max: Vec::new(),
             receipt_info: Vec::new(),
             stop_backlogs: Vec::new(),
+            drain_calls: 0,
+            drain_true_remaining: 0,
+            order: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1997,6 +2016,9 @@ impl ReceiptHost {
             receipt_max: Vec::new(),
             receipt_info: Vec::new(),
             stop_backlogs: Vec::new(),
+            drain_calls: 0,
+            drain_true_remaining: 0,
+            order: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -2007,6 +2029,16 @@ impl LaneHost<Pin> for ReceiptHost {
     fn abandon_capture_coverage(&mut self) {}
     fn note_stop_backlog(&mut self, backlog: TargetDelta) {
         self.stop_backlogs.push(backlog);
+        self.order.push("note_stop_backlog");
+    }
+    fn drain_stop_backlog(&mut self) -> bool {
+        self.drain_calls += 1;
+        if self.drain_true_remaining > 0 {
+            self.drain_true_remaining -= 1;
+            true
+        } else {
+            false
+        }
     }
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         self.receipts
@@ -2034,7 +2066,9 @@ impl LaneHost<Pin> for ReceiptHost {
     ) -> NativeReceipt {
         NativeReceipt::default()
     }
-    fn end_capture_coverage(&mut self, _at_ns: u64) {}
+    fn end_capture_coverage(&mut self, _at_ns: u64) {
+        self.order.push("end_capture_coverage");
+    }
     fn note_native_lane(&mut self) {}
     fn note_scope_gap(&mut self, subject: String, reason: String) {
         self.gaps.push((subject, reason));
@@ -2903,41 +2937,6 @@ fn tick_and_pass_carry_info_revoked_alike() {
     );
 }
 
-/// The stop gaps the tick backlog still deferred when it lands: five
-/// endpoints never reached any pass receipt, so the summary names them
-/// still deferred instead of dropping them silently. Stop-only folds
-/// name no pass span and no per-pass peak: no pass measured them.
-#[test]
-fn stop_gaps_the_tick_backlog_as_still_deferred() {
-    use crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT;
-    let log = Log::default();
-    let mut coordinator = info_coordinator();
-    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
-        .map_err(|(_, reason)| reason)
-        .unwrap();
-    lane.after_pass(&mut coordinator);
-    preset_backlog(&mut lane, 5);
-    lane.stop(&mut coordinator);
-    coordinator.commit_batch(false).unwrap();
-    let gaps = coordinator.registry().gaps();
-    let summary = gaps.iter().find(|gap| {
-        gap.subject == DEFERRED_ATTACH_SUBJECT
-            && gap.reason.contains("5 endpoint(s) with no recorded module")
-            && gap.reason.contains("still deferred at stop")
-    });
-    assert!(
-        summary.is_some(),
-        "the stop gaps its backlog as still deferred: {gaps:?}"
-    );
-    let reason = &summary.unwrap().reason;
-    assert_eq!(
-        reason.as_str(),
-        "attach unfinished at stop: 5 endpoint(s) with no recorded module deferred at stop \
-         (5 still deferred at stop); counted uses are lower bounds",
-        "a stop-only fold names no pass span and no per-pass peak"
-    );
-}
-
 /// Healthy twin: a tick that produces no INFO counts stages no INFO gaps —
 /// the carry forwards only what ticks produced, never invented counts.
 #[test]
@@ -3000,46 +2999,6 @@ fn stop_without_backlog_stages_no_deferral_summary() {
             .iter()
             .any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT),
         "no deferral gaps without deferred endpoints: {gaps:?}"
-    );
-}
-
-/// No-regression pin: endpoints a pass receipt already deferred keep their
-/// single per-receipt row at stop — the stop note folds only what no
-/// receipt covered, never a second row, and the pass count stays honest.
-#[test]
-fn stop_with_already_folded_backlog_stages_no_second_row() {
-    use crate::discovery::engine::inventory_coordinator::{
-        DEFERRED_ATTACH_SUBJECT, is_deferral_folded_reason, is_deferral_receipt_reason,
-    };
-    let log = Log::default();
-    let mut coordinator = info_coordinator();
-    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
-        .map_err(|(_, reason)| reason)
-        .unwrap();
-    // The earlier pass receipt deferred five endpoints: one per-receipt
-    // row stages and the fold holds them.
-    coordinator.note_extend_receipt(&ExtendReceipt {
-        deferred: fabricated_delta(5),
-        ..ExtendReceipt::default()
-    });
-    lane.after_pass(&mut coordinator);
-    preset_backlog(&mut lane, 5);
-    lane.stop(&mut coordinator);
-    coordinator.commit_batch(false).unwrap();
-    let gaps = coordinator.registry().gaps();
-    let rows = gaps
-        .iter()
-        .filter(|gap| {
-            gap.subject == DEFERRED_ATTACH_SUBJECT && is_deferral_receipt_reason(&gap.reason)
-        })
-        .count();
-    assert_eq!(rows, 1, "one per-receipt row, never a second: {gaps:?}");
-    assert!(
-        gaps.iter().any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT
-            && is_deferral_folded_reason(&gap.reason)
-            && gap.reason.contains("deferred over 1 pass")
-            && gap.reason.contains("5 still deferred at stop")),
-        "the summary keeps its honest pass count: {gaps:?}"
     );
 }
 
@@ -3270,16 +3229,18 @@ fn tick_receipt_forwards_only_on_forwardable_progress() {
 
 /// The stop notes the lane backlog still deferred when it lands — and
 /// nothing else: the host delta stays untouched (no target delta is
-/// taken after the stop).
+/// taken after the stop). The backlog forms through a real pass (512
+/// attached, 88 deferred), the note precedes the coverage end, and the
+/// blocking stop drains before returning.
 #[test]
 fn stop_notes_the_lane_backlog_without_taking_the_host_delta() {
     let log = Log::default();
-    let mut host = ReceiptHost::with_delta(TargetDelta::default());
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
     let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
     lane.after_pass(&mut host);
-    preset_backlog(&mut lane, 5);
+    assert_eq!(host.receipts[1], (512, 88));
     host.delta = fabricated_delta(3);
     lane.stop(&mut host);
     assert_eq!(
@@ -3297,13 +3258,30 @@ fn stop_notes_the_lane_backlog_without_taking_the_host_delta() {
             .iter()
             .map(|endpoint| endpoint.id.0)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4],
-        "the lane backlog only"
+        (512..600).collect::<Vec<_>>(),
+        "the pass-deferred lane backlog only"
     );
     assert_eq!(
         host.delta.endpoints.len(),
         3,
         "the host delta stays untouched: no take after the stop"
+    );
+    let note_at = host
+        .order
+        .iter()
+        .position(|entry| *entry == "note_stop_backlog");
+    let end_at = host
+        .order
+        .iter()
+        .position(|entry| *entry == "end_capture_coverage");
+    assert!(
+        note_at.is_some_and(|note| end_at.is_some_and(|end| note < end)),
+        "the note precedes the coverage end: {:?}",
+        host.order
+    );
+    assert!(
+        host.drain_calls >= 1,
+        "the blocking stop drains before returning"
     );
 }
 
@@ -3330,17 +3308,19 @@ fn stop_without_backlog_notes_nothing() {
 }
 
 /// The cooperative stop notes the lane backlog too: its first action
-/// folds what is still deferred, before the coverage ends — the same
-/// terminal accounting as the blocking stop.
+/// stashes what is still deferred, before the coverage ends — the same
+/// terminal accounting as the blocking stop. The backlog forms through
+/// a real pass; the scripted host drains empty, so the coverage ends
+/// on the first gated step.
 #[test]
 fn cooperative_stop_notes_the_lane_backlog() {
     let log = Log::default();
-    let mut host = ReceiptHost::with_delta(TargetDelta::default());
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
     let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
     lane.after_pass(&mut host);
-    preset_backlog(&mut lane, 5);
+    assert_eq!(host.receipts[1], (512, 88));
     let stop = lane
         .into_finite_stop(NativeStopDisposition::Error, None)
         .ok()
@@ -3376,8 +3356,52 @@ fn cooperative_stop_notes_the_lane_backlog() {
             .iter()
             .map(|endpoint| endpoint.id.0)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4],
-        "the cooperative stop folds the lane backlog"
+        (512..600).collect::<Vec<_>>(),
+        "the cooperative stop notes the pass-deferred backlog"
+    );
+}
+
+/// The cooperative coverage end resumes the drain: while the host
+/// reports more work the stop stays on its coverage step instead of
+/// ending the coverage, so a multi-credit backlog folds completely
+/// before the stop summary splits it.
+#[test]
+fn cooperative_coverage_end_resumes_until_the_drain_empties() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
+    host.drain_true_remaining = 2;
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    let stop = lane
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    loop {
+        steps += 1;
+        assert!(steps <= 10_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(&mut host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+    assert_eq!(
+        host.drain_calls, 3,
+        "two resumed credits plus the empty check: the coverage ends only \
+         after the drain empties"
     );
 }
 

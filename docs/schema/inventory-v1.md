@@ -108,11 +108,16 @@ where `{total}` is the distinct deferred endpoint count and each
 deferred endpoint lands in exactly one outcome (a deferred endpoint
 that later failed counts as failed); when the total exceeds the
 per-pass peak the parenthesis also names it (`peak {max} in one
-pass`). Each
-summary attributes where its receipts did. Endpoints that failed to
-attach (sticky, never retried) keep their own gap with `subject`
-`native endpoint attach failed`. Any of these gaps forces a `PARTIAL`
-verdict.
+pass`). Endpoints the stop folds without any pass receipt behind them
+(a lane backlog no receipt covered) summarize without a pass span or
+peak — no pass measured them: the `reason` reads `attach unfinished
+at stop: {total} endpoint(s) deferred at stop ({still} still deferred
+at stop); counted uses are lower bounds`, attributing where the stop
+folded them. Each
+summary otherwise attributes where its receipts did. Endpoints that
+failed to attach (sticky, never retried) keep their own gap with
+`subject` `native endpoint attach failed`. Any of these gaps forces a
+`PARTIAL` verdict.
 
 In the native lane an admitted edge no coverage note reached reads
 `not_attached`, never `scan_only`. When the observer's `/proc` numbering is

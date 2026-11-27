@@ -31087,44 +31087,31 @@ int main(int argc, char **argv) {
     /// timing, the child raises SIGINT to itself.
     #[test]
     fn installing_the_stop_flag_overrides_inherited_ignore() {
-        if std::env::var("P11SCOPE_F11_CHILD").is_ok() {
-            // Fresh process, no contention, but the install contract
-            // requires the guard all the same.
-            let _signal_guard = ActualSignalTestGuard::hold();
-            // SAFETY: `signal` with SIG_IGN installs no handler code;
-            // `raise` delivers SIGINT to this thread, whose handler
-            // the install below provides.
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_IGN);
-            }
-            assert_eq!(current_disposition(libc::SIGINT), libc::SIG_IGN);
-            let state = install_stop_flag().expect("install succeeds");
-            let installed = current_disposition(libc::SIGINT);
-            assert_ne!(installed, libc::SIG_IGN, "ignore survives install");
-            assert_ne!(installed, libc::SIG_DFL, "install leaves default");
-            unsafe {
-                libc::raise(libc::SIGINT);
-            }
-            assert_eq!(
-                state.first_signal(),
-                Some(libc::SIGINT),
-                "a delivery records on the installed flag"
-            );
+        const TEST: &str = "run::tests::installing_the_stop_flag_overrides_inherited_ignore";
+        if !crate::test_support::isolation::enter(TEST, "f11-ignore-override") {
             return;
         }
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .arg("run::tests::installing_the_stop_flag_overrides_inherited_ignore")
-            .arg("--exact")
-            .arg("--nocapture")
-            .env("P11SCOPE_F11_CHILD", "1")
-            .output()
-            .expect("spawn self");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "child override check failed: {} {stdout}",
-            output.status
+        // Fresh process, no contention, but the install contract
+        // requires the guard all the same.
+        let _signal_guard = ActualSignalTestGuard::hold();
+        // SAFETY: `signal` with SIG_IGN installs no handler code;
+        // `raise` delivers SIGINT to this thread, whose handler
+        // the install below provides.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        }
+        assert_eq!(current_disposition(libc::SIGINT), libc::SIG_IGN);
+        let state = install_stop_flag().expect("install succeeds");
+        let installed = current_disposition(libc::SIGINT);
+        assert_ne!(installed, libc::SIG_IGN, "ignore survives install");
+        assert_ne!(installed, libc::SIG_DFL, "install leaves default");
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        assert_eq!(
+            state.first_signal(),
+            Some(libc::SIGINT),
+            "a delivery records on the installed flag"
         );
     }
 
@@ -31139,71 +31126,63 @@ int main(int argc, char **argv) {
     #[test]
     #[ignore = "privileged: startup stop through real capture startup (needs BPF probe admission)"]
     fn startup_stop_in_host_window_refuses_and_leaves_no_temp() {
-        if std::env::var("P11SCOPE_F11_SEAM_CHILD").is_ok() {
-            // Fresh process, no contention, but the install contract
-            // requires the guard all the same.
-            let _signal_guard = ActualSignalTestGuard::hold();
-            // SAFETY: `signal` installs no handler code; `raise`
-            // delivers SIGINT to this thread, whose handler the
-            // install below provides.
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_IGN);
-            }
-            // Under /var/tmp (sticky): the sink refuses group-writable
-            // ancestry, and the test TMPDIR may sit under some.
-            let dir = tempfile::Builder::new()
-                .prefix("p11scope-f11-seam")
-                .tempdir_in("/var/tmp")
-                .unwrap();
-            let mut args = capture_args(ScopeArg::Pid(std::process::id()));
-            args.out = Some(dir.path().join("report.json"));
-            args.duration = Some(Duration::from_secs(1));
-            let error = capture_with_host(&args, &|| {
-                unsafe {
-                    libc::raise(libc::SIGINT);
-                }
-                Ok(crate::attach::MultiCapableHost::for_test())
-            })
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<StartupInterrupted>(),
-                Some(&StartupInterrupted {
-                    signal: libc::SIGINT
-                }),
-                "{error:#}"
+        const TEST: &str = "run::tests::startup_stop_in_host_window_refuses_and_leaves_no_temp";
+        if !crate::test_support::isolation::in_child(TEST, "f11-seam-stop") {
+            crate::test_support::isolation::run_child_with_timeout(
+                TEST,
+                "f11-seam-stop",
+                Duration::from_secs(120),
+                |command| {
+                    command.arg("--ignored");
+                },
             );
-            let litter: Vec<String> =
-                std::fs::read_dir(dir.path())
-                    .unwrap()
-                    .filter_map(|entry| {
-                        entry.ok().and_then(|entry| {
-                            entry.file_name().into_string().ok().filter(|name| {
-                                name.starts_with(".p11scope.") && name.ends_with(".tmp")
-                            })
-                        })
-                    })
-                    .collect();
-            assert_eq!(litter, Vec::<String>::new(), "no orphan temp left");
             return;
         }
-        let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .arg("run::tests::startup_stop_in_host_window_refuses_and_leaves_no_temp")
-            .arg("--exact")
-            .arg("--ignored")
-            .arg("--nocapture")
-            .env("P11SCOPE_F11_SEAM_CHILD", "1")
-            .output()
-            .expect("spawn self");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut detail = format!("{stdout}\n{stderr}");
-        detail.truncate(3000);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "child seam check failed: {} {detail}",
-            output.status
+        // Fresh process, no contention, but the install contract
+        // requires the guard all the same.
+        let _signal_guard = ActualSignalTestGuard::hold();
+        // SAFETY: `signal` installs no handler code; `raise`
+        // delivers SIGINT to this thread, whose handler the
+        // install below provides.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        }
+        // Under /var/tmp (sticky): the sink refuses group-writable
+        // ancestry, and the test TMPDIR may sit under some.
+        let dir = tempfile::Builder::new()
+            .prefix("p11scope-f11-seam")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let mut args = capture_args(ScopeArg::Pid(std::process::id()));
+        args.out = Some(dir.path().join("report.json"));
+        args.duration = Some(Duration::from_secs(1));
+        let error = capture_with_host(&args, &|| {
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+            Ok(crate::attach::MultiCapableHost::for_test())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StartupInterrupted>(),
+            Some(&StartupInterrupted {
+                signal: libc::SIGINT
+            }),
+            "{error:#}"
         );
+        let litter: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| {
+                entry.ok().and_then(|entry| {
+                    entry
+                        .file_name()
+                        .into_string()
+                        .ok()
+                        .filter(|name| name.starts_with(".p11scope.") && name.ends_with(".tmp"))
+                })
+            })
+            .collect();
+        assert_eq!(litter, Vec::<String>::new(), "no orphan temp left");
     }
 
     /// `run` owns its stop signals before it forks: the flag install is

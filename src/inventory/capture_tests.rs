@@ -438,6 +438,17 @@ struct CountSpec {
     count: u64,
 }
 
+/// Scripted attach-side INFO counts for the next extends: the tick-carry
+/// tests set this on `lane.capture` before a tick (like `attach_ns_max`)
+/// and reset it after, so exactly one extend produces INFO counts.
+#[derive(Clone, Copy, Default)]
+struct ScriptedExtendInfo {
+    deferred: u64,
+    refused_hazard: u64,
+    revoked: u64,
+    revoke_failed: u64,
+}
+
 /// A scripted facade: records every call, activates on the first extend,
 /// attaches what it is given (minus a scripted deferral), reports scripted
 /// rows per read, answers scripted cookies, and retires after a scripted
@@ -557,6 +568,9 @@ struct ScriptedLane {
     /// the receipt carries `fd_exhausted` and defers the whole delta,
     /// like the production facade's exhaustion arm.
     exhaust_fds: bool,
+    /// Attach-side INFO counts every extend reports (the tick-carry
+    /// twin sets this before one extend and resets it after).
+    extend_info: ScriptedExtendInfo,
 }
 
 impl Drop for ScriptedLane {
@@ -623,6 +637,7 @@ impl ScriptedLane {
             refuse_extends: false,
             attach_ns_max: 0,
             exhaust_fds: false,
+            extend_info: ScriptedExtendInfo::default(),
         }
     }
 
@@ -788,6 +803,10 @@ impl CaptureLane<Pin> for ScriptedLane {
             ..ExtendReceipt::default()
         };
         receipt.attach_ns_max = self.attach_ns_max;
+        receipt.info_return_deferred = self.extend_info.deferred;
+        receipt.info_return_refused_hazard = self.extend_info.refused_hazard;
+        receipt.info_revoked = self.extend_info.revoked;
+        receipt.info_revoke_failed = self.extend_info.revoke_failed;
         if self.check_targets {
             for endpoint in &delta.endpoints {
                 assert!(
@@ -1928,6 +1947,10 @@ struct ReceiptHost {
     receipts: Vec<(usize, usize)>,
     /// Every receipt's worst single-attach wall time, in receipt order.
     receipt_max: Vec<u64>,
+    /// Every receipt's attach-side INFO counts, in receipt order:
+    /// (`info_return_deferred`, `info_return_refused_hazard`,
+    /// `info_revoked`, `info_revoke_failed`).
+    receipt_info: Vec<(u64, u64, u64, u64)>,
     gaps: Vec<(String, String)>,
 }
 
@@ -1939,6 +1962,7 @@ impl ReceiptHost {
             delta,
             receipts: Vec::new(),
             receipt_max: Vec::new(),
+            receipt_info: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1968,6 +1992,7 @@ impl ReceiptHost {
             delta: absorbed.delta,
             receipts: Vec::new(),
             receipt_max: Vec::new(),
+            receipt_info: Vec::new(),
             gaps: Vec::new(),
         }
     }
@@ -1980,6 +2005,12 @@ impl LaneHost<Pin> for ReceiptHost {
         self.receipts
             .push((receipt.attached.len(), receipt.deferred.endpoints.len()));
         self.receipt_max.push(receipt.attach_ns_max);
+        self.receipt_info.push((
+            receipt.info_return_deferred,
+            receipt.info_return_refused_hazard,
+            receipt.info_revoked,
+            receipt.info_revoke_failed,
+        ));
     }
     fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
     fn take_target_delta(&mut self) -> TargetDelta {
@@ -2703,6 +2734,292 @@ fn flush_carries_the_buffered_ticks_worst_attach_wall_time() {
         "the flush folds the ticks' worst wall time; pass receipts keep \
          their own: {:?}",
         host.receipt_max
+    );
+}
+
+/// A real coordinator over a scripted process source for the tick-carry
+/// seam tests: the lane drives it directly (no catalog flow), so the
+/// attach set stays empty and every endpoint reads unclaimed.
+fn info_coordinator() -> InventoryCoordinator<ScriptedSource> {
+    let source = ScriptedSource::default();
+    source.spawn(PID, START);
+    InventoryCoordinator::new(
+        crate::attach::Scope::System,
+        HookRegistry::builtin(),
+        Vec::new(),
+        vec![],
+        source,
+        RegistryLimits::default_limits(),
+    )
+    .unwrap()
+}
+
+/// The lane's backlog stands in for endpoints a pass deferred: the lane's
+/// own extends always pre-fold their deferrals, so the preset isolates
+/// what the stop itself must still gap.
+fn preset_backlog<L>(lane: &mut NativeLane<L>, count: u32) {
+    lane.backlog = fabricated_delta(count);
+}
+
+/// A tick-produced `info_return_deferred` count reaches the coordinator's
+/// join through the pass flush: one tick reports three EMFILE-deferred
+/// info returns, the pass forwards them, and the join counts three.
+#[test]
+fn tick_produced_info_return_deferred_reaches_the_coordinator_join() {
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    preset_backlog(&mut lane, 128);
+    lane.capture.extend_info.deferred = 3;
+    lane.tick(&mut coordinator);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    lane.after_pass(&mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.gaps.return_deferred, 3,
+        "the tick's deferred info returns reach the join"
+    );
+}
+
+/// A tick-produced `info_return_refused_hazard` count reaches the
+/// coordinator's join through the pass flush, beside the deferred gap.
+#[test]
+fn tick_produced_info_return_refused_hazard_reaches_the_coordinator_join() {
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    preset_backlog(&mut lane, 128);
+    lane.capture.extend_info.refused_hazard = 2;
+    lane.tick(&mut coordinator);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    lane.after_pass(&mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.gaps.return_refused_hazard, 2,
+        "the tick's refused-hazard info returns reach the join"
+    );
+}
+
+/// Tick-produced `info_revoke_failed` counts reach the registry gaps: the
+/// stale INFO_KIND cells keep authorizing probe reads until the retry, so
+/// each failure still reaches the operator with its count.
+#[test]
+fn tick_produced_info_revoke_failures_reach_the_registry_gaps() {
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    preset_backlog(&mut lane, 128);
+    lane.capture.extend_info.revoke_failed = 2;
+    lane.tick(&mut coordinator);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    lane.after_pass(&mut coordinator);
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        gaps.iter().any(|gap| gap.subject.contains("provider info")
+            && gap
+                .reason
+                .contains("info revocation failed for 2 endpoint(s)")),
+        "the tick's revocation failures note a gap: {gaps:?}"
+    );
+}
+
+/// The flush carries every attach-side INFO count a tick produced, in one
+/// forwarded receipt: deferred, refused-hazard, revoked and revoke-failed
+/// alike. The pass receipt keeps its own (zero) counts.
+#[test]
+fn flush_carries_every_info_count_a_tick_produced() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (512, 88));
+    lane.capture.extend_info = ScriptedExtendInfo {
+        deferred: 3,
+        refused_hazard: 2,
+        revoked: 5,
+        revoke_failed: 1,
+    };
+    lane.tick(&mut host);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (512, 88), (64, 0), (24, 0)],
+        "one 64-entry tick drains before the second pass: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.receipt_info,
+        vec![(0, 0, 0, 0), (0, 0, 0, 0), (3, 2, 5, 1), (0, 0, 0, 0)],
+        "the flush forwards the tick's INFO counts; the pass receipt keeps \
+         its own: {:?}",
+        host.receipt_info
+    );
+}
+
+/// Tick and pass receipts treat `info_revoked` alike: no coordinator fold
+/// consumes the revocation-completion count on any path (revocation loss
+/// is disclosed once at absorb time via `info_aliased_endpoint`), so the
+/// assertion is receipt parity — the flush carries exactly what a pass
+/// receipt carries — not a gap.
+#[test]
+fn tick_and_pass_carry_info_revoked_alike() {
+    let log = Log::default();
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    lane.capture.extend_info.revoked = 2;
+    lane.tick(&mut host);
+    lane.after_pass(&mut host);
+    assert_eq!(
+        host.receipt_info[2], (0, 0, 2, 0),
+        "the flush carries the tick's revocation count: {:?}",
+        host.receipt_info
+    );
+    assert_eq!(
+        host.receipt_info[3], (0, 0, 2, 0),
+        "the pass receipt carries its own revocation count: {:?}",
+        host.receipt_info
+    );
+}
+
+/// The stop gaps the tick backlog still deferred when it lands: five
+/// endpoints never reached any pass receipt, so the summary names them
+/// still deferred instead of dropping them silently.
+#[test]
+fn stop_gaps_the_tick_backlog_as_still_deferred() {
+    use crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT;
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut coordinator);
+    preset_backlog(&mut lane, 5);
+    lane.stop(&mut coordinator);
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        gaps.iter().any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT
+            && gap.reason.contains("5 endpoint(s) with no recorded module")
+            && gap.reason.contains("still deferred at stop")),
+        "the stop gaps its backlog as still deferred: {gaps:?}"
+    );
+}
+
+/// Healthy twin: a tick that produces no INFO counts stages no INFO gaps —
+/// the carry forwards only what ticks produced, never invented counts.
+#[test]
+fn tick_without_info_stages_no_info_gaps() {
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    preset_backlog(&mut lane, 128);
+    lane.tick(&mut coordinator);
+    lane.after_pass(&mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(observations.gaps.return_deferred, 0);
+    assert_eq!(observations.gaps.return_refused_hazard, 0);
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        !gaps.iter().any(|gap| gap.subject.contains("provider info")),
+        "no revocation gap without revocation failures: {gaps:?}"
+    );
+}
+
+/// Healthy twin: the pass path already folds INFO counts into the join —
+/// the tick fix must not disturb it.
+#[test]
+fn pass_produced_info_still_folds_into_the_join() {
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    preset_backlog(&mut lane, 128);
+    lane.capture.extend_info.deferred = 4;
+    lane.after_pass(&mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.gaps.return_deferred, 4,
+        "the pass receipt's deferred info returns reach the join"
+    );
+}
+
+/// Healthy twin: a stop with an empty backlog stages no deferral gaps —
+/// the stop note fires only for endpoints still deferred when it lands.
+#[test]
+fn stop_without_backlog_stages_no_deferral_summary() {
+    use crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT;
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut coordinator);
+    assert!(lane.backlog.endpoints.is_empty());
+    lane.stop(&mut coordinator);
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        !gaps
+            .iter()
+            .any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT),
+        "no deferral gaps without deferred endpoints: {gaps:?}"
+    );
+}
+
+/// No-regression pin: endpoints a pass receipt already deferred keep their
+/// single per-receipt row at stop — the stop note folds only what no
+/// receipt covered, never a second row, and the pass count stays honest.
+#[test]
+fn stop_with_already_folded_backlog_stages_no_second_row() {
+    use crate::discovery::engine::inventory_coordinator::{
+        DEFERRED_ATTACH_SUBJECT, is_deferral_folded_reason, is_deferral_receipt_reason,
+    };
+    let log = Log::default();
+    let mut coordinator = info_coordinator();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut coordinator, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // The earlier pass receipt deferred five endpoints: one per-receipt
+    // row stages and the fold holds them.
+    coordinator.note_extend_receipt(&ExtendReceipt {
+        deferred: fabricated_delta(5),
+        ..ExtendReceipt::default()
+    });
+    lane.after_pass(&mut coordinator);
+    preset_backlog(&mut lane, 5);
+    lane.stop(&mut coordinator);
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    let rows = gaps
+        .iter()
+        .filter(|gap| {
+            gap.subject == DEFERRED_ATTACH_SUBJECT && is_deferral_receipt_reason(&gap.reason)
+        })
+        .count();
+    assert_eq!(rows, 1, "one per-receipt row, never a second: {gaps:?}");
+    assert!(
+        gaps.iter().any(|gap| gap.subject == DEFERRED_ATTACH_SUBJECT
+            && is_deferral_folded_reason(&gap.reason)
+            && gap.reason.contains("deferred over 1 pass")
+            && gap.reason.contains("5 still deferred at stop")),
+        "the summary keeps its honest pass count: {gaps:?}"
     );
 }
 

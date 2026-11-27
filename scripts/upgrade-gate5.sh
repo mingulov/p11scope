@@ -337,6 +337,9 @@ observe_uninstall_leftovers() {
   unexpected=""
   while IFS= read -r path; do
     [ -n "$path" ] || continue
+    case "$path" in
+      */.) path="${path%/.}"; [ -n "$path" ] || path="/";;
+    esac
     case " $SHARED_PREFIXES " in
       *" $path "*) continue;;
     esac

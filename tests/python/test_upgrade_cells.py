@@ -598,6 +598,8 @@ WART_11_RPM = [
     "/usr/share/doc/p11scope/notices/licenses/upstream",
 ]
 SHARED_PREFIXES = ["/", "/usr", "/usr/bin", "/usr/share", "/usr/share/doc"]
+# dpkg -L spells the filesystem root "/." (rpm lists payload entries only).
+DEB_OWNED_ROOT = "/."
 OWNED_FILES = [
     "/usr/bin/p11scope",
     "/usr/bin/p11scope-discover",
@@ -608,7 +610,7 @@ OWNED_FILES = [
 def owned_paths():
     fmt = os.environ["SIM_FORMAT"]
     if fmt == "deb":
-        paths = SHARED_PREFIXES + OWNED_FILES + WART_11_RPM
+        paths = [DEB_OWNED_ROOT] + SHARED_PREFIXES[1:] + OWNED_FILES + WART_11_RPM
     else:
         paths = ["/usr/share/doc/p11scope"] + OWNED_FILES
     sys.stdout.write("\n".join(paths) + "\n")

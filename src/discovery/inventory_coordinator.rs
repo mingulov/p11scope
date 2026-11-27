@@ -46715,9 +46715,9 @@ int main(void) {
                 },
             );
         }
-        // Three live evictions: two fill the exact set, the third
-        // overflows past the cap.
-        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+        // Five folds, three live evictions: two fill the exact set,
+        // the third overflows past the cap.
+        for (pass, exec) in [9u64, 10, 11, 12, 13].iter().enumerate() {
             native.scene.coordinator.pair_targets.insert(
                 PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
@@ -46825,7 +46825,7 @@ int main(void) {
                 },
             );
         }
-        for (pass, exec) in [9u64, 10, 11].iter().enumerate() {
+        for (pass, exec) in [9u64, 10, 11, 12, 13].iter().enumerate() {
             native.scene.coordinator.pair_targets.insert(
                 PairKey {
                     image: DomainCookie::scripted(native.domain, 41),
@@ -46897,9 +46897,9 @@ int main(void) {
                 },
             );
         }
-        // Five live evictions: two fill the exact set, two fill the
-        // overflow tier, the fifth poisons the class.
-        for (pass, exec) in [9u64, 10, 11, 12, 13].iter().enumerate() {
+        // Seven folds, five live evictions: two fill the exact set,
+        // two fill the overflow tier, the fifth poisons the class.
+        for (pass, exec) in [9u64, 10, 11, 12, 13, 14, 15].iter().enumerate() {
             native.scene.coordinator.pair_targets.insert(
                 PairKey {
                     image: DomainCookie::scripted(native.domain, 41),

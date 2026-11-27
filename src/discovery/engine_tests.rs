@@ -87220,14 +87220,18 @@ fn committed_two_provider_engine_with_pin_loss() -> (
 }
 
 /// Candidate construction with a pinless committed-plan module
-/// builds instead of bailing: the victim stays planned for the
-/// render to gap while nothing fresh is unproven. Fails while
-/// construction refuses the whole candidate on plan staleness.
+/// builds instead of bailing: the victim leaves the candidate plan
+/// with one exact omission gap while nothing fresh is unproven.
+/// Fails while construction refuses the whole candidate on plan
+/// staleness.
 #[test]
 fn candidate_build_succeeds_with_pinless_plan_module() {
     let (mut engine, victim, healthy, _) = committed_two_provider_engine_with_pin_loss();
+    // The healthy provider rescans fresh; the victim stays committed
+    // but unscanned with its pin lost.
+    let raw_b = overlay_module(overlay_key(87));
     let candidate = engine
-        .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+        .live_candidate(engine.pinned.clone(), vec![raw_b], Vec::new())
         .expect("construction admits the degraded candidate");
     assert!(
         candidate.pinned.summary(victim).is_none(),
@@ -87238,8 +87242,40 @@ fn candidate_build_succeeds_with_pinless_plan_module() {
         "the healthy pin stays"
     );
     assert!(
-        candidate.plan.modules.iter().any(|m| m.object == victim),
-        "the victim stays planned for the render gap"
+        !candidate.plan.modules.iter().any(|m| m.object == victim),
+        "the victim leaves the candidate plan"
+    );
+    assert!(
+        candidate.plan.modules.iter().any(|m| m.object == healthy),
+        "the healthy module stays planned"
+    );
+    for op in candidate
+        .delta
+        .new
+        .iter()
+        .chain(candidate.delta.replace.iter())
+    {
+        assert!(
+            candidate.pinned.summary(op.object).is_some(),
+            "every mutation op carries an exact pin"
+        );
+    }
+    let victim_path = engine.plan.modules[0].path.clone();
+    let expected = format!(
+        "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
+        victim_path
+    );
+    let gaps: Vec<(&str, &str)> = candidate
+        .plan
+        .modules_skipped
+        .iter()
+        .filter(|skip| skip.reason.contains("lost its comparable pin"))
+        .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![("planned provider object", expected.as_str())],
+        "one exact gap names the omitted victim"
     );
 }
 
@@ -87325,8 +87361,9 @@ fn candidate_apply_publishes_healthy_rows_plus_victim_gap() {
     let (mut engine, victim, healthy, _) = committed_two_provider_engine_with_pin_loss();
     let victim_path = engine.plan.modules[0].path.clone();
     let healthy_id = engine.plan.modules[1].id;
+    let raw_b = overlay_module(overlay_key(87));
     let candidate = engine
-        .live_candidate(engine.pinned.clone(), Vec::new(), Vec::new())
+        .live_candidate(engine.pinned.clone(), vec![raw_b], Vec::new())
         .expect("construction admits the degraded candidate");
     let mut session = ScriptedSession::default();
     let mut additions = true;
@@ -87348,19 +87385,25 @@ fn candidate_apply_publishes_healthy_rows_plus_victim_gap() {
         victim_path
     );
     let gaps: Vec<(&str, &str)> = engine
-        .capture_facts
-        .history
-        .losses
-        .values()
-        .filter(|loss| {
-            loss.reason.contains(&victim_path) && loss.reason.contains("lost its comparable pin")
-        })
-        .map(|loss| (loss.subject.as_str(), loss.reason.as_str()))
+        .plan
+        .modules_skipped
+        .iter()
+        .filter(|skip| skip.reason.contains("lost its comparable pin"))
+        .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
         .collect();
     assert_eq!(
         gaps,
         vec![("planned provider object", expected.as_str())],
-        "one exact gap names the victim"
+        "one exact gap names the omitted victim"
+    );
+    assert!(
+        engine
+            .capture_facts
+            .history
+            .losses
+            .values()
+            .all(|loss| !loss.reason.contains("lost its comparable pin")),
+        "the omission gap is filed once, not also at render"
     );
     assert!(
         engine.pinned.summary(victim).is_none(),

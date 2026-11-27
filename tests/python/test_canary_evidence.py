@@ -3582,29 +3582,43 @@ class VersionCanaryPrefixTests(unittest.TestCase):
         # is refused under provider-scoped read_name, so it corroborates
         # (known_prefix, 104) instead of reading exact.
         manifest = MATRIX_MANIFEST_ROWS
-        raw = [((2, 40), 68, "full"), ((2, 40), 68, "full"),
-               ((3, 0), 92, "full")]
+        # Test-owned scan rows: ((version), count, walk, linkage, agreeing).
+        # Only the (3,0) table can be a live return (the workload's
+        # C_GetInterface calls name it); every other baseline row is
+        # sweep-only. Agreement counts the in-range getter anchors.
+        raw = [((2, 40), 68, "full", "heuristic", 1),
+               ((2, 40), 68, "full", "heuristic", 1),
+               ((3, 0), 92, "full", "live_return", 3)]
         if bits == 32:
-            raw += [((3, 1), 92, "full"), ((3, 2), 104, "full"),
-                    ((3, 9), 104, "known_prefix")]
-        surfaces = Counter((walk, count) for _, count, walk in manifest + raw)
+            raw += [((3, 1), 92, "full", "heuristic", 3),
+                    ((3, 2), 104, "full", "heuristic", 3),
+                    ((3, 9), 104, "known_prefix", "heuristic", 3)]
+        surfaces = Counter(
+            [(walk, count) for _, count, walk in manifest]
+            + [(walk, count) for _, count, walk, _, _ in raw])
         evidence = subject.evidence_fixture(
             surfaces, sources=("scan", "manifest"), discovery_skipped=0)
         module = evidence["discovery"][0]
         module["tables"] = [
-            {"source": "manifest", "version": list(version), "entries": count}
+            {"source": "manifest", "version": list(version), "entries": count,
+             "file_offset": None, "linkage": "manifest",
+             "exports_agreeing": None}
             for version, count, _ in manifest
         ] + [
             {"source": "scan", "version": list(version), "entries": count,
-             "file_offset": 4096 * (index + 1)}
-            for index, (version, count, _) in enumerate(raw)
+             "file_offset": 4096 * (index + 1), "linkage": linkage,
+             "exports_agreeing": agreeing}
+            for index, (version, count, _, linkage, agreeing) in enumerate(raw)
         ]
-        evidence["surfaces"] = typed_matrix_surfaces(module["path"], manifest, raw)
+        evidence["surfaces"] = typed_matrix_surfaces(
+            module["path"], manifest,
+            [(version, count, walk) for version, count, walk, _, _ in raw])
         if boundary is not None:
             offset, count, walk = boundary
             module["tables"].append({
                 "source": "scan", "version": [3, 1], "entries": count,
-                "file_offset": offset,
+                "file_offset": offset, "linkage": "heuristic",
+                "exports_agreeing": 3 if count > 68 else (1 if count > 3 else 0),
             })
             evidence["surfaces"].append({
                 "source": module["path"] + " table 3.1", "acquisition": "ok",
@@ -3701,7 +3715,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                 future = [table for table in evidence["discovery"][0]["tables"]
                           if table["source"] == "scan" and table["version"] == [3, 9]]
                 self.assertEqual(future, ([{"source": "scan", "version": [3, 9],
-                                           "entries": 104, "file_offset": 6 * 4096}]
+                                           "entries": 104, "file_offset": 6 * 4096,
+                                           "linkage": "heuristic",
+                                           "exports_agreeing": 3}]
                                          if bits == 32 else []))
                 capture.validate_canary("owned-default-metrics", document, bits)
                 if bits == 32:

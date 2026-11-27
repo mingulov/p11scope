@@ -23,6 +23,8 @@ impl Case {
 
     fn with_close_failure(fail_return: bool) -> Self {
         let (child, mut engine, modules) = engine_with_one_accepted_provider();
+        // Explicit custody transfer: `Case::drop` below owns kill+wait.
+        let child = child.into_inner();
         engine.scope = Scope::System;
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let gate = Arc::clone(&release);
@@ -1980,7 +1982,7 @@ fn async_global_ended_pid_retire_opens_no_coverage_window() {
 #[test]
 fn async_global_running_owned_pure_retire_opens_a_counted_coverage_window() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
-    engine.owned_run_pid = Some(child.id());
+    engine.owned_run_pid = Some(child.pid());
     assert!(
         !engine.pause_owned_batch,
         "premise: the owned child runs (no pause held)"
@@ -2041,7 +2043,7 @@ fn async_global_running_owned_pure_retire_opens_a_counted_coverage_window() {
 #[test]
 fn async_global_owned_retire_with_reattach_stays_silent() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
-    engine.owned_run_pid = Some(child.id());
+    engine.owned_run_pid = Some(child.pid());
     let mut candidate = peer_candidate(&mut engine, &modules);
     candidate.delta.retire.push(engine.plan.slots[0].clone());
     candidate.plan.deactivate(0);
@@ -2090,7 +2092,7 @@ fn async_global_owned_retire_with_reattach_stays_silent() {
 #[test]
 fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_silent() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
-    engine.owned_run_pid = Some(child.id());
+    engine.owned_run_pid = Some(child.pid());
     engine.set_pause_owned_batch(true);
     assert!(
         engine.pause_owned_batch,
@@ -2098,7 +2100,7 @@ fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_sil
     );
     assert_eq!(
         engine.views[0].pid(),
-        child.id(),
+        child.pid(),
         "premise: the provider cover maps the owned child"
     );
     let mut second = modules[0].clone();
@@ -2214,7 +2216,7 @@ fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_sil
 #[test]
 fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverage_window() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
-    engine.owned_run_pid = Some(child.id());
+    engine.owned_run_pid = Some(child.pid());
     let peers = e06_spawn_sleeps(1);
     let descendant_view = ProcessView::open(ProcessViewId(4), peers[0].pid()).unwrap();
     engine.views.push(descendant_view);
@@ -2548,7 +2550,7 @@ fn async_global_precheck_failed_replacement_discloses_the_stranded_endpoint() {
     // The child exits inside the apply's second detach — after the
     // new-target attach, before the replacement precheck — so the
     // precheck finds its generation gone and skips the replacement.
-    session.lose_generations_at_detach([None, Some(child.id())]);
+    session.lose_generations_at_detach([None, Some(child.pid())]);
     let mut additions = true;
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut additions, false, &[])

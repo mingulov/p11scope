@@ -7726,19 +7726,17 @@ fn write_proc_stat_fixture(
 /// (mt-system: workload children reaped after the tick gap +1 each.)
 #[test]
 fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let mut child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
     let view = ProcessView::open(ProcessViewId(7001), pid).expect("track the sleeper");
     engine.views.push(view);
     engine.next_view_id = 7002;
     engine.seed_initial_cgroup_views();
     assert_eq!(engine.pid_descendant_gaps(), 0);
-    child.kill().expect("exit the sleeper");
+    child.inner_mut().kill().expect("exit the sleeper");
     wait_until_zombie(pid);
     let procdir = tempfile::tempdir().expect("fixture proc root");
     let starttime = crate::process::process_start_time(pid).expect("zombie keeps starttime");
@@ -7749,7 +7747,7 @@ fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
         !engine.newcomer_first_seen.contains_key(&pid),
         "lingering zombie re-marked as newcomer"
     );
-    child.wait().expect("reap the sleeper");
+    child.inner_mut().wait().expect("reap the sleeper");
     std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -7764,19 +7762,17 @@ fn tick_does_not_remark_lingering_zombie_of_tracked_generation() {
 /// stat-readable): it must not mark either.
 #[test]
 fn tick_does_not_remark_unreadable_pid_with_pending_view() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let mut child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
     let view = ProcessView::open(ProcessViewId(7003), pid).expect("track the sleeper");
     engine.views.push(view);
     engine.next_view_id = 7004;
     engine.seed_initial_cgroup_views();
     assert_eq!(engine.pid_descendant_gaps(), 0);
-    child.kill().expect("exit the sleeper");
+    child.inner_mut().kill().expect("exit the sleeper");
     wait_until_zombie(pid);
     // No fixture stat at all: reaped between enumeration and admission.
     // (fail-open user filter still desires it; the arrival filter skips it.)
@@ -7787,7 +7783,7 @@ fn tick_does_not_remark_unreadable_pid_with_pending_view() {
         !engine.newcomer_first_seen.contains_key(&pid),
         "unreadable tracked pid re-marked as newcomer"
     );
-    child.wait().expect("reap the sleeper");
+    child.inner_mut().wait().expect("reap the sleeper");
     std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -7852,18 +7848,16 @@ fn tick_still_marks_unreadable_pid_without_view() {
 /// readdir race may still list it just after reap; it must not mark.
 #[test]
 fn tick_does_not_remark_unreadable_pid_with_settled_view() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let mut child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let (mut engine, scope_dir) = engine_over_cgroup_naming(&[pid]);
     let view = ProcessView::open(ProcessViewId(7007), pid).expect("track the sleeper");
     engine.views.push(view);
     engine.next_view_id = 7008;
     engine.seed_initial_cgroup_views();
-    child.kill().expect("exit the sleeper");
+    child.inner_mut().kill().expect("exit the sleeper");
     wait_until_zombie(pid);
     // Settle the view as an earlier tick would after observing the exit:
     // the admission closes (retained), the view drops.
@@ -7877,7 +7871,7 @@ fn tick_does_not_remark_unreadable_pid_with_settled_view() {
         !engine.newcomer_first_seen.contains_key(&pid),
         "unreadable settled pid re-marked as newcomer"
     );
-    child.wait().expect("reap the sleeper");
+    child.inner_mut().wait().expect("reap the sleeper");
     std::fs::write(scope_dir.path().join("cgroup.procs"), "").expect("empty scope");
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -7969,19 +7963,17 @@ fn unseeded_unknown_exit_still_gaps() {
 /// view pends removal still marks: only the same lingering generation skips.
 #[test]
 fn tick_still_marks_reused_pid_with_pending_view() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let mut child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid]);
     let view = ProcessView::open(ProcessViewId(7005), pid).expect("track the sleeper");
     let old_start = view.start_time();
     engine.views.push(view);
     engine.next_view_id = 7006;
     engine.seed_initial_cgroup_views();
-    child.kill().expect("exit the sleeper");
+    child.inner_mut().kill().expect("exit the sleeper");
     wait_until_zombie(pid);
     // From the filter's viewpoint this is now a REUSED pid: the old view
     // pends removal, but a running generation with a new start_time answers.
@@ -8000,7 +7992,7 @@ fn tick_still_marks_reused_pid_with_pending_view() {
         engine.newcomer_first_seen.contains_key(&pid),
         "reused running pid with a pending view must still mark"
     );
-    child.wait().ok();
+    child.inner_mut().wait().ok();
 }
 
 /// A `Z`-state pid whose stat line still counts live threads (field 20 >= 2)
@@ -8119,20 +8111,14 @@ fn admitted_pid_counts_match_views_after_admit_close_churn() {
             "count map drifts from the recorded admissions ({step})"
         );
     }
-    let mut first = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(first.id());
-    let mut second = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(second.id());
-    let pid_a = first.id();
-    let pid_b = second.id();
+    let first = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(first.pid());
+    let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(second.pid());
+    let pid_a = first.pid();
+    let pid_b = second.pid();
     let (mut engine, _scope_dir) = engine_over_cgroup_naming(&[pid_a, pid_b]);
     for (id, pid) in [(7101u32, pid_a), (7102, pid_a), (7103, pid_b)] {
         engine
@@ -8209,10 +8195,7 @@ fn admitted_pid_counts_match_views_after_admit_close_churn() {
         "recycled view id overwrite must drop the old pid count and raise the new one"
     );
     assert_mirrored(&engine, "recycle-id");
-    first.kill().ok();
-    second.kill().ok();
-    first.wait().ok();
-    second.wait().ok();
+
 }
 
 /// One drained leader exit for `pid` at `hook_ts` (unadmitted, so it
@@ -8761,18 +8744,14 @@ fn a_view_retired_after_its_group_exited_is_not_a_link_loss() {
     // capture end counts every still-pending assessment as a lost uprobe
     // link -- so an ordinary target exit was published as a capture gap
     // that never happened.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(40), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(40), child.pid()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(40), None);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     engine.settle_leader_exits_at_removal([ProcessViewId(40)]);
 
@@ -8801,13 +8780,10 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
     // The other direction, so the fix cannot be "stop counting". The
     // leader exited and the thread group did not: the link that probe
     // held is genuinely gone and the gap is real.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(42), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(42), child.pid()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(42), None);
@@ -8816,8 +8792,8 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
 
     assert!(engine.pending_leader_exit_views.is_empty());
     assert_eq!(engine.task_uprobe_link_losses, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 #[test]
@@ -8827,13 +8803,10 @@ fn terminal_drain_withdraws_a_counted_loss_whose_group_exited() {
     // exited by capture end, no member survived to escape observation, so
     // the terminal re-poll withdraws the transient instead of publishing
     // a gap that never happened.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(60), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(60), child.pid()).unwrap();
     let view_exit_ns = view.admitted_ns();
     let mut engine = wide_system_engine();
     engine.views.push(view);
@@ -8851,8 +8824,8 @@ fn terminal_drain_withdraws_a_counted_loss_whose_group_exited() {
     );
     assert_eq!(assessment, LeaderExitAssessment::LinkLoss);
     assert_eq!(engine.task_uprobe_link_losses, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(engine.views[0].original_exited(), Ok(true));
 
     engine.settle_terminal_drain();
@@ -8872,19 +8845,16 @@ fn terminal_drain_prunes_a_pending_assessment_whose_group_exited() {
     // The sibling path: an assessment that never became answerable
     // mid-capture must not be terminalized as a loss when the terminal
     // re-poll proves the whole group exited.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(61), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(61), child.pid()).unwrap();
     let view_exit_ns = view.admitted_ns();
     let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(61), Some(view_exit_ns));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(engine.views[0].original_exited(), Ok(true));
 
     engine.settle_terminal_drain();
@@ -8901,13 +8871,10 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
     // The other direction, so the withdrawal cannot become "stop
     // counting": a counted loss whose group is still live at capture end
     // keeps its gap.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(62), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(62), child.pid()).unwrap();
     let view_exit_ns = view.admitted_ns();
     let mut engine = wide_system_engine();
     engine.views.push(view);
@@ -8935,8 +8902,8 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
             .contains(&ProcessViewId(62)),
         "a surviving group keeps its counted view"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// An engine whose leader-exit losses may be withdrawn: system scope, and
@@ -8966,14 +8933,11 @@ fn group_record_at(kind: u8, pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
 
 /// One counted leader-exit loss for a live `sleep`, with the exit hook at
 /// the view's admission time. Returns the engine, the child and that time.
-fn counted_leader_exit_loss(id: u32) -> (Engine, std::process::Child, u64) {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(id), child.id()).unwrap();
+fn counted_leader_exit_loss(id: u32) -> (Engine, ParkedSleep, u64) {
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(id), child.pid()).unwrap();
     let exit_ns = view.admitted_ns();
     let mut engine = wide_system_engine();
     engine.views.push(view);
@@ -9000,7 +8964,7 @@ fn terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit() 
     // a record from the group after the exit hook proves a member ran
     // userspace while the pid-bound links were dead, so a later whole-group
     // exit cannot withdraw that loss.
-    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(63);
+    let (mut engine, child, exit_ns) = counted_leader_exit_loss(63);
     let pid = engine.views[0].pid();
     engine
         .apply_discovery_batch(
@@ -9013,8 +8977,8 @@ fn terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit() 
             0,
         )
         .unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(engine.views[0].original_exited(), Ok(true));
 
     engine.settle_terminal_drain();
@@ -9034,7 +8998,7 @@ fn terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit() 
 fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit() {
     // The healthy twin: records that precede the exit hook (even when
     // dispatched after it) say nothing about survivors.
-    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(64);
+    let (mut engine, child, exit_ns) = counted_leader_exit_loss(64);
     let pid = engine.views[0].pid();
     engine
         .apply_discovery_batch(
@@ -9047,8 +9011,8 @@ fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit
             0,
         )
         .unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 
     engine.settle_terminal_drain();
 
@@ -9060,21 +9024,17 @@ fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit
 fn terminal_drain_keeps_a_pending_assessment_observed_after_the_exit() {
     // The pending path takes the same gate: an unanswerable assessment
     // whose group ran after the exit hook still counts at capture end.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(65), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(65), child.pid()).unwrap();
     let exit_ns = view.admitted_ns();
     let pid = view.pid();
     let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(65), Some(exit_ns));
     engine.note_group_record(&group_record_at(DISCOVERY_KIND_EXEC, pid, exit_ns + 5));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     engine.settle_terminal_drain();
 
@@ -9085,13 +9045,10 @@ fn terminal_drain_keeps_a_pending_assessment_observed_after_the_exit() {
 fn terminal_drain_keeps_a_loss_whose_exit_order_is_unknown() {
     // Without a known exit hook time nothing can bound the survivor
     // window, so the count stays.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(66), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(66), child.pid()).unwrap();
     let mut engine = wide_system_engine();
     engine.views.push(view);
     engine.queue_leader_exit_assessment(ProcessViewId(66), None);
@@ -9103,8 +9060,7 @@ fn terminal_drain_keeps_a_loss_whose_exit_order_is_unknown() {
         ProcessViewId(66),
         polled,
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     engine.settle_terminal_drain();
 
@@ -9124,9 +9080,9 @@ fn terminal_drain_withdraws_a_loss_whose_exited_view_was_removed() {
     // A counted view is often retired before capture end once its group
     // is gone; the proof taken at removal still lets capture end
     // withdraw the transient.
-    let (mut engine, mut child, _) = counted_leader_exit_loss(67);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let (mut engine, child, _) = counted_leader_exit_loss(67);
+    child.close();
+
     remove_view_like_retirement(&mut engine, ProcessViewId(67));
     assert!(engine.views.is_empty());
 
@@ -9139,10 +9095,10 @@ fn terminal_drain_withdraws_a_loss_whose_exited_view_was_removed() {
 #[test]
 fn terminal_drain_keeps_a_removed_loss_whose_group_ran_after_the_exit() {
     // Records still in flight when the view was dropped count too.
-    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(68);
+    let (mut engine, child, exit_ns) = counted_leader_exit_loss(68);
     let pid = engine.views[0].pid();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     remove_view_like_retirement(&mut engine, ProcessViewId(68));
     engine.note_group_record(&group_record_at(
         DISCOVERY_KIND_FUNCTION_LIST_RETURN,
@@ -9162,10 +9118,10 @@ fn terminal_drain_keeps_a_removed_loss_whose_group_ran_after_the_exit() {
 #[test]
 fn terminal_drain_keeps_a_loss_whose_view_was_removed_while_live() {
     // Removal of a still-live group proves nothing about exit.
-    let (mut engine, mut child, _) = counted_leader_exit_loss(69);
+    let (mut engine, child, _) = counted_leader_exit_loss(69);
     remove_view_like_retirement(&mut engine, ProcessViewId(69));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 
     engine.settle_terminal_drain();
 
@@ -9174,17 +9130,14 @@ fn terminal_drain_keeps_a_loss_whose_view_was_removed_while_live() {
 
 /// A second `sleep` opened under `id` after the first process's id was
 /// released, with its own leader exit queued at `exit_ns`.
-fn reuse_id_for_new_process(engine: &mut Engine, id: u32, exit_ns: u64) -> std::process::Child {
+fn reuse_id_for_new_process(engine: &mut Engine, id: u32, exit_ns: u64) -> ParkedSleep {
     assert_eq!(engine.allocate_view_id().unwrap(), ProcessViewId(id));
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(id), child.id()).unwrap());
+        .push(ProcessView::open(ProcessViewId(id), child.pid()).unwrap());
     engine.queue_leader_exit_assessment(ProcessViewId(id), Some(exit_ns));
     child
 }
@@ -9194,20 +9147,20 @@ fn a_later_process_on_a_reused_id_cannot_withdraw_an_earlier_real_loss() {
     // The first process ran after its leader exit (a real loss); its id
     // goes back to the free list. A second process on the same id exits
     // cleanly. Its clean exit must not take back the first process's count.
-    let (mut engine, mut first, exit_ns) = counted_leader_exit_loss(71);
+    let (mut engine, first, exit_ns) = counted_leader_exit_loss(71);
     let first_pid = engine.views[0].pid();
     engine.note_group_record(&group_record_at(
         DISCOVERY_KIND_FUNCTION_LIST_RETURN,
         first_pid,
         exit_ns + 1,
     ));
-    first.kill().unwrap();
-    first.wait().unwrap();
+    first.close();
+
     remove_view_like_retirement(&mut engine, ProcessViewId(71));
 
-    let mut second = reuse_id_for_new_process(&mut engine, 71, exit_ns + 100);
-    second.kill().unwrap();
-    second.wait().unwrap();
+    let second = reuse_id_for_new_process(&mut engine, 71, exit_ns + 100);
+    second.close();
+
     let polled = engine.views[0].original_exited();
     assert_eq!(polled, Ok(true));
     settle_leader_exit_view(
@@ -9232,14 +9185,14 @@ fn a_reused_id_keeps_each_process_judged_on_its_own_proof() {
     // The forward direction: the first process's transient is withdrawn
     // from its own released proof, while the second process on the reused
     // id, still live at capture end, keeps its own loss.
-    let (mut engine, mut first, exit_ns) = counted_leader_exit_loss(72);
-    first.kill().unwrap();
-    first.wait().unwrap();
+    let (mut engine, first, exit_ns) = counted_leader_exit_loss(72);
+    first.close();
+
     remove_view_like_retirement(&mut engine, ProcessViewId(72));
     assert_eq!(engine.released_leader_exit_proofs.len(), 1);
     assert!(engine.counted_leader_exit_views.is_empty());
 
-    let mut second = reuse_id_for_new_process(&mut engine, 72, exit_ns + 100);
+    let second = reuse_id_for_new_process(&mut engine, 72, exit_ns + 100);
     let polled = engine.views[0].original_exited();
     assert_eq!(polled, Ok(false));
     settle_leader_exit_view(
@@ -9254,8 +9207,8 @@ fn a_reused_id_keeps_each_process_judged_on_its_own_proof() {
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
-    second.kill().unwrap();
-    second.wait().unwrap();
+    second.close();
+
 }
 
 /// Twin (V3/V4 release path): releasing a view ID clears both pin
@@ -9327,10 +9280,10 @@ fn a_pending_assessment_is_written_off_when_its_id_is_released() {
 fn pid_scope_never_withdraws_a_leader_exit_loss() {
     // Under --pid and run every probe is bound to the leader's task, so
     // surviving threads leave no record the gate could see.
-    let (mut engine, mut child, _) = counted_leader_exit_loss(74);
+    let (mut engine, child, _) = counted_leader_exit_loss(74);
     engine.scope = Scope::Pid(engine.views[0].pid());
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 
     engine.settle_terminal_drain();
 
@@ -9341,12 +9294,12 @@ fn pid_scope_never_withdraws_a_leader_exit_loss() {
 fn a_pid_bound_session_under_system_scope_never_withdraws() {
     // A selected-endpoint session binds its probes to one pid even under
     // system scope; one such batch disables withdrawal for the capture.
-    let (mut engine, mut child, _) = counted_leader_exit_loss(75);
+    let (mut engine, child, _) = counted_leader_exit_loss(75);
     engine.note_session_probe_scope(&ScriptedSession::default());
     engine.note_session_probe_scope(&wide_session());
     assert_eq!(engine.static_probes_process_wide, Some(false));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 
     engine.settle_terminal_drain();
 
@@ -9356,10 +9309,10 @@ fn a_pid_bound_session_under_system_scope_never_withdraws() {
 #[test]
 fn lost_discovery_records_never_let_a_leader_exit_loss_be_withdrawn() {
     // "No later record" proves nothing when records were dropped.
-    let (mut engine, mut child, _) = counted_leader_exit_loss(76);
+    let (mut engine, child, _) = counted_leader_exit_loss(76);
     engine.account_unvalidated_discovery(1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 
     engine.settle_terminal_drain();
 
@@ -9370,10 +9323,10 @@ fn lost_discovery_records_never_let_a_leader_exit_loss_be_withdrawn() {
 fn a_system_batch_record_after_removal_keeps_the_removed_loss() {
     // Through the real batch path under system scope: a group record
     // stamped after the exit arrives once the view was already dropped.
-    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(77);
+    let (mut engine, child, exit_ns) = counted_leader_exit_loss(77);
     let pid = engine.views[0].pid();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     remove_view_like_retirement(&mut engine, ProcessViewId(77));
     engine
         .apply_discovery_batch(
@@ -9404,14 +9357,14 @@ fn dropped_function_list_records_never_let_a_leader_exit_loss_be_withdrawn() {
     // A BPF-side drop (state failure, bounded read failure, ABI refusal)
     // can hide a survivor's record just like ring loss.
     for drop in 0..3u32 {
-        let (mut engine, mut child, _) = counted_leader_exit_loss(78 + drop);
+        let (mut engine, child, _) = counted_leader_exit_loss(78 + drop);
         match drop {
             0 => engine.counter_snapshot.export_state_failures = 1,
             1 => engine.counter_snapshot.export_bounded_read_failures = 1,
             _ => engine.counter_snapshot.abi_refusals = 1,
         }
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
 
         engine.settle_terminal_drain();
 
@@ -9440,13 +9393,10 @@ fn leader_exit_records_never_count_as_group_observations() {
 
 #[test]
 fn cgroup_exec_rejects_a_stale_retained_generation() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(35), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(35), child.pid()).unwrap();
     let admitted = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
@@ -9457,18 +9407,19 @@ fn cgroup_exec_rejects_a_stale_retained_generation() {
     engine.views.push(view);
     engine.seed_initial_cgroup_views();
     engine.close_cgroup_admission(ProcessViewId(35), admitted);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let pid = child.pid();
+    child.close();
+
     let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exec.kind = DISCOVERY_KIND_EXEC;
-    exec.pid_tgid = u64::from(child.id()) << 32;
+    exec.pid_tgid = u64::from(pid) << 32;
     exec.hook_ts_ns = admitted.saturating_add(1);
     let mut pending = PendingViewRetirements::new();
 
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
 
     assert!(pending.is_empty());
-    assert!(!engine.refresh_queue.contains_key(&child.id()));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(
         engine.admitted_cgroup_views[&ProcessViewId(35)]
             .closed_ns
@@ -11710,23 +11661,24 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         record.hook_ts_ns = hook_ts_ns;
         record
     };
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(18), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(18), child.pid()).unwrap();
     let hook_ts_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let pid = child.pid();
+    child.close();
+
     let mut pending = PendingViewRetirements::new();
 
     for record in [
-        record(DISCOVERY_KIND_EXEC, child.id(), hook_ts_ns),
-        record(DISCOVERY_KIND_LEADER_EXIT, child.id(), hook_ts_ns),
+        record(DISCOVERY_KIND_EXEC, pid, hook_ts_ns),
+        record(DISCOVERY_KIND_LEADER_EXIT, pid, hook_ts_ns),
     ] {
         engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &record, &mut pending);
     }
@@ -11736,7 +11688,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         pending.get(&ProcessViewId(18)),
         Some(&RetirementCause::ExpectedRemoval)
     );
-    assert!(!engine.refresh_queue.contains_key(&child.id()));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(
         engine
             .counters
@@ -11750,18 +11702,18 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // the exit record is still in the ring while the pidfd is already
     // readable, and calling that proven exit a lost generation failed
     // `p11scope run` on every short-lived child.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(19), child.id()).unwrap();
-    let exec = record(DISCOVERY_KIND_EXEC, child.id(), view.admitted_ns());
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(19), child.pid()).unwrap();
+    let exec = record(DISCOVERY_KIND_EXEC, child.pid(), view.admitted_ns());
     let mut engine = Engine::empty();
     engine.views.push(view);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
     engine.promote_stale_execs(&mut pending);
@@ -11783,19 +11735,19 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // still running is declined — the pin re-reads Current, so there is no
     // positive evidence of change to record as loss. The deferral is marked
     // and the next pass re-checks.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(20), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(20), child.pid()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
     let mut pending = PendingViewRetirements::new();
     engine.queue_stale_views(&[ProcessViewId(20)].into_iter().collect(), &mut pending);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert!(
         pending.is_empty(),
         "a contradicted report queues nothing: {pending:?}"
@@ -11822,21 +11774,17 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
 #[test]
 fn a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it() {
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(0), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(0), child.pid()).unwrap();
     record.kind = DISCOVERY_KIND_EXEC;
-    record.pid_tgid = u64::from(child.id()) << 32;
+    record.pid_tgid = u64::from(child.pid()) << 32;
     record.hook_ts_ns = view.admitted_ns();
     let mut engine = Engine::empty();
-    engine.scope = Scope::Pid(child.id());
+    engine.scope = Scope::Pid(child.pid());
     engine.views.push(view);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     let mut session = ScriptedSession::default();
     apply_ordinary_batch(&mut engine, &mut session, vec![record])
@@ -13459,8 +13407,8 @@ fn sibling_silent_abort_defers_loader_arm_without_recording() {
     // generation reads stale, the pin proves the exit, and the pid reads
     // dead — the exact silent-abort conjuncts. The kill is async: wait
     // for the zombie state before asserting staleness.
-    sibling.kill().unwrap();
-    let sibling_pid = sibling.id();
+    sibling.inner_mut().kill().unwrap();
+    let sibling_pid = sibling.pid();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !process::process_is_zombie(sibling_pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -13486,7 +13434,7 @@ fn sibling_silent_abort_defers_loader_arm_without_recording() {
     let armed = engine.arm_loader_or_partial(1, &mut session, &mut additions_allowed, &mut pending);
     victim.kill().unwrap();
     victim.wait().unwrap();
-    sibling.wait().unwrap();
+    sibling.inner_mut().wait().unwrap();
     armed.expect("a sibling-denied arm of a live view defers, it does not fail");
 
     assert!(
@@ -13597,7 +13545,7 @@ fn bound_loader_arm_replaces_a_stale_unbound_entry() {
 fn sibling_loud_abort_still_records_the_loader_gap() {
     let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
     let sibling_id = ProcessViewId(3);
-    let sibling_pid = sibling.id();
+    let sibling_pid = sibling.pid();
     engine.views[0] =
         crate::process::reused_process_view_for_test(sibling_id, sibling_pid).unwrap();
     let mut victim = SettledChild::spawn();
@@ -13609,7 +13557,7 @@ fn sibling_loud_abort_still_records_the_loader_gap() {
     engine.next_view_id = 5;
     engine.scope = Scope::Pid(victim_pid);
     assert!(
-        sibling.try_wait().unwrap().is_none(),
+        sibling.inner_mut().try_wait().unwrap().is_none(),
         "the reused sibling pid stays live, so the abort stays loud"
     );
     assert!(
@@ -13627,8 +13575,7 @@ fn sibling_loud_abort_still_records_the_loader_gap() {
     let armed = engine.arm_loader_or_partial(1, &mut session, &mut additions_allowed, &mut pending);
     victim.kill().unwrap();
     victim.wait().unwrap();
-    sibling.kill().unwrap();
-    sibling.wait().unwrap();
+    sibling.close();
     armed.expect("a loud-denied arm still returns");
 
     assert!(
@@ -13680,7 +13627,7 @@ fn sibling_loud_abort_still_records_the_loader_gap() {
 /// Accepted + closed + loud cleanup takes the record path.
 #[test]
 fn new_slot_cleanup_detach_failure_still_records_loader_gap() {
-    let (mut sibling, mut engine, modules) = engine_with_one_accepted_provider();
+    let (sibling, mut engine, modules) = engine_with_one_accepted_provider();
     let view_id = engine.views[0].id();
     let batch = peer_candidate(&mut engine, &modules);
     let mut session = ScriptedSession::default();
@@ -13715,8 +13662,8 @@ fn new_slot_cleanup_detach_failure_still_records_loader_gap() {
         &mut additions_allowed,
         &mut PendingViewRetirements::new(),
     );
-    sibling.kill().unwrap();
-    sibling.wait().unwrap();
+    sibling.close();
+
     armed.expect("a loud-denied arm still returns");
 
     assert!(
@@ -13769,7 +13716,7 @@ fn new_slot_cleanup_detach_failure_still_records_loader_gap() {
 /// replacement's cleanup detach fails loudly.
 #[test]
 fn replacement_detach_failure_still_records_loader_gap() {
-    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (sibling, mut engine, _modules) = engine_with_one_accepted_provider();
     let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
     let accepted = &mut engine.plan.slots[0];
     accepted.descriptor_index = descriptor;
@@ -13801,8 +13748,8 @@ fn replacement_detach_failure_still_records_loader_gap() {
     );
     victim.kill().unwrap();
     victim.wait().unwrap();
-    sibling.kill().unwrap();
-    sibling.wait().unwrap();
+    sibling.close();
+
     armed.expect("a loud-denied arm still returns");
 
     assert!(
@@ -13844,7 +13791,7 @@ fn replacement_detach_failure_still_records_loader_gap() {
 /// replacement failed with fresh detach bookkeeping behind it.
 #[test]
 fn failed_replacement_with_detach_failure_still_records_loader_gap() {
-    let (mut sibling, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (sibling, mut engine, _modules) = engine_with_one_accepted_provider();
     let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
     let accepted = &mut engine.plan.slots[0];
     accepted.descriptor_index = descriptor;
@@ -13876,8 +13823,8 @@ fn failed_replacement_with_detach_failure_still_records_loader_gap() {
     );
     victim.kill().unwrap();
     victim.wait().unwrap();
-    sibling.kill().unwrap();
-    sibling.wait().unwrap();
+    sibling.close();
+
     armed.expect("a loud-denied arm still returns");
 
     assert!(!additions_allowed, "the failed replacement closed the tick");
@@ -13919,7 +13866,7 @@ fn failed_replacement_with_detach_failure_still_records_loader_gap() {
 /// twin (spark M4).
 #[test]
 fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
-    let (mut sibling, mut engine, modules) = engine_with_one_accepted_provider();
+    let (sibling, mut engine, modules) = engine_with_one_accepted_provider();
     let mut victim = SettledChild::spawn();
     let victim_pid = victim.id();
     let victim_id = ProcessViewId(4);
@@ -13961,8 +13908,8 @@ fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
     );
     victim.kill().unwrap();
     victim.wait().unwrap();
-    sibling.kill().unwrap();
-    sibling.wait().unwrap();
+    sibling.close();
+
     armed.expect("an accepted-into-closed arm defers, it does not fail");
 
     assert_eq!(
@@ -14704,16 +14651,13 @@ fn a_loader_hit_remapped_by_a_same_batch_exec_is_not_a_discovery_loss() {
 /// authority `queue_retirement` already uses.
 #[test]
 fn a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
     let mut engine = Engine::empty();
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(0), child.id()).unwrap());
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
     engine.next_view_id = 1;
 
     engine.mark_generation_change(ProcessViewId(0), "live loader arming", "scripted");
@@ -14723,8 +14667,8 @@ fn a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss() {
         "a live generation that changed under an arm is a real loss"
     );
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     engine.counters.object_skips.clear();
     engine.mark_generation_change(ProcessViewId(0), "live loader arming", "scripted");
     assert!(
@@ -15246,13 +15190,10 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
 /// not misfire when nothing is stale.
 #[test]
 fn a_candidate_naming_only_live_views_marks_no_generation_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(18), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(18), child.pid()).unwrap();
     let id = view.id();
     let mut engine = Engine::empty();
     engine.views.push(view);
@@ -15283,8 +15224,8 @@ fn a_candidate_naming_only_live_views_marks_no_generation_gap() {
         "no silence note when nothing was stale: {:?}",
         engine.counters.noise.lines()
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// v0.7.0 `--system` demo: a candidate that names a generation which
@@ -15296,18 +15237,15 @@ fn a_candidate_naming_only_live_views_marks_no_generation_gap() {
 /// twin (nothing exits) stayed clean. The silence stays visible on -v.
 #[test]
 fn a_candidate_stale_only_by_exited_views_marks_no_generation_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(19), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(19), child.pid()).unwrap();
     let id = view.id();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert!(
         !engine
             .views
@@ -15441,13 +15379,10 @@ fn a_dead_stale_view_with_a_new_attach_target_stays_loud() {
 fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
     let (_fixture, live_view, module, pins) = loaded_seed_provider();
     let live_id = live_view.id();
-    let mut dead = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(dead.id());
-    let dead_view = ProcessView::open(ProcessViewId(4400), dead.id()).unwrap();
+    let dead = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(dead.pid());
+    let dead_view = ProcessView::open(ProcessViewId(4400), dead.pid()).unwrap();
     let dead_id = dead_view.id();
     let mut engine = Engine::empty();
     engine.views.push(live_view);
@@ -15485,8 +15420,8 @@ fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
         .unwrap()
         .unwrap();
     candidate.delta.new.push(slot);
-    dead.kill().unwrap();
-    dead.wait().unwrap();
+    dead.close();
+
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
     let outcome = engine
@@ -15527,39 +15462,30 @@ fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
 /// for the predicate the candidate test above wires through the apply.
 #[test]
 fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
-    let mut live = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(live.id());
-    let live_view = ProcessView::open(ProcessViewId(20), live.id()).unwrap();
-    let mut dead = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(dead.id());
-    let dead_view = ProcessView::open(ProcessViewId(21), dead.id()).unwrap();
-    dead.kill().unwrap();
-    dead.wait().unwrap();
+    let live = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(live.pid());
+    let live_view = ProcessView::open(ProcessViewId(20), live.pid()).unwrap();
+    let dead = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(dead.pid());
+    let dead_view = ProcessView::open(ProcessViewId(21), dead.pid()).unwrap();
+    dead.close();
+
     // A pid reused by a live process: the original generation is gone
     // but the pid reads live.
     let reused_view =
-        crate::process::reused_process_view_for_test(ProcessViewId(23), live.id()).unwrap();
+        crate::process::reused_process_view_for_test(ProcessViewId(23), live.pid()).unwrap();
     // An unanswerable pin on a zombie: the generation reads dead but
     // the pin verdict is an error, so the set stays loud. The zombie is
     // never waited until the end, so its pid cannot be reused mid-test.
-    let mut zombie = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(zombie.id());
-    let zombie_pid = zombie.id();
+    let mut zombie = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(zombie.pid());
+    let zombie_pid = zombie.pid();
     let zombie_view =
         crate::process::unprovable_process_view_for_test(ProcessViewId(24), zombie_pid).unwrap();
-    zombie.kill().unwrap();
+    zombie.inner_mut().kill().unwrap();
     for _ in 0..200 {
         if crate::process::generation_dead(zombie_pid) {
             break;
@@ -15601,9 +15527,9 @@ fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
         !stale_views_all_dead(&set(&[ProcessViewId(22)]), &views, &extra),
         "an unknown view reads unproven"
     );
-    live.kill().unwrap();
-    live.wait().unwrap();
-    zombie.wait().unwrap();
+    live.close();
+
+    zombie.inner_mut().wait().unwrap();
 }
 
 #[test]
@@ -18195,20 +18121,16 @@ fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
 /// capture with "the named process generation changed during capture".
 #[test]
 fn a_capture_refresh_ends_on_a_proven_exit_instead_of_failing() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
     let mut engine = Engine::empty();
     engine.scope = Scope::Pid(pid);
     engine.views.push(view);
     engine.next_view_id = 1;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 
     let mut session = ScriptedSession::with_records([], 0);
     let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
@@ -20712,16 +20634,13 @@ fn retirement_intent_is_persistent_and_recorded_loss_is_sticky() {
 
 #[test]
 fn expected_exit_waits_for_the_original_process_pin() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(16), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(16), child.pid()).unwrap();
     let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
     record.kind = DISCOVERY_KIND_LEADER_EXIT;
-    record.pid_tgid = u64::from(child.id()) << 32;
+    record.pid_tgid = u64::from(child.pid()) << 32;
     record.hook_ts_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
@@ -20739,8 +20658,8 @@ fn expected_exit_waits_for_the_original_process_pin() {
     );
     assert_eq!(engine.task_uprobe_link_losses, 0);
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     let mut additions_allowed = true;
     let mut closure = PauseClosure::new(true);
     let assessments = engine.pending_leader_exit_views.clone();
@@ -22623,18 +22542,16 @@ fn engine_retains_pid_reports_live_views_only() {
         "a live view for the pid retains it"
     );
     assert!(!engine.retains_pid(u32::MAX), "no view, no retention");
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
-    let stale_pid = sleeper.id();
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let stale_pid = sleeper.pid();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(1), stale_pid).expect("sleeper view opens"));
     assert!(engine.retains_pid(stale_pid), "a live view retains its pid");
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
     assert!(
         !engine.retains_pid(stale_pid),
         "a reaped view retains nothing"
@@ -23721,6 +23638,18 @@ impl ParkedSleep {
         }
     }
 
+    /// Relinquish the child to another owner (explicit custody transfer
+    /// for pre-existing wrapper guards); the guard itself is forgotten
+    /// without running `Drop`, so exactly one owner cleans up.
+    fn into_inner(mut self) -> std::process::Child {
+        let child = self
+            .child
+            .take()
+            .expect("ParkedSleep has no child to relinquish");
+        std::mem::forget(self);
+        child
+    }
+
     fn pid(&self) -> u32 {
         self.pid
     }
@@ -23800,7 +23729,8 @@ fn parked_sleep_drop_kills_without_a_close() {
 #[test]
 fn parked_sleep_failed_proof_leaves_no_process() {
     let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", "read line"]).stdin(std::process::Stdio::piped());
+    cmd.args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
     let guard = ParkedSleep::spawn_unparked(&mut cmd);
     let pid = guard.pid();
     let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.prove_parked()));
@@ -23817,9 +23747,7 @@ fn parked_sleep_failed_proof_leaves_no_process() {
 #[test]
 fn parked_sleep_unparked_spawn_failure_creates_no_process() {
     let loud = std::panic::catch_unwind(|| {
-        ParkedSleep::spawn_unparked(&mut std::process::Command::new(
-            "/nonexistent-sleeper-xyz",
-        ));
+        ParkedSleep::spawn_unparked(&mut std::process::Command::new("/nonexistent-sleeper-xyz"));
     });
     assert!(loud.is_err(), "spawn failure is loud");
 }
@@ -23847,6 +23775,26 @@ fn parked_sleep_close_on_reaped_child_fails_loud_without_hang() {
     assert!(
         message.contains("kill parked sleeper"),
         "named failure reason, got {message:?}"
+    );
+}
+
+/// `into_inner` hands a live child to the next owner exactly once:
+/// the forgotten guard cleans nothing, and the receiver owns cleanup.
+#[test]
+fn parked_sleep_into_inner_transfers_custody_once() {
+    let guard =
+        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let pid = guard.pid();
+    let mut child = guard.into_inner();
+    assert!(
+        !crate::process::process_proven_exited(pid),
+        "relinquished child stays alive under its new owner"
+    );
+    child.kill().expect("receiver kills");
+    child.wait().expect("receiver reaps");
+    assert!(
+        crate::process::process_proven_exited(pid),
+        "receiver owns cleanup"
     );
 }
 
@@ -23881,8 +23829,7 @@ fn unwind_drops_a_constructed_guard_before_proof() {
 /// wait saw instead of re-reading (which could race a shell exit).
 fn wait_sh_wrapped_sleep_spawned(pid: u32) -> String {
     for _ in 0..500 {
-        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        {
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
             if !children.trim().is_empty() {
                 return children;
             }
@@ -24399,14 +24346,12 @@ fn view_owns_provider_pins_the_exploration_predicate() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(1), sleeper.pid()).expect("sleeper view opens"));
     assert!(!engine.view_owns_provider(ProcessViewId(0)));
     assert!(!engine.view_owns_provider(ProcessViewId(1)));
     let (_fixture, _view, scanned, _pins) = loaded_seed_provider();
@@ -24429,8 +24374,8 @@ fn view_owns_provider_pins_the_exploration_predicate() {
         !engine.view_owns_provider(ProcessViewId(0)),
         "a module elsewhere owns nothing here"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// The owned child's scheduled arm moves first: newcomer order that
@@ -24449,14 +24394,12 @@ fn owned_child_arm_priority_moves_the_scheduled_child_first() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(1), sleeper.pid()).expect("sleeper view opens"));
     engine.owned_run_pid = Some(std::process::id());
     let ids = vec![ProcessViewId(0), ProcessViewId(1)];
     let mut order = vec![1usize, 0];
@@ -24474,8 +24417,8 @@ fn owned_child_arm_priority_moves_the_scheduled_child_first() {
     let mut unordered = vec![1usize, 0];
     assert_eq!(engine.owned_child_arm_priority(&ids, &mut unordered), None);
     assert_eq!(unordered, vec![1, 0]);
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Watch scans count memory-refused races per cause instead of marking
@@ -24651,11 +24594,9 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
     let object = pin.id;
     let key = pin.key;
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -24671,7 +24612,7 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(7), sleeper.pid()).expect("sleeper view opens"));
     let proofs = vec![OwnedLearnProof {
         view: ProcessViewId(7),
         path: backing.to_string_lossy().into_owned(),
@@ -24732,8 +24673,8 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         engine.pending_learned.is_empty(),
         "the direct child's files need no learning"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Learning records whether the proving view was still retained: a
@@ -24763,11 +24704,9 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
     let retained_object = retained_pin.id;
     let transient_object = transient_pin.id;
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -24781,7 +24720,7 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(7), sleeper.pid()).expect("sleeper view opens"));
     // A proof from the retained sleeper view and one from a released
     // transient view id (never retained): distinct files, so neither
     // proof dedupes the other.
@@ -24816,8 +24755,8 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         !engine.pending_learned[1].proving_retained,
         "a transient prover stages as transient"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Staging stages the proof's stored loader naming and resolves
@@ -24835,11 +24774,9 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
     let mut pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
     let object = pins.pinned().next().expect("one pin").id;
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -24853,7 +24790,7 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(7), sleeper.pid()).expect("sleeper view opens"));
     // The capture found the loader gone: the stored naming is the
     // finite unknown, while the loader reads live (a recycled pid's
     // exe link must never leak into the staged file).
@@ -24881,8 +24818,8 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
         Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
         "the stored finite unknown travels with the proof"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// E1 table harvest: a transient descendant's scan that decoded
@@ -25904,11 +25841,9 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
         "the prompt fixture must compile"
     );
     let me = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {
         id: 7,
@@ -25920,7 +25855,7 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
-    let retained_pid = sleeper.id();
+    let retained_pid = sleeper.pid();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(5), retained_pid).expect("retained view opens"));
@@ -25969,28 +25904,26 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
         "every retained view owes a prompt refresh: {:?}",
         engine.refresh_queue.keys().collect::<Vec<_>>(),
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// A still-live loader is named through the proving view's pidfd
 /// bracket: the live twin of the exited case below.
 #[test]
 fn owned_proof_loader_name_names_the_live_loader_through_its_pidfd() {
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
-    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let view = ProcessView::open(ProcessViewId(7), sleeper.pid()).expect("sleeper view opens");
     let (exe, reason) = loader_name_for_proving_view(&view);
     assert_eq!(reason, None, "a live loader names without a reason");
     assert!(
         exe.as_deref().is_some_and(|exe| exe.ends_with("sleep")),
         "the live sleeper is named: {exe:?}"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// Once the loader exits, the same proving view yields only the
@@ -25998,14 +25931,12 @@ fn owned_proof_loader_name_names_the_live_loader_through_its_pidfd() {
 /// named. The live twin above names the same view while it lives.
 #[test]
 fn owned_proof_loader_name_is_unknown_once_the_loader_exits() {
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
-    let view = ProcessView::open(ProcessViewId(7), sleeper.id()).expect("sleeper view opens");
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let view = ProcessView::open(ProcessViewId(7), sleeper.pid()).expect("sleeper view opens");
+    sleeper.close();
+
     assert!(
         !view.still_the_same(),
         "the reaped view no longer names its generation"
@@ -28792,7 +28723,7 @@ fn selection_counter_regression_invalidates_silent_coverage() {
 
 #[test]
 fn selection_bindings_isolate_provider_attribution_and_refusal() {
-    let (child, mut engine, modules) = engine_with_one_accepted_provider();
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
     engine
@@ -28966,9 +28897,6 @@ fn selection_bindings_isolate_provider_attribution_and_refusal() {
         engine.selection_bindings[&2].coverage,
         SelectionCoverageState::OwnedOpen(generation)
     );
-    let mut child = child;
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
@@ -31548,7 +31476,8 @@ fn named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it() 
         ("post-retirement", vec![None, Some(())]),
     ] {
         // The preflight kills and reaps this child; the test never waits on it.
-        let pid = spawn_execed_sleep().id();
+        let _pid_guard = spawn_execed_sleep();
+        let pid = _pid_guard.pid();
         let mut engine = Engine::empty();
         engine.scope = Scope::Pid(pid);
         engine.next_view_id = 1;
@@ -34151,17 +34080,14 @@ fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObje
 /// A live child, an Engine that retains one process view on it, and one
 /// accepted provider already attached in slot 0. The returned modules are
 /// `[accepted, peer]`; the peer is what a later candidate allocates.
-fn engine_with_one_accepted_provider() -> (std::process::Child, Engine, Vec<ScannedModule>) {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(3), child.id()).unwrap();
+fn engine_with_one_accepted_provider() -> (ParkedSleep, Engine, Vec<ScannedModule>) {
+    let child =
+        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(3), child.pid()).unwrap();
     let modules = child_provider_modules(&view);
     let mut engine = Engine::empty();
-    engine.scope = Scope::Pid(child.id());
+    engine.scope = Scope::Pid(child.pid());
     engine.next_view_id = 4;
     engine.views.push(view);
     let pins = pin_test_modules(&engine.views[0], &modules[..1]);
@@ -35227,7 +35153,7 @@ fn post_mutation_generation_loss_never_owns_the_cell_it_allocated() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     let accepted_owner = engine.plan.module_of_slot(0);
     let candidate = peer_candidate(&mut engine, &modules);
-    let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+    let mut session = ScriptedSession::losing_generation_at_attach(child.pid());
     let mut additions = true;
 
     let outcome = engine
@@ -35483,7 +35409,7 @@ fn generation_loss_cleanup_finishes_after_one_failed_detach() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     let accepted_owner = engine.plan.module_of_slot(0);
     let candidate = peer_candidate(&mut engine, &modules);
-    let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+    let mut session = ScriptedSession::losing_generation_at_attach(child.pid());
     session.fail_slot_detaches([false, false, true]);
     let mut additions = true;
 
@@ -35520,7 +35446,7 @@ fn generation_loss_cleanup_finishes_after_one_failed_detach() {
 
 #[test]
 fn a_history_preparation_failure_never_enters_the_link_mutation() {
-    let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
     let candidate = peer_candidate(&mut engine, &modules);
     let plan = engine.plan.clone();
     let pins = engine.pinned.pinned().count();
@@ -35546,8 +35472,8 @@ fn a_history_preparation_failure_never_enters_the_link_mutation() {
     assert_eq!(engine.plan, plan, "the accepted plan is unchanged");
     assert_eq!(engine.pinned.pinned().count(), pins);
     assert!(additions, "a pre-mutation refusal keeps the additions gate");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 #[test]
@@ -35555,7 +35481,7 @@ fn a_post_mutation_retirement_is_not_an_accepted_candidate() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let candidate = peer_candidate(&mut engine, &modules);
-    let mut session = ScriptedSession::losing_generation_at_attach(child.id());
+    let mut session = ScriptedSession::losing_generation_at_attach(child.pid());
     let mut additions = true;
 
     let retired = engine
@@ -38589,25 +38515,25 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
 /// fast path did the skipping.
 #[test]
 fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
-    let mut first = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(first.id());
-    let mut second = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(second.id());
-    let mut waiting = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let mut fourth = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let (p1, p2, p3, p4) = (first.id(), second.id(), waiting.id(), fourth.id());
+    let first = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+    wait_sleep_child_settled(first.pid());
+    let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+    wait_sleep_child_settled(second.pid());
+    let waiting = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+    let fourth = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+    let (p1, p2, p3, p4) = (first.pid(), second.pid(), waiting.pid(), fourth.pid());
     assert!(p3 < p4, "spawn order pins pid order");
     let (mut engine, dir) = engine_over_cgroup_naming(&[p1, p2, p3]);
     // Rebuild counts, not wall-time budgets, are under test: an infinite
@@ -38688,9 +38614,8 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     assert_eq!(engine.views.len(), 2);
     assert!(engine.views.iter().any(|view| view.pid() == p1));
     assert!(engine.views.iter().any(|view| view.pid() == p2));
-    for child in [&mut first, &mut second, &mut waiting, &mut fourth] {
-        child.kill().unwrap();
-        child.wait().unwrap();
+    for sleeper in [first, second, waiting, fourth] {
+        sleeper.close();
     }
 }
 
@@ -41095,18 +41020,16 @@ fn publish_deferral_matches_full_publication_step_for_step() {
     let mut deferred = fixture.engine();
     let mut full = fixture.engine();
     full.set_disable_publish_deferral_for_test(true);
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
     for engine in [&mut deferred, &mut full] {
         engine
             .views
-            .push(ProcessView::open(ProcessViewId(100), child.id()).unwrap());
+            .push(ProcessView::open(ProcessViewId(100), child.pid()).unwrap());
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     let mut deferred_counts = publish_operation_counts(&deferred);
     let mut full_counts = publish_operation_counts(&full);
     for full_side in [false, true] {
@@ -42214,15 +42137,12 @@ fn conservative_intent_survives_refusal_until_current_candidate_commits() {
 #[test]
 fn candidate_admission_keeps_exact_retained_and_local_stale_view_ids() {
     fn exited_view(id: ProcessViewId) -> ProcessView {
-        let mut child = std::process::Command::new("sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        wait_sleep_child_settled(child.id());
-        let view = ProcessView::open(id, child.id()).unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+        wait_sleep_child_settled(child.pid());
+        let view = ProcessView::open(id, child.pid()).unwrap();
+    child.close();
+
         assert!(!view.still_the_same());
         view
     }
@@ -45029,13 +44949,10 @@ fn parked_sleep_has_a_stable_full_census() {
 /// Until its exec completes the child is a fork of this test binary, and a
 /// scan racing that exec is not what the U-11 ticks below are about; until
 /// its loader maps, an arm racing it sees a partial child.
-fn spawn_execed_sleep() -> std::process::Child {
-    let child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
+fn spawn_execed_sleep() -> ParkedSleep {
+    let child =
+        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    wait_sleep_child_settled(child.pid());
     child
 }
 
@@ -45055,8 +44972,8 @@ fn capacity_exhausted(engine: &Engine) -> bool {
 /// recycle one ID.
 #[test]
 fn refresh_releases_view_ids_when_the_target_preflight_refuses() {
-    let mut child = spawn_execed_sleep();
-    let (mut engine, _dir) = engine_over_cgroup_naming(&[child.id()]);
+    let child = spawn_execed_sleep();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[child.pid()]);
     engine.max_scan_pids = 2;
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::refusing_preflight();
@@ -45101,8 +45018,8 @@ fn refresh_releases_view_ids_when_the_target_preflight_refuses() {
     );
     assert_eq!(engine.next_view_id, 1, "no tick mints a second ID");
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// U-11, the stale-generation exit. A process admitted this tick that ends
@@ -45123,7 +45040,8 @@ fn refresh_releases_view_ids_when_a_new_generation_ends_before_admission() {
     let mut lost = Vec::new();
     for tick in 1..=ticks {
         // The preflight kills and reaps this child; the test never waits on it.
-        let pid = spawn_execed_sleep().id();
+        let _pid_guard = spawn_execed_sleep();
+        let pid = _pid_guard.pid();
         std::fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
         session.lose_generations_at_preflight([Some(pid)]);
         refresh_inventory_with(&mut engine, &mut session);
@@ -45179,7 +45097,8 @@ fn refresh_releases_view_ids_when_a_new_generation_ends_before_admission() {
 #[test]
 fn refresh_releases_view_ids_at_the_post_retirement_preflight_exits() {
     // Tick 2's preflight kills and reaps this child; the test never waits on it.
-    let pid = spawn_execed_sleep().id();
+    let _pid_guard = spawn_execed_sleep();
+    let pid = _pid_guard.pid();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::default();
@@ -45369,21 +45288,21 @@ fn a_foreign_exit_retired_in_the_same_tick_does_not_strand_a_newcomer() {
     let dir = tempfile::tempdir().expect("a fixture directory");
     let provider = system_scope_build_fixture(dir.path(), "u07-newcomer");
     let driver = system_scope_build_driver(dir.path());
-    let mut foreign = spawn_execed_sleep();
-    let (mut engine, scope) = u07_engine(&[foreign.id()], std::slice::from_ref(&provider));
+    let foreign = spawn_execed_sleep();
+    let (mut engine, scope) = u07_engine(&[foreign.pid()], std::slice::from_ref(&provider));
     let mut session = ScriptedSession::default();
     u07_tick(&mut engine, &mut session, &mut true);
     let foreign_view = engine
         .views
         .iter()
-        .find(|view| view.pid() == foreign.id())
+        .find(|view| view.pid() == foreign.pid())
         .map(ProcessView::id)
         .expect("tick 1 admits the foreign member");
 
     // Between the ticks the foreign member ends and leaves the scope, and the
     // newcomer joins it: tick 2 retires the one and admits the other.
-    foreign.kill().unwrap();
-    foreign.wait().unwrap();
+    foreign.close();
+
     let newcomer = system_scope_spawn_loaded(&driver, &provider);
     u07_name_members(scope.path(), &[newcomer.pid()]);
     let attached_before = session.attached_slots.len();
@@ -45432,7 +45351,7 @@ fn a_foreign_exit_retired_in_the_same_tick_does_not_strand_a_newcomer() {
 #[test]
 fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
     for detach_fails in [false, true] {
-        let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+        let (child, mut engine, _) = engine_with_one_accepted_provider();
         let slots = engine.plan.slots.len();
         assert_eq!(slots, 1, "the retired view owns one attached slot");
         engine.pending_retirements.insert(engine.views[0].id());
@@ -45477,8 +45396,8 @@ fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
             "detach failed: {detach_fails}; {:?}",
             engine.counters.object_skips
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
     }
 }
 
@@ -45489,7 +45408,7 @@ fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
 /// exactly as its PARTIAL reason says.
 #[test]
 fn a_conservative_replay_whose_detach_fails_before_mutation_closes_the_tick() {
-    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
     engine.pending_retirements.insert(engine.views[0].id());
     let mut session = ScriptedSession::default();
     session.fail_slot_detaches_before_mutation([true]);
@@ -45514,8 +45433,8 @@ fn a_conservative_replay_whose_detach_fails_before_mutation_closes_the_tick() {
         engine.counters.object_skips
     );
     assert!(!additions, "the failed detach closes the tick");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// U-07. A tick whose additions are already closed (by its caller or by an
@@ -45839,7 +45758,8 @@ fn a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication() 
     let survivor = system_scope_spawn_loaded(&driver, &provider);
     // Killed and reaped inside `attach_targets`, between the link mutation's
     // generation precheck and its postcheck; the test never waits on it.
-    let lost = spawn_execed_sleep().id();
+    let _lost_guard = spawn_execed_sleep();
+    let lost = _lost_guard.pid();
     let (mut engine, scope) = u07_engine(&[survivor.pid(), lost], std::slice::from_ref(&provider));
     let mut session = ScriptedSession::losing_generation_at_attach(lost);
 
@@ -45945,7 +45865,8 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
     engine.request_refresh(member.pid(), None);
     // Killed and reaped inside the candidate's detach, before its attach
     // precheck; the test never waits on it.
-    let lost = spawn_execed_sleep().id();
+    let _lost_guard = spawn_execed_sleep();
+    let lost = _lost_guard.pid();
     u07_name_members(scope.path(), &[member.pid(), lost]);
     session.lose_generations_at_detach([Some(lost)]);
     let attach_calls = session.attached_slots.len();
@@ -46024,7 +45945,7 @@ fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
     let provider = system_scope_build_fixture(dir.path(), "u07-unarmed");
     let driver = system_scope_build_driver(dir.path());
     let exiting = spawn_execed_sleep();
-    let exiting_pid = exiting.id();
+    let exiting_pid = exiting.pid();
     let (mut engine, scope) = u07_engine(&[exiting_pid], std::slice::from_ref(&provider));
     u07_tick(&mut engine, &mut ScriptedSession::default(), &mut true);
     let exiting_view = engine
@@ -46868,7 +46789,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
 /// corroboration would supply; the rebuilt candidate downgrades it.
 #[test]
 fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
-    let (mut kept, mut engine, modules) = engine_with_one_accepted_provider();
+    let (kept, mut engine, modules) = engine_with_one_accepted_provider();
     let descriptor = crate::kinds::function_id("C_Initialize").unwrap() + 1;
     let accepted = &mut engine.plan.slots[0];
     accepted.descriptor_index = descriptor;
@@ -46879,7 +46800,8 @@ fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
 
     // A second candidate view, whose own provider is new; it is killed and
     // reaped inside the apply's second detach. The test never waits on it.
-    let lost = spawn_execed_sleep().id();
+    let _lost_guard = spawn_execed_sleep();
+    let lost = _lost_guard.pid();
     let lost_view = ProcessView::open(ProcessViewId(4), lost).unwrap();
     engine.next_view_id = 5;
     let lost_module = child_provider_modules(&lost_view)[1].clone();
@@ -46932,8 +46854,8 @@ fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
         engine.counters.object_skips
     );
     assert!(!additions, "the lost generation closes the tick");
-    kept.kill().unwrap();
-    kept.wait().unwrap();
+    kept.close();
+
 }
 
 /// Replays one queued retirement through `replay_pending_conservative` on
@@ -46959,7 +46881,7 @@ fn u07_replay(
 /// tick; its retirement stays queued.
 #[test]
 fn a_refused_conservative_replay_closes_the_tick() {
-    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
     let retired = ProcessViewId(9);
     let mut session = ScriptedSession::default();
     session.refuse_preflights([true]);
@@ -46977,8 +46899,8 @@ fn a_refused_conservative_replay_closes_the_tick() {
         session.attached_slots.is_empty(),
         "the replay attached nothing"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// U-07 fix round 1 (Minor 3a). A replay whose candidate loses a generation
@@ -46990,7 +46912,7 @@ fn a_retired_conservative_replay_closes_the_tick() {
     let mut session = ScriptedSession::default();
     // The accepted provider's process ends inside the replay's detach; the
     // seam kills and reaps it.
-    session.lose_generations_at_detach([Some(child.id())]);
+    session.lose_generations_at_detach([Some(child.pid())]);
 
     let (outcome, additions) = u07_replay(&mut engine, &mut session, ProcessViewId(9));
 
@@ -47018,7 +46940,7 @@ fn a_retired_conservative_replay_closes_the_tick() {
 /// be rebuilt closes the tick and keeps its retirement queued.
 #[test]
 fn a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick() {
-    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
     let retired = ProcessViewId(9);
     // The capture-lifetime module registry no longer maps the accepted
     // provider bijectively, so no candidate over it can be rebuilt. Remove
@@ -47054,15 +46976,15 @@ fn a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick() {
         session.detached_slots.is_empty() && session.attached_slots.is_empty(),
         "no link was touched"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// U-07 fix round 1 (Minor 3b). A replay whose conservative candidate cannot
 /// be applied closes the tick and keeps its retirement queued.
 #[test]
 fn a_conservative_replay_that_cannot_be_applied_closes_the_tick() {
-    let (mut child, mut engine, _) = engine_with_one_accepted_provider();
+    let (child, mut engine, _) = engine_with_one_accepted_provider();
     let retired = ProcessViewId(9);
     // The accepted manifest history lost its source ordinals, so the replay's
     // publication preflight refuses before any link mutation.
@@ -47090,8 +47012,8 @@ fn a_conservative_replay_that_cannot_be_applied_closes_the_tick() {
         session.detached_slots.is_empty() && session.attached_slots.is_empty(),
         "no link was touched"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 #[test]
@@ -61661,7 +61583,7 @@ fn library_handle_deferral_marks_handles_first_and_retries() {
     }
     engine.file_fixture_pins_for_test();
     engine.set_table_cap_for_test(2);
-    let live_pid = child.id();
+    let live_pid = child.pid();
     let tick_start = 1_000_000u64;
     engine
         .scheduler
@@ -61728,7 +61650,8 @@ fn library_handle_deferral_marks_handles_first_and_retries() {
 fn handles_deferred_pid_attempted_first_in_window() {
     // The handle drops immediately (no zombie to wait): the `sleep 600`
     // child outlives this sub-second admission either way.
-    let other = spawn_execed_sleep().id();
+    let _other_guard = spawn_execed_sleep();
+    let other = _other_guard.pid();
     let live = std::process::id();
     let mut engine = Engine::empty();
     engine
@@ -61875,17 +61798,18 @@ fn tick_handle_release_owes_an_immediate_round() {
 /// pends owes the immediate next round through the frame flag.
 #[test]
 fn tick_with_release_and_pending_handles_owes_frame() {
-    let live = spawn_execed_sleep().id();
-    let mut dead = spawn_execed_sleep();
-    let dead_pid = dead.id();
+    let _live_guard = spawn_execed_sleep();
+    let live = _live_guard.pid();
+    let dead = spawn_execed_sleep();
+    let dead_pid = dead.pid();
     let mut engine = Engine::empty();
     engine.scope = Scope::Pid(live);
     engine.next_view_id = 1;
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), dead_pid).unwrap());
-    dead.kill().unwrap();
-    dead.wait().unwrap();
+    dead.close();
+
     engine.request_refresh(live, None);
     engine
         .handles_deferred
@@ -67506,13 +67430,10 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
     // transaction serves it only when the scope enumerates it.
     engine.scope = Scope::Pid(selected);
     // The cap filler: a provider-free sleeper, exploratory by construction.
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn ambient sleeper");
-    wait_sleep_child_settled(sleeper.id());
-    let ambient = sleeper.id();
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let ambient = sleeper.pid();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(1), ambient).unwrap());
@@ -67631,8 +67552,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
         engine.discovery_truncated, 0,
         "zero loss: no refusal anywhere"
     );
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
+
 }
 
 /// Lane-A fail-closed twin: with no evictable view at a full cap, the
@@ -67656,13 +67576,10 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     // helper-attached context: a context that bypassed the candidate
     // pipeline would be healed mid-pass (missing-context rescan and rearm),
     // which is exactly the ambient noise this twin excludes.
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn dirty filler");
-    wait_sleep_child_settled(sleeper.id());
-    let filler = sleeper.id();
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let filler = sleeper.pid();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(1), filler).unwrap());
@@ -67740,8 +67657,7 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     );
     assert!(engine.pressure_rotation_pending, "rotation continues");
     assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
+
 }
 
 /// Lane-A shield twin: the classifier alone would evict the parked head's
@@ -67758,13 +67674,10 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
     engine.scope = Scope::Pid(selected);
     // The cap filler is exploratory AND the parked head's own view: only the
     // shield stands between it and eviction.
-    let mut headpeer = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn head peer");
-    wait_sleep_child_settled(headpeer.id());
-    let head_pid = headpeer.id();
+    let headpeer = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(headpeer.pid());
+    let head_pid = headpeer.pid();
     assert!(head_pid != selected);
     engine
         .views
@@ -67839,8 +67752,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
         "the head re-parks"
     );
     assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
-    let _ = headpeer.kill();
-    let _ = headpeer.wait();
+
 }
 
 /// Lane-A P3, healthy twin: at a full view cap with no evictable view, an
@@ -76454,7 +76366,7 @@ struct CollectedFinishRetirementCase {
 impl CollectedFinishRetirementCase {
     fn new(fail_return: bool, leader_debt: bool) -> Self {
         let (child, mut engine, modules) = engine_with_one_accepted_provider();
-        let child = SystemScopeChildGuard::new(child);
+        let child = SystemScopeChildGuard::new(child.into_inner());
         engine.scope = Scope::System;
         let release =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -76927,7 +76839,7 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
 #[test]
 fn collected_finish_pending_graph_retains_actual_view_and_id() {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let mut child = SystemScopeChildGuard::new(child);
+    let mut child = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let admission = engine.views[0].view_admission();
@@ -77018,7 +76930,7 @@ struct CollectedFinishGraphCase {
 impl CollectedFinishGraphCase {
     fn new(fail_return: bool) -> Self {
         let (child, mut engine, _) = engine_with_one_accepted_provider();
-        let child = SystemScopeChildGuard::new(child);
+        let child = SystemScopeChildGuard::new(child.into_inner());
         engine.scope = Scope::System;
         let view = engine.views[0].id();
         let admission = engine.views[0].view_admission();
@@ -77198,7 +77110,7 @@ fn collected_session_requires_original_q() {
         .expect("a missing Q must be refused");
     assert_eq!(err.to_string(), "collected retirement needs the original Q");
     let (child, engine, _) = engine_with_one_accepted_provider();
-    let _guard = SystemScopeChildGuard::new(child);
+    let _guard = SystemScopeChildGuard::new(child.into_inner());
     let fixture = crate::attach::RetirementFixture::new_collected(
         &engine.plan.slots,
         &engine.pinned,
@@ -77521,14 +77433,14 @@ struct TwoViewProviderEngine {
 impl TwoViewProviderEngine {
     fn new() -> Self {
         let (child, mut engine, first) = engine_with_one_accepted_provider();
-        let first_guard = SystemScopeChildGuard::new(child);
-        let child = std::process::Command::new("sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        wait_sleep_child_settled(child.id());
-        let view = ProcessView::open(ProcessViewId(4), child.id()).unwrap();
+        let first_guard = SystemScopeChildGuard::new(child.into_inner());
+        let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+        wait_sleep_child_settled(child.pid());
+        let view = ProcessView::open(ProcessViewId(4), child.pid()).unwrap();
         let second = child_provider_modules(&view);
         engine.views.push(view);
         engine.next_view_id = 5;
@@ -77558,7 +77470,7 @@ impl TwoViewProviderEngine {
         assert!(engine.plan.modules_skipped.is_empty());
         Self {
             _first: first_guard,
-            _second: SystemScopeChildGuard::new(child),
+            _second: SystemScopeChildGuard::new(child.into_inner()),
             engine,
         }
     }
@@ -77909,7 +77821,7 @@ fn collected_graph_barrier_fences_records_and_assessments() {
     // First half: a live graph fences a queued record and a pending
     // assessment; both advance in original order after Done.
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let mut session = ScriptedSession::default();
@@ -78214,7 +78126,7 @@ fn collected_graph_native_error_is_contained() {
     // ticket comes from a real fixture preparation; the staged session has no
     // carrier, so the poll fails after the mutation was recorded.
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let mut fixture = crate::attach::RetirementFixture::new_collected(
         &engine.plan.slots,
@@ -78300,7 +78212,7 @@ fn collected_graph_native_error_is_contained() {
 #[test]
 fn collected_graph_exec_refresh_is_disposed_once() {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let mut session = ScriptedSession::default();
@@ -78374,7 +78286,7 @@ fn exec_refresh_outside_finish_still_requests_refresh() {
 #[test]
 fn collected_graph_rejection_only_requests_graph() {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let object = engine.plan.slots[0].object;
     let key = engine.pinned.summary(object).unwrap().key;
@@ -78408,7 +78320,7 @@ fn collected_graph_unready_intent_is_disposed_once_at_q() {
     // Ok(false): a live (unexited) named view is disposed once with the OD-7
     // count, and Finish drains afterwards.
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     assert_eq!(engine.views[0].original_exited(), Ok(false));
@@ -78539,7 +78451,7 @@ fn collected_graph_unready_intent_is_disposed_once_at_q() {
 #[test]
 fn collected_graph_empty_selection_finishes_without_copy() {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let revision = engine.pinned.revision();
     let publishes = engine.tail_publishes;
@@ -79233,7 +79145,7 @@ fn engine_with_ready_graph_intent() -> (
     ProcessViewId,
 ) {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let guard = SystemScopeChildGuard::new(child);
+    let guard = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let mut session = ScriptedSession::default();
@@ -79587,7 +79499,7 @@ fn assert_scanned_module_copy_is_exact(copy: &ScannedModule, source: &ScannedMod
 #[test]
 fn scanned_module_copy_is_exact() {
     let (child, engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     let mut source = engine.modules[0].scanned.clone();
     source
         .exports
@@ -80126,7 +80038,7 @@ fn collected_graph_wedged_native_poll_reaches_finite_incomplete_stop() {
     // disclosure. The bound is wall-time, not a poll count: a tight driver
     // spins thousands of polls while a healthy worker closes.
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let mut child = SystemScopeChildGuard::new(child);
+    let mut child = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let admission = engine.views[0].view_admission();
@@ -80382,7 +80294,7 @@ fn collected_graph_wedged_owed_cancel_reaches_finite_incomplete_stop() {
     // progress, and the cancel settles promptly to the existing untouched
     // incomplete stop with its existing disclosure and no trip.
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let mut child = SystemScopeChildGuard::new(child);
+    let mut child = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let admission = engine.views[0].view_admission();
@@ -80934,7 +80846,7 @@ fn collected_graph_retired_pin_file_stays_open_until_handoff_close() {
 #[test]
 fn collected_graph_reclaim_refusal_retains_and_finishes() {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let view = engine.views[0].id();
     let mut session = ScriptedSession::default();
@@ -81622,7 +81534,7 @@ fn collected_graph_singles_logical_retire_matches_multi_report() {
 #[test]
 fn slot_copy_is_exact() {
     let (child, engine, _) = engine_with_one_accepted_provider();
-    let _accepted = SystemScopeChildGuard::new(child);
+    let _accepted = SystemScopeChildGuard::new(child.into_inner());
     let mut source = engine.plan.slots[0].clone();
     source
         .names
@@ -82776,7 +82688,7 @@ fn facts_provider_pair(view: &ProcessView) -> Vec<ScannedModule> {
 /// The second provider is what pair 1 rejects while the first survives.
 fn facts_two_provider_engine() -> (SystemScopeChildGuard, Engine, Vec<ScannedModule>) {
     let (child, mut engine, _) = engine_with_one_accepted_provider();
-    let guard = SystemScopeChildGuard::new(child);
+    let guard = SystemScopeChildGuard::new(child.into_inner());
     engine.scope = Scope::System;
     let modules = facts_provider_pair(&engine.views[0]);
     let candidate = peer_candidate(&mut engine, &modules);
@@ -83546,13 +83458,10 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
     let selected = fixture.spawn_peer();
     wait_peer_mapped(selected, "seed-provider.so");
     engine.scope = Scope::Pid(selected);
-    let mut headpeer = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn head peer");
-    wait_sleep_child_settled(headpeer.id());
-    let head_pid = headpeer.id();
+    let headpeer = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(headpeer.pid());
+    let head_pid = headpeer.pid();
     assert!(head_pid != selected);
     engine
         .views
@@ -83665,8 +83574,8 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         engine.pressure_service_passes == 0,
         "no service pass runs under the terminal stop"
     );
-    headpeer.kill().unwrap();
-    headpeer.wait().unwrap();
+    headpeer.close();
+
 }
 
 /// The exact-address reader behind live publication, selection and
@@ -85710,13 +85619,10 @@ fn owned_run_under_cgroup_scope_arms_pid_consumer_for_direct_child() {
 #[test]
 fn owned_run_under_cgroup_scope_ignores_descendant_exec() {
     let owned = std::process::id();
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(sleeper.id());
-    let descendant = sleeper.id();
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
+    let descendant = sleeper.pid();
     let (mut engine, _scope) = engine_over_cgroup_naming(&[owned, descendant]);
     engine
         .views
@@ -85753,8 +85659,8 @@ fn owned_run_under_cgroup_scope_ignores_descendant_exec() {
     );
     assert_eq!(engine.extensive.stash_len_for_test(), 0);
     assert_eq!(engine.pid_descendant_gaps(), 0);
-    sleeper.kill().unwrap();
-    sleeper.wait().unwrap();
+    sleeper.close();
+
 }
 
 // 7.10b: a validated target EXEC under exact-PID scope classifies
@@ -85838,15 +85744,13 @@ fn pid_target_exec_ignores_execs_that_match_no_retained_view() {
 // possibly reused PID.
 #[test]
 fn pid_target_exec_ignores_execs_against_a_dead_view() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
-    child.kill().expect("kill sleeper");
-    child.wait().expect("reap sleeper");
+    child.close();
+
     assert!(!view.still_the_same());
     let mut engine = Engine::empty();
     engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
@@ -86983,16 +86887,13 @@ fn named_pid_scan_failure_after_exit_gaps_instead_of_aborting() {
     // and the failed scan records no `scan_unavailable` (it never
     // produced an unavailable outcome), so PARTIAL again comes from the
     // empty-discovery/slots causes.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(42), pid).unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     let args = CaptureArgs {
         track_short_lived: false,
         verbose: false,
@@ -87049,13 +86950,10 @@ fn named_pid_with_live_view_still_discovers() {
     // unchanged when the process exists). The target is a small `sleep`
     // fixture, never the test binary itself: an instrumented coverage
     // build exceeds the per-object byte cap and gaps as designed.
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(41), pid).unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
@@ -87087,8 +86985,8 @@ fn named_pid_with_live_view_still_discovers() {
     let scope = Scope::Pid(pid);
     let engine = Engine::discover(&args, &scope, Some(view)).expect("live pid discovers");
     assert!(engine.counters.object_skips.is_empty());
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 #[test]
@@ -91588,19 +91486,16 @@ fn late_holder_relief_preserves_protected_requests_and_bound() {
     );
     // View-bearing departed entry: a reaped pid whose retained view still
     // names it is protected by the view alone (no owner, no /proc).
-    let mut reaped = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .expect("spawn reaped peer");
-    wait_sleep_child_settled(reaped.id());
-    let reaped_pid = reaped.id();
+    let reaped = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(reaped.pid());
+    let reaped_pid = reaped.pid();
     engine
         .views
         .push(ProcessView::open(ProcessViewId(1), reaped_pid).unwrap());
     engine.next_view_id = 2;
-    reaped.kill().unwrap();
-    reaped.wait().unwrap();
+    reaped.close();
+
     assert!(
         !std::path::Path::new(&format!("/proc/{reaped_pid}")).exists(),
         "the reaped pid stays absent"
@@ -94443,14 +94338,12 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
     // Two real arms through the arming path file exactly one gap row
     // (mark dedupes): the refusal must surface from the arm, not from
     // a test that files the row itself.
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(1), sleeper.pid()).expect("sleeper view opens"));
     let mut session = ScriptedSession::default();
     let arms_before = engine.loader_arms;
     for _ in 0..2 {
@@ -94468,8 +94361,8 @@ fn loader_exhaustion_names_once_and_watch_still_stages() {
         arms_before + 2,
         "both arms ran through the arming path"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
     let exhaustion_rows = engine
         .counters
         .object_skips
@@ -94536,14 +94429,12 @@ fn loader_reserve_holds_contexts_for_the_owned_child() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn sleeper");
-    wait_sleep_child_settled(sleeper.id());
+    let sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(sleeper.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
+        .push(ProcessView::open(ProcessViewId(1), sleeper.pid()).expect("sleeper view opens"));
     let fill = |engine: &mut Engine, count: usize| {
         use crate::discovery::loader::LoaderContextSpec;
         for _ in 0..count {
@@ -94607,8 +94498,8 @@ fn loader_reserve_holds_contexts_for_the_owned_child() {
         engine.loader_reserve_refusal(ProcessViewId(1)).is_none(),
         "a non-tree scope draws to capacity"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
+
 }
 
 /// End to end through the real arm path: with 248 contexts spent, the
@@ -94629,21 +94520,17 @@ fn loader_reserve_refuses_member_arms_but_arms_the_child() {
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), me).expect("own view opens"));
-    let mut first_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn first sleeper");
-    wait_sleep_child_settled(first_sleeper.id());
+    let first_sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(first_sleeper.pid());
     engine
         .views
-        .push(ProcessView::open(ProcessViewId(1), first_sleeper.id()).expect("sleeper view opens"));
-    let mut second_sleeper = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawn second sleeper");
-    wait_sleep_child_settled(second_sleeper.id());
+        .push(ProcessView::open(ProcessViewId(1), first_sleeper.pid()).expect("sleeper view opens"));
+    let second_sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(second_sleeper.pid());
     engine.views.push(
-        ProcessView::open(ProcessViewId(2), second_sleeper.id()).expect("sleeper view opens"),
+        ProcessView::open(ProcessViewId(2), second_sleeper.pid()).expect("sleeper view opens"),
     );
     let mut session = ScriptedSession::default();
     // Bind one real context first: the fill below reuses its loader
@@ -94718,10 +94605,10 @@ fn loader_reserve_refuses_member_arms_but_arms_the_child() {
             .is_empty(),
         "the refused member bound no context"
     );
-    first_sleeper.kill().expect("kill first sleeper");
-    first_sleeper.wait().expect("reap first sleeper");
-    second_sleeper.kill().expect("kill second sleeper");
-    second_sleeper.wait().expect("reap second sleeper");
+    first_sleeper.close();
+
+    second_sleeper.close();
+
     let exhaustion_rows = engine
         .counters
         .object_skips
@@ -96801,7 +96688,7 @@ int main(int argc, char **argv) {
 /// unbound loader context and no arming gap.
 #[test]
 fn loader_arm_failure_on_a_group_in_final_exit_files_no_loader_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     engine.set_final_exit_for_test(view);
     engine.fail_next_loader_locate_for_test = true;
@@ -96812,8 +96699,8 @@ fn loader_arm_failure_on_a_group_in_final_exit_files_no_loader_gap() {
         &mut additions_allowed,
         &mut PendingViewRetirements::new(),
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     armed.expect("an ending group's arm returns");
     let aggregate = engine.loader_discovery();
     assert_eq!(
@@ -96837,7 +96724,7 @@ fn loader_arm_failure_on_a_group_in_final_exit_files_no_loader_gap() {
 /// arming gap with its unbound context.
 #[test]
 fn loader_arm_failure_on_a_live_group_still_files_the_loader_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.fail_next_loader_locate_for_test = true;
     let mut additions_allowed = true;
     let armed = engine.arm_loader_or_partial(
@@ -96846,8 +96733,8 @@ fn loader_arm_failure_on_a_live_group_still_files_the_loader_gap() {
         &mut additions_allowed,
         &mut PendingViewRetirements::new(),
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     armed.expect("a failed arm still returns");
     let aggregate = engine.loader_discovery();
     assert_eq!(aggregate.strategies.unavailable, 1);
@@ -96867,13 +96754,13 @@ fn loader_arm_failure_on_a_live_group_still_files_the_loader_gap() {
 /// with nothing to attach, and no gap is filed.
 #[test]
 fn export_attach_without_context_on_a_group_in_final_exit_files_no_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
     engine.set_final_exit_for_test(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(outcome, (false, true, false, false));
     assert!(
         !engine
@@ -96890,12 +96777,12 @@ fn export_attach_without_context_on_a_group_in_final_exit_files_no_gap() {
 /// attached context stays a disclosed export-hook gap.
 #[test]
 fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -97278,7 +97165,7 @@ fn deferred_rearm_mark_cleared_on_view_release() {
 /// refreshed live view or rejected retry waits behind it.
 #[test]
 fn queued_retirement_postpones_only_ending_cleanup_exactly() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     engine.pending_retirements.insert(view);
     assert!(
@@ -97308,8 +97195,8 @@ fn queued_retirement_postpones_only_ending_cleanup_exactly() {
         !engine.postpones_only_ending_cleanup(true, true),
         "a rejected retry is postponed work"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// A tick-quantum deferral postpones rescans with their requests kept:
@@ -97349,7 +97236,7 @@ fn quantum_deferral_records_stand_only_while_a_rescan_is_owed() {
 /// it stays a named loss.
 #[test]
 fn generation_change_on_a_group_in_final_exit_files_no_loss() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let subject = "live loader arming";
     let reason = "the process generation changed before the loader-arm postcheck";
@@ -97363,7 +97250,7 @@ fn generation_change_on_a_group_in_final_exit_files_no_loss() {
     };
     assert!(filed(&engine), "a live group's generation change is a loss");
 
-    let (mut ending_child, mut ending, _modules) = engine_with_one_accepted_provider();
+    let (ending_child, mut ending, _modules) = engine_with_one_accepted_provider();
     let ending_view = ending.views[0].id();
     ending.set_final_exit_for_test(ending_view);
     ending.mark_generation_change(ending_view, subject, reason);
@@ -97371,9 +97258,8 @@ fn generation_change_on_a_group_in_final_exit_files_no_loss() {
         !filed(&ending),
         "an ending group's generation change is its end"
     );
-    for child in [&mut child, &mut ending_child] {
-        child.kill().unwrap();
-        child.wait().unwrap();
+    for child in [child, ending_child] {
+        child.close();
     }
 }
 
@@ -97443,7 +97329,7 @@ fn arming_skips(engine: &Engine) -> Vec<&Skipped> {
 #[test]
 fn generation_change_retirement_on_an_ending_group_files_no_generation_loss() {
     for ending in [true, false] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         let view = engine.views[0].id();
         if ending {
             engine.set_final_exit_for_test(view);
@@ -97455,8 +97341,8 @@ fn generation_change_retirement_on_an_ending_group_files_no_generation_loss() {
             "live loader arming",
             "the process generation changed before the loader-arm postcheck",
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         let subjects: Vec<_> = arming_skips(&engine)
             .iter()
             .map(|skip| skip.subject.clone())
@@ -97486,14 +97372,14 @@ fn generation_change_retirement_on_an_ending_group_files_no_generation_loss() {
 #[test]
 fn loader_arm_gap_is_silent_only_for_an_ending_group() {
     for ending in [true, false] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         let view = engine.views[0].id();
         if ending {
             engine.set_final_exit_for_test(view);
         }
         let result = engine.loader_arm_gap(view, "the exact loader mapping could not be pinned");
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         if ending {
             assert!(matches!(result, Err(LoaderArmFailure::NotArmable)));
             assert!(arming_skips(&engine).is_empty());
@@ -97512,7 +97398,7 @@ fn loader_arm_gap_is_silent_only_for_an_ending_group() {
 #[test]
 fn loader_pin_skip_is_silent_only_for_an_ending_group() {
     for ending in [true, false] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         let view = engine.views[0].id();
         if ending {
             engine.set_final_exit_for_test(view);
@@ -97527,8 +97413,8 @@ fn loader_pin_skip_is_silent_only_for_an_ending_group() {
             &mut true,
             &mut PendingViewRetirements::new(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         let _ = armed;
         let injected = engine
             .counters
@@ -97551,7 +97437,7 @@ fn loader_pin_skip_is_silent_only_for_an_ending_group() {
 #[test]
 fn lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group() {
     for ending in [true, false] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         engine.scope = Scope::System;
         let view = engine.views[0].id();
         if ending {
@@ -97565,8 +97451,8 @@ fn lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group()
             &mut true,
             &mut PendingViewRetirements::new(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         armed.expect("an unnamed scope returns");
         let aggregate = engine.loader_discovery();
         assert_eq!(
@@ -97589,14 +97475,14 @@ fn lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group()
 #[test]
 fn export_generation_change_is_silent_only_for_an_ending_group() {
     for ending in [true, false] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         let view = engine.views[0].id();
         if ending {
             engine.set_final_exit_for_test(view);
         }
         engine.mark_export_generation_change(view);
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         let filed = engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live export hook"
                 && skip.reason
@@ -97611,15 +97497,12 @@ fn export_generation_change_is_silent_only_for_an_ending_group() {
 /// group live at scan start keeps them even when it exits mid-scan (`p2_*`).
 #[test]
 fn scan_refusal_on_a_group_ended_before_its_scan_files_no_gap() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(712), child.id()).unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(712), child.pid()).unwrap();
+    child.close();
+
     let mut counters = DiscoveryCounters::default();
     let result = scan_and_pin_with(
         &view,
@@ -97702,13 +97585,10 @@ fn scan_child_with_forced_ending(
     scan_skips: Vec<Skipped>,
     filing: crate::discovery::handle_table::Filing<'_>,
 ) -> DiscoveryCounters {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(713), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(713), child.pid()).unwrap();
     let mut module = child_provider_modules(&view)[0].clone();
     module.tables.clear();
     edit(&mut module);
@@ -97735,8 +97615,8 @@ fn scan_child_with_forced_ending(
         filing,
     );
     FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     result.expect("a live view scans and pins");
     counters
 }
@@ -97954,21 +97834,18 @@ fn mid_scan_exit_race_skips() -> Vec<Skipped> {
 #[test]
 fn mid_scan_exit_race_goes_silent_but_counted() {
     use crate::discovery::noise::DiscoveryNoiseClass;
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(714), pid).unwrap();
     assert!(view.still_the_same(), "the group is live at scan start");
     let counters = scan_view_with_outcome_skips(
         &view,
         mid_scan_exit_race_skips(),
         || {
-            child.kill().unwrap();
-            child.wait().unwrap();
+    child.close();
+
         },
         false,
     );
@@ -98014,13 +97891,10 @@ fn mid_scan_exit_race_goes_silent_but_counted() {
 #[test]
 fn mid_scan_exit_race_with_live_group_stays_loud() {
     use crate::discovery::noise::DiscoveryNoiseClass;
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let view = ProcessView::open(ProcessViewId(715), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let view = ProcessView::open(ProcessViewId(715), child.pid()).unwrap();
     assert!(view.still_the_same(), "the group is live at scan start");
     let counters = scan_view_with_outcome_skips(&view, mid_scan_exit_race_skips(), || {}, true);
     assert_eq!(
@@ -98048,8 +97922,8 @@ fn mid_scan_exit_race_with_live_group_stays_loud() {
         3,
         "loud races keep their class count"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// A reused pid stays a loud named skip even though the pin reads the
@@ -98110,13 +97984,10 @@ fn mid_scan_exit_race_with_reused_pid_stays_loud() {
 /// stay loud with their own reasons.
 #[test]
 fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(717), pid).unwrap();
     let reasons = vec![
         "memory scan refused: process generation changed during acquisition: proc acquisition crossed a process generation change"
@@ -98139,8 +98010,8 @@ fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
         &view,
         skips,
         || {
-            child.kill().unwrap();
-            child.wait().unwrap();
+    child.close();
+
         },
         false,
     );
@@ -98440,16 +98311,13 @@ fn mid_scan_exit_race_with_live_leader_and_member_stays_loud() {
 fn mid_scan_exit_proof_exhausted_budget_proves_nothing() {
     use crate::process::leader_exit::LeaderExitReadBudget;
 
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(721), pid).unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert_eq!(
         view.original_exited(),
         Ok(true),
@@ -98464,13 +98332,10 @@ fn mid_scan_exit_proof_exhausted_budget_proves_nothing() {
         "an exhausted budget never proves an exit, even a real one"
     );
 
-    let mut live = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(live.id());
-    let live_view = ProcessView::open(ProcessViewId(722), live.id()).unwrap();
+    let live = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(live.pid());
+    let live_view = ProcessView::open(ProcessViewId(722), live.pid()).unwrap();
     assert!(
         !live_view.final_exit_in_progress_within(&mut LeaderExitReadBudget::for_test(0)),
         "an exhausted budget reads unproven on a live group"
@@ -98479,8 +98344,8 @@ fn mid_scan_exit_proof_exhausted_budget_proves_nothing() {
         !mid_scan_exit_proven(&live_view),
         "no positive proof fires on a live group"
     );
-    live.kill().unwrap();
-    live.wait().unwrap();
+    live.close();
+
 }
 
 /// A group that was live at scan start but is an unreaped zombie by the
@@ -98495,20 +98360,17 @@ fn mid_scan_exit_race_with_unreaped_exit_goes_silent_but_counted() {
     use crate::discovery::noise::DiscoveryNoiseClass;
     use std::time::{Duration, Instant};
 
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(child.id());
-    let pid = child.id();
+    let mut child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+    wait_sleep_child_settled(child.pid());
+    let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(723), pid).unwrap();
     assert!(view.still_the_same(), "the group is live at scan start");
     let counters = scan_view_with_outcome_skips(
         &view,
         mid_scan_exit_race_skips(),
         || {
-            child.kill().unwrap();
+            child.inner_mut().kill().unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while !crate::process::process_is_zombie(pid) {
                 assert!(Instant::now() < deadline, "the victim did not reach Z");
@@ -98555,7 +98417,7 @@ fn mid_scan_exit_race_with_unreaped_exit_goes_silent_but_counted() {
         counters.ending_suppressed_skips, 0,
         "the mid-scan path silenced these, not the scan-start excuse"
     );
-    child.wait().unwrap();
+    child.inner_mut().wait().unwrap();
 }
 
 /// Defers view 0 of a fresh fixture with a zero quantum, then rescans it
@@ -98657,18 +98519,18 @@ fn ending_rescan_refused_by_deadline_keeps_a_counted_gap() {
 /// second, out of budget, keeps its counted generation loss.
 #[test]
 fn stale_batch_shares_one_final_exit_budget() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
-    let mut second = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(second.id());
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+    wait_sleep_child_settled(second.pid());
     let first = engine.views[0].id();
     let other = ProcessViewId(4);
     engine
         .views
-        .push(ProcessView::open(other, second.id()).unwrap());
+        .push(ProcessView::open(other, second.pid()).unwrap());
     engine.next_view_id = 5;
     engine.set_final_exit_for_test(first);
     engine.set_final_exit_for_test(other);
@@ -98678,9 +98540,8 @@ fn stale_batch_shares_one_final_exit_budget() {
         &mut pending,
         &mut crate::process::leader_exit::LeaderExitReadBudget::for_test(1),
     );
-    for c in [&mut child, &mut second] {
-        c.kill().unwrap();
-        c.wait().unwrap();
+    for c in [child, second] {
+        c.close();
     }
     assert_eq!(
         pending.get(&first).copied(),
@@ -98705,18 +98566,18 @@ fn stale_batch_shares_one_final_exit_budget() {
 /// group is proven and the second, out of budget, is postponed work.
 #[test]
 fn postponement_check_shares_one_final_exit_budget() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
-    let mut second = std::process::Command::new("sleep")
-        .arg("600")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    wait_sleep_child_settled(second.id());
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+
+
+
+    wait_sleep_child_settled(second.pid());
     let first = engine.views[0].id();
     let other = ProcessViewId(4);
     engine
         .views
-        .push(ProcessView::open(other, second.id()).unwrap());
+        .push(ProcessView::open(other, second.pid()).unwrap());
     engine.next_view_id = 5;
     engine.set_final_exit_for_test(first);
     engine.set_final_exit_for_test(other);
@@ -98738,9 +98599,8 @@ fn postponement_check_shares_one_final_exit_budget() {
         engine.postpones_only_ending_cleanup(true, true),
         "the production budget covers both"
     );
-    for c in [&mut child, &mut second] {
-        c.kill().unwrap();
-        c.wait().unwrap();
+    for c in [child, second] {
+        c.close();
     }
 }
 
@@ -98749,7 +98609,7 @@ fn postponement_check_shares_one_final_exit_budget() {
 /// the real enqueue site, not an internal helper line.
 #[test]
 fn queue_retirement_reports_the_real_enqueue_line() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let mut pending = PendingViewRetirements::new();
 
@@ -98769,8 +98629,8 @@ fn queue_retirement_reports_the_real_enqueue_line() {
     engine.queue_apply_outcome(&outcome, &mut pending);
     assert_eq!(engine.last_retirement_caller_line_for_test, Some(applied));
 
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
 }
 
 /// The pin-wait subject check carries weight: a map_files fallback
@@ -98807,7 +98667,7 @@ fn ending_loader_pin_skip_keeps_budget_stops_and_other_skips() {
         format!("mapping identity unavailable: {WORK_CEILING_REASON}"),
         "target path cannot be normalized; object was not pinned".to_string(),
     ] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         let view = engine.views[0].id();
         engine.set_final_exit_for_test(view);
         engine.inject_loader_pin_skip_for_test = Some(Skipped {
@@ -98820,8 +98680,8 @@ fn ending_loader_pin_skip_keeps_budget_stops_and_other_skips() {
             &mut true,
             &mut PendingViewRetirements::new(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
+
         let _ = armed;
         assert!(
             engine
@@ -98839,7 +98699,7 @@ fn ending_loader_pin_skip_keeps_budget_stops_and_other_skips() {
 /// stop stays a disclosed arming gap, through both loader-arm excuses.
 #[test]
 fn ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     engine.set_final_exit_for_test(view);
     engine.fail_next_loader_locate_for_test = true;
@@ -98860,8 +98720,8 @@ fn ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap() {
     );
 
     let result = engine.loader_arm_gap(view, WORK_CEILING_REASON);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
+
     assert!(matches!(result, Ok(false)));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -98877,13 +98737,10 @@ fn ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap() {
 #[test]
 fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
     for stop in [true, false] {
-        let mut child = std::process::Command::new("sleep")
-            .arg("600")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
-        wait_sleep_child_settled(child.id());
-        let view = ProcessView::open(ProcessViewId(714), child.id()).unwrap();
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+
+        wait_sleep_child_settled(child.pid());
+        let view = ProcessView::open(ProcessViewId(714), child.pid()).unwrap();
         let mut counters = DiscoveryCounters::default();
         let mut budget = CaptureWorkBudget::default();
         FORCE_ENDING_AT_SCAN_START.with(|force| force.set(true));
@@ -98915,8 +98772,8 @@ fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
             crate::discovery::handle_table::Filing::Untracked,
         );
         FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
-        child.kill().unwrap();
-        child.wait().unwrap();
+    child.close();
+
         result.expect("the scan returns");
         let kept = counters
             .object_skips

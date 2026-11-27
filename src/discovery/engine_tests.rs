@@ -8195,7 +8195,6 @@ fn admitted_pid_counts_match_views_after_admit_close_churn() {
         "recycled view id overwrite must drop the old pid count and raise the new one"
     );
     assert_mirrored(&engine, "recycle-id");
-
 }
 
 /// One drained leader exit for `pid` at `hook_ts` (unadmitted, so it
@@ -8793,7 +8792,6 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
     assert!(engine.pending_leader_exit_views.is_empty());
     assert_eq!(engine.task_uprobe_link_losses, 1);
     child.close();
-
 }
 
 #[test]
@@ -8903,7 +8901,6 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
         "a surviving group keeps its counted view"
     );
     child.close();
-
 }
 
 /// An engine whose leader-exit losses may be withdrawn: system scope, and
@@ -9013,7 +9010,6 @@ fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit
         .unwrap();
     child.close();
 
-
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 0);
@@ -9122,7 +9118,6 @@ fn terminal_drain_keeps_a_loss_whose_view_was_removed_while_live() {
     remove_view_like_retirement(&mut engine, ProcessViewId(69));
     child.close();
 
-
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
@@ -9208,7 +9203,6 @@ fn a_reused_id_keeps_each_process_judged_on_its_own_proof() {
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
     second.close();
-
 }
 
 /// Twin (V3/V4 release path): releasing a view ID clears both pin
@@ -9284,7 +9278,6 @@ fn pid_scope_never_withdraws_a_leader_exit_loss() {
     engine.scope = Scope::Pid(engine.views[0].pid());
     child.close();
 
-
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
@@ -9300,7 +9293,6 @@ fn a_pid_bound_session_under_system_scope_never_withdraws() {
     assert_eq!(engine.static_probes_process_wide, Some(false));
     child.close();
 
-
     engine.settle_terminal_drain();
 
     assert_eq!(engine.task_uprobe_link_losses, 1);
@@ -9312,7 +9304,6 @@ fn lost_discovery_records_never_let_a_leader_exit_loss_be_withdrawn() {
     let (mut engine, child, _) = counted_leader_exit_loss(76);
     engine.account_unvalidated_discovery(1);
     child.close();
-
 
     engine.settle_terminal_drain();
 
@@ -9364,7 +9355,6 @@ fn dropped_function_list_records_never_let_a_leader_exit_loss_be_withdrawn() {
             _ => engine.counter_snapshot.abi_refusals = 1,
         }
         child.close();
-
 
         engine.settle_terminal_drain();
 
@@ -11663,9 +11653,6 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     };
     let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
-
     wait_sleep_child_settled(child.pid());
     let view = ProcessView::open(ProcessViewId(18), child.pid()).unwrap();
     let hook_ts_ns = view.admitted_ns();
@@ -11704,9 +11691,6 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // `p11scope run` on every short-lived child.
     let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
-
     wait_sleep_child_settled(child.pid());
     let view = ProcessView::open(ProcessViewId(19), child.pid()).unwrap();
     let exec = record(DISCOVERY_KIND_EXEC, child.pid(), view.admitted_ns());
@@ -11736,9 +11720,6 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // positive evidence of change to record as loss. The deferral is marked
     // and the next pass re-checks.
     let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
-
-
-
 
     wait_sleep_child_settled(child.pid());
     let view = ProcessView::open(ProcessViewId(20), child.pid()).unwrap();
@@ -15225,7 +15206,6 @@ fn a_candidate_naming_only_live_views_marks_no_generation_gap() {
         engine.counters.noise.lines()
     );
     child.close();
-
 }
 
 /// v0.7.0 `--system` demo: a candidate that names a generation which
@@ -23782,8 +23762,7 @@ fn parked_sleep_close_on_reaped_child_fails_loud_without_hang() {
 /// the forgotten guard cleans nothing, and the receiver owns cleanup.
 #[test]
 fn parked_sleep_into_inner_transfers_custody_once() {
-    let guard =
-        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let guard = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
     let pid = guard.pid();
     let mut child = guard.into_inner();
     assert!(
@@ -24375,7 +24354,6 @@ fn view_owns_provider_pins_the_exploration_predicate() {
         "a module elsewhere owns nothing here"
     );
     sleeper.close();
-
 }
 
 /// The owned child's scheduled arm moves first: newcomer order that
@@ -24418,7 +24396,6 @@ fn owned_child_arm_priority_moves_the_scheduled_child_first() {
     assert_eq!(engine.owned_child_arm_priority(&ids, &mut unordered), None);
     assert_eq!(unordered, vec![1, 0]);
     sleeper.close();
-
 }
 
 /// Watch scans count memory-refused races per cause instead of marking
@@ -24674,7 +24651,6 @@ fn learn_owned_proofs_stages_a_scan_proven_file_once() {
         "the direct child's files need no learning"
     );
     sleeper.close();
-
 }
 
 /// Learning records whether the proving view was still retained: a
@@ -24756,7 +24732,6 @@ fn learn_owned_proofs_records_whether_the_proving_view_was_retained() {
         "a transient prover stages as transient"
     );
     sleeper.close();
-
 }
 
 /// Staging stages the proof's stored loader naming and resolves
@@ -24819,7 +24794,6 @@ fn learn_owned_proofs_stages_the_proofs_stored_loader_naming() {
         "the stored finite unknown travels with the proof"
     );
     sleeper.close();
-
 }
 
 /// E1 table harvest: a transient descendant's scan that decoded
@@ -25905,7 +25879,6 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
         engine.refresh_queue.keys().collect::<Vec<_>>(),
     );
     sleeper.close();
-
 }
 
 /// A still-live loader is named through the proving view's pidfd
@@ -25923,7 +25896,6 @@ fn owned_proof_loader_name_names_the_live_loader_through_its_pidfd() {
         "the live sleeper is named: {exe:?}"
     );
     sleeper.close();
-
 }
 
 /// Once the loader exits, the same proving view yields only the
@@ -34081,8 +34053,7 @@ fn pin_test_modules(view: &ProcessView, modules: &[ScannedModule]) -> PinnedObje
 /// accepted provider already attached in slot 0. The returned modules are
 /// `[accepted, peer]`; the peer is what a later candidate allocates.
 fn engine_with_one_accepted_provider() -> (ParkedSleep, Engine, Vec<ScannedModule>) {
-    let child =
-        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
     wait_sleep_child_settled(child.pid());
     let view = ProcessView::open(ProcessViewId(3), child.pid()).unwrap();
     let modules = child_provider_modules(&view);
@@ -35473,7 +35444,6 @@ fn a_history_preparation_failure_never_enters_the_link_mutation() {
     assert_eq!(engine.pinned.pinned().count(), pins);
     assert!(additions, "a pre-mutation refusal keeps the additions gate");
     child.close();
-
 }
 
 #[test]
@@ -38517,21 +38487,13 @@ fn loader_pin_reuse_does_not_carry_across_a_later_dirty_mutation() {
 fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     let first = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
     wait_sleep_child_settled(first.pid());
     let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
-
-
 
     wait_sleep_child_settled(second.pid());
     let waiting = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
     let fourth = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
-
-
 
     let (p1, p2, p3, p4) = (first.pid(), second.pid(), waiting.pid(), fourth.pid());
     assert!(p3 < p4, "spawn order pins pid order");
@@ -42137,11 +42099,11 @@ fn conservative_intent_survives_refusal_until_current_candidate_commits() {
 #[test]
 fn candidate_admission_keeps_exact_retained_and_local_stale_view_ids() {
     fn exited_view(id: ProcessViewId) -> ProcessView {
-    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+        let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
         wait_sleep_child_settled(child.pid());
         let view = ProcessView::open(id, child.pid()).unwrap();
-    child.close();
+        child.close();
 
         assert!(!view.still_the_same());
         view
@@ -44950,8 +44912,7 @@ fn parked_sleep_has_a_stable_full_census() {
 /// scan racing that exec is not what the U-11 ticks below are about; until
 /// its loader maps, an arm racing it sees a partial child.
 fn spawn_execed_sleep() -> ParkedSleep {
-    let child =
-        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
     wait_sleep_child_settled(child.pid());
     child
 }
@@ -45019,7 +44980,6 @@ fn refresh_releases_view_ids_when_the_target_preflight_refuses() {
     assert_eq!(engine.next_view_id, 1, "no tick mints a second ID");
 
     child.close();
-
 }
 
 /// U-11, the stale-generation exit. A process admitted this tick that ends
@@ -45397,7 +45357,6 @@ fn a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty() {
             engine.counters.object_skips
         );
         child.close();
-
     }
 }
 
@@ -45434,7 +45393,6 @@ fn a_conservative_replay_whose_detach_fails_before_mutation_closes_the_tick() {
     );
     assert!(!additions, "the failed detach closes the tick");
     child.close();
-
 }
 
 /// U-07. A tick whose additions are already closed (by its caller or by an
@@ -46855,7 +46813,6 @@ fn a_generation_lost_before_replacement_leaves_the_detached_targets_inactive() {
     );
     assert!(!additions, "the lost generation closes the tick");
     kept.close();
-
 }
 
 /// Replays one queued retirement through `replay_pending_conservative` on
@@ -46900,7 +46857,6 @@ fn a_refused_conservative_replay_closes_the_tick() {
         "the replay attached nothing"
     );
     child.close();
-
 }
 
 /// U-07 fix round 1 (Minor 3a). A replay whose candidate loses a generation
@@ -46977,7 +46933,6 @@ fn a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick() {
         "no link was touched"
     );
     child.close();
-
 }
 
 /// U-07 fix round 1 (Minor 3b). A replay whose conservative candidate cannot
@@ -47013,7 +46968,6 @@ fn a_conservative_replay_that_cannot_be_applied_closes_the_tick() {
         "no link was touched"
     );
     child.close();
-
 }
 
 #[test]
@@ -67552,7 +67506,6 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
         engine.discovery_truncated, 0,
         "zero loss: no refusal anywhere"
     );
-
 }
 
 /// Lane-A fail-closed twin: with no evictable view at a full cap, the
@@ -67657,7 +67610,6 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
     );
     assert!(engine.pressure_rotation_pending, "rotation continues");
     assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
-
 }
 
 /// Lane-A shield twin: the classifier alone would evict the parked head's
@@ -67752,7 +67704,6 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
         "the head re-parks"
     );
     assert_eq!(engine.discovery_truncated, 0, "ruled out is not refused");
-
 }
 
 /// Lane-A P3, healthy twin: at a full view cap with no evictable view, an
@@ -77436,9 +77387,6 @@ impl TwoViewProviderEngine {
         let first_guard = SystemScopeChildGuard::new(child.into_inner());
         let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
-
         wait_sleep_child_settled(child.pid());
         let view = ProcessView::open(ProcessViewId(4), child.pid()).unwrap();
         let second = child_provider_modules(&view);
@@ -83575,7 +83523,6 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         "no service pass runs under the terminal stop"
     );
     headpeer.close();
-
 }
 
 /// The exact-address reader behind live publication, selection and
@@ -85660,7 +85607,6 @@ fn owned_run_under_cgroup_scope_ignores_descendant_exec() {
     assert_eq!(engine.extensive.stash_len_for_test(), 0);
     assert_eq!(engine.pid_descendant_gaps(), 0);
     sleeper.close();
-
 }
 
 // 7.10b: a validated target EXEC under exact-PID scope classifies
@@ -86986,7 +86932,6 @@ fn named_pid_with_live_view_still_discovers() {
     let engine = Engine::discover(&args, &scope, Some(view)).expect("live pid discovers");
     assert!(engine.counters.object_skips.is_empty());
     child.close();
-
 }
 
 #[test]
@@ -94499,7 +94444,6 @@ fn loader_reserve_holds_contexts_for_the_owned_child() {
         "a non-tree scope draws to capacity"
     );
     sleeper.close();
-
 }
 
 /// End to end through the real arm path: with 248 contexts spent, the
@@ -94523,10 +94467,11 @@ fn loader_reserve_refuses_member_arms_but_arms_the_child() {
     let first_sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
     wait_sleep_child_settled(first_sleeper.pid());
-    engine
-        .views
-        .push(ProcessView::open(ProcessViewId(1), first_sleeper.pid()).expect("sleeper view opens"));
-    let second_sleeper = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    engine.views.push(
+        ProcessView::open(ProcessViewId(1), first_sleeper.pid()).expect("sleeper view opens"),
+    );
+    let second_sleeper =
+        ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
     wait_sleep_child_settled(second_sleeper.pid());
     engine.views.push(
@@ -97196,7 +97141,6 @@ fn queued_retirement_postpones_only_ending_cleanup_exactly() {
         "a rejected retry is postponed work"
     );
     child.close();
-
 }
 
 /// A tick-quantum deferral postpones rescans with their requests kept:
@@ -97844,8 +97788,7 @@ fn mid_scan_exit_race_goes_silent_but_counted() {
         &view,
         mid_scan_exit_race_skips(),
         || {
-    child.close();
-
+            child.close();
         },
         false,
     );
@@ -97923,7 +97866,6 @@ fn mid_scan_exit_race_with_live_group_stays_loud() {
         "loud races keep their class count"
     );
     child.close();
-
 }
 
 /// A reused pid stays a loud named skip even though the pin reads the
@@ -98010,8 +97952,7 @@ fn mid_scan_proven_exit_keeps_non_exit_refusals_loud() {
         &view,
         skips,
         || {
-    child.close();
-
+            child.close();
         },
         false,
     );
@@ -98345,7 +98286,6 @@ fn mid_scan_exit_proof_exhausted_budget_proves_nothing() {
         "no positive proof fires on a live group"
     );
     live.close();
-
 }
 
 /// A group that was live at scan start but is an unreaped zombie by the
@@ -98522,9 +98462,6 @@ fn stale_batch_shares_one_final_exit_budget() {
     let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-
-
-
     wait_sleep_child_settled(second.pid());
     let first = engine.views[0].id();
     let other = ProcessViewId(4);
@@ -98568,9 +98505,6 @@ fn stale_batch_shares_one_final_exit_budget() {
 fn postponement_check_shares_one_final_exit_budget() {
     let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let second = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
-
-
-
 
     wait_sleep_child_settled(second.pid());
     let first = engine.views[0].id();
@@ -98630,7 +98564,6 @@ fn queue_retirement_reports_the_real_enqueue_line() {
     assert_eq!(engine.last_retirement_caller_line_for_test, Some(applied));
 
     child.close();
-
 }
 
 /// The pin-wait subject check carries weight: a map_files fallback
@@ -98737,7 +98670,7 @@ fn ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap() {
 #[test]
 fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
     for stop in [true, false] {
-    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+        let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
         wait_sleep_child_settled(child.pid());
         let view = ProcessView::open(ProcessViewId(714), child.pid()).unwrap();
@@ -98772,7 +98705,7 @@ fn ending_scan_that_set_a_capture_stop_excuses_nothing() {
             crate::discovery::handle_table::Filing::Untracked,
         );
         FORCE_ENDING_AT_SCAN_START.with(|force| force.set(false));
-    child.close();
+        child.close();
 
         result.expect("the scan returns");
         let kept = counters

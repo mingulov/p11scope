@@ -98062,6 +98062,7 @@ fn member_stop_rejected_staging_key_refuses_the_hold() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: None,
         loader_unknown_reason: None,
+        loader_pid: None,
         run_learned: false,
         proving_retained: false,
     });
@@ -98147,6 +98148,7 @@ fn learned_staging_refusals_record_the_hold_refusal() {
         display_path: bogus.to_string_lossy().into_owned(),
         loader_exe: None,
         loader_unknown_reason: None,
+        loader_pid: None,
         run_learned: false,
         proving_retained: false,
     });
@@ -98179,6 +98181,7 @@ fn learned_staging_refusals_record_the_hold_refusal() {
             display_path: bogus.to_string_lossy().into_owned(),
             loader_exe: None,
             loader_unknown_reason: None,
+        loader_pid: None,
             run_learned: false,
             proving_retained: false,
         },
@@ -98247,6 +98250,7 @@ fn member_stop_bind_rejected_key_refuses_the_hold_without_a_commit() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(
         engine.pending_rejected_keys.contains(&staged_key),
@@ -98292,6 +98296,7 @@ fn member_stop_drain_first_staging_key_refuses_the_later_hold() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: None,
             loader_unknown_reason: None,
+        loader_pid: None,
             run_learned: false,
             proving_retained: false,
         },
@@ -98326,6 +98331,7 @@ fn member_stop_drain_first_staging_key_refuses_the_later_hold() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: None,
         loader_unknown_reason: None,
+        loader_pid: None,
         run_learned: false,
         proving_retained: false,
     });
@@ -98410,6 +98416,7 @@ fn member_stop_bind_entry_drop_keeps_the_hold_waiting() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(
         !engine.hold_refused_for_test((dev, ino)),

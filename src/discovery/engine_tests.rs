@@ -3038,6 +3038,53 @@ fn discovery_evidence_without_a_pin_for_a_planned_object_files_a_gap() {
     );
 }
 
+/// Projection fold: a learned note under the fd key attaches to its
+/// planned same-file scan row across the overlay split (first_loaded_by
+/// set), instead of missing the row by key.
+#[test]
+fn discovery_evidence_folds_a_split_learned_note_onto_its_row() {
+    let (engine, _, fd_key, _) = split_terminal_state();
+    let learned = BTreeMap::from([(fd_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1);
+    assert!(
+        evidence.modules[0].first_loaded_by.is_some(),
+        "the split note attaches to its same-file row"
+    );
+}
+
+/// No-data-loss twin: a note for a genuinely different file never
+/// attaches to the planned row.
+#[test]
+fn discovery_evidence_keeps_a_distinct_learned_note_off_the_row() {
+    use crate::discovery::identity::test_fixture::{INODE, overlay};
+    use p11scope_manifest::maps::ObjectKey;
+    let (engine, _, _, _) = split_terminal_state();
+    let other_fd_key = ObjectKey {
+        device: overlay(41).device,
+        inode: INODE + 1,
+    };
+    let learned = BTreeMap::from([(other_fd_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1);
+    assert!(
+        evidence.modules[0].first_loaded_by.is_none(),
+        "a foreign note never attaches to the row"
+    );
+}
+
 /// A planned slot whose object lost its pin drops from its module's
 /// objects with a gap, while the module row itself still renders.
 #[test]
@@ -93414,6 +93461,169 @@ fn learned_run_learned_prearmed_file_dedupes_by_identity_not_spelling() {
             .iter()
             .any(|skip| skip.name == "learned provider file"),
         "no spurious first-use gap for an already-prearmed file: {public:?}"
+    );
+}
+
+/// The runtime post-rekey split shape without merging: the scan pin
+/// files first, then the fd-keyed pre-arm pin files beside it. One
+/// planned scan module plus its projected row; the learned note under
+/// the fd key is the caller's to stage.
+fn split_terminal_state() -> (
+    Engine,
+    PinnedObjectId,
+    p11scope_manifest::maps::ObjectKey,
+    p11scope_manifest::maps::ObjectKey,
+) {
+    use crate::discovery::identity::test_fixture::{
+        PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+    };
+    let fd_key = overlay(41);
+    let maps_key = overlay(21);
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+    reback(&mut scan, &file);
+    let mut pins = PinnedObjects::empty();
+    assert!(pins.absorb(scan).is_empty());
+    let mut prearm = split_prearm_pin(fd_key, maps_key, SHA, 1);
+    reback(&mut prearm, &file);
+    assert!(pins.absorb(prearm).is_empty());
+    assert_eq!(pins.pinned().count(), 2, "the split files two objects");
+    let scan_id = pins
+        .pinned()
+        .find(|pin| pin.key == maps_key)
+        .expect("the scan object")
+        .id;
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = scan_id;
+    plan.modules[0].key = maps_key;
+    plan.modules[0].path = PATH.to_string();
+    engine.plan = plan;
+    (engine, scan_id, fd_key, maps_key)
+}
+
+fn split_live_row(maps_key: p11scope_manifest::maps::ObjectKey) -> render::DiscoveredModule {
+    use crate::discovery::identity::test_fixture::PATH;
+    render::DiscoveredModule {
+        id: plan::ModuleId(0),
+        admission_class: None,
+        dev: (maps_key.device.major, maps_key.device.minor),
+        ino: maps_key.inode,
+        sha256: None,
+        path: PATH.to_string(),
+        build_id: None,
+        layer: None,
+        objects: Vec::new(),
+        sources: vec!["scan", "prearm"],
+        corroborated: false,
+        corroboration: vec!["uncorroborated"],
+        tables: Vec::new(),
+        interfaces: 0,
+        skipped: Vec::new(),
+        watch: None,
+        attached_at_ns: None,
+        unobserved_windows: None,
+        coverage_retired_folded: None,
+        first_attached_at_ns: None,
+        first_attach_points: None,
+        first_loaded_by: None,
+    }
+}
+
+fn split_note() -> render::FirstLoadedBy {
+    render::FirstLoadedBy {
+        exe: Some("/usr/bin/pkcs11-tool".to_string()),
+        exe_unknown_reason: None,
+        pre_attach_loads: 1,
+    }
+}
+
+/// Terminal fold: a learned note under the fd key for the planned
+/// same-file scan object folds onto the live row (gaining
+/// first_loaded_by) instead of publishing a ghost prearm-only row.
+#[test]
+fn terminal_learned_note_folds_onto_the_planned_split_object() {
+    let (mut engine, _, fd_key, maps_key) = split_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one file stays one row: {:?}",
+        engine
+            .discovery
+            .modules
+            .iter()
+            .map(|m| &m.sources)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the fold keeps the loader note on the live row"
+    );
+}
+
+/// Terminal fold across a stale rendering: the live row still shows
+/// the fd-domain device (projected before the re-key) without the
+/// note — the fold lands by identity, not by the rendered numbers.
+#[test]
+fn terminal_learned_note_folds_onto_a_stale_rendered_row() {
+    let (mut engine, _, fd_key, _) = split_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(fd_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one file stays one row across the stale rendering"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the fold keeps the loader note on the live row"
+    );
+}
+
+/// No-data-loss twin: a note for a genuinely different file still
+/// publishes its own terminal row beside the planned object.
+#[test]
+fn terminal_learned_note_for_a_distinct_file_keeps_its_row() {
+    use crate::discovery::identity::test_fixture::{
+        INODE, SHA, backing_file, overlay, reback, split_prearm_pin,
+    };
+    use p11scope_manifest::maps::ObjectKey;
+    let (mut engine, _, _, maps_key) = split_terminal_state();
+    let dir = tempfile::tempdir().unwrap();
+    let other = backing_file(&dir, "other.so");
+    let other_inode = INODE + 1;
+    let other_fd_key = ObjectKey {
+        device: overlay(41).device,
+        inode: other_inode,
+    };
+    let other_maps_key = ObjectKey {
+        device: maps_key.device,
+        inode: other_inode,
+    };
+    let mut foreign = split_prearm_pin(other_fd_key, other_maps_key, SHA, 1);
+    reback(&mut foreign, &other);
+    assert!(engine.pinned.absorb(foreign).is_empty());
+    engine.learned_notes.insert(other_fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "a distinct file keeps its own row"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_none(),
+        "the live row gains no foreign note"
+    );
+    assert!(
+        engine.discovery.modules[1].first_loaded_by.is_some(),
+        "the distinct file's row carries its note"
     );
 }
 

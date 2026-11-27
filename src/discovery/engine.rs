@@ -11129,6 +11129,28 @@ fn discovery_evidence(
         })
     };
     let mut gaps: Vec<Skipped> = Vec::new();
+    // Fold split learned notes onto their same-file planned rows: a note
+    // the exact pin-key join below misses may still name a planned
+    // object across the proved pre-6.8 overlay split (fd-domain note
+    // key vs maps-domain plan key). Resolved once per projection;
+    // exact matches keep the fast path and never consult it. First
+    // resolution wins per object (BTreeMap order): two notes resolving
+    // to one object both name it, and the row carries one loader note.
+    let planned_ids: Vec<PinnedObjectId> = plan.modules.iter().map(|m| m.object).collect();
+    let exact_keys: BTreeSet<ObjectKey> = plan
+        .modules
+        .iter()
+        .filter_map(|m| pinned.summary(m.object).map(|pin| pin.key))
+        .collect();
+    let mut split_notes: BTreeMap<PinnedObjectId, render::FirstLoadedBy> = BTreeMap::new();
+    for (key, note) in learned {
+        if exact_keys.contains(key) {
+            continue;
+        }
+        if let Some(target) = pinned.resolve_split_note_target(*key, &planned_ids) {
+            split_notes.entry(target).or_insert_with(|| note.clone());
+        }
+    }
     let modules = plan
         .modules
         .iter()
@@ -11196,9 +11218,12 @@ fn discovery_evidence(
                 coverage_retired_folded: None,
                 first_attached_at_ns: None,
                 first_attach_points: None,
-                first_loaded_by: pinned
-                    .summary(m.object)
-                    .and_then(|pin| learned.get(&pin.key).cloned()),
+                first_loaded_by: pinned.summary(m.object).and_then(|pin| {
+                    learned
+                        .get(&pin.key)
+                        .cloned()
+                        .or_else(|| split_notes.get(&m.object).cloned())
+                }),
             })
         })
         .collect();
@@ -24917,6 +24942,12 @@ impl Engine {
             .iter()
             .filter_map(|module| self.pinned.summary(module.object).map(|pin| pin.key))
             .collect();
+        let planned_ids: Vec<PinnedObjectId> = self
+            .plan
+            .modules
+            .iter()
+            .map(|module| module.object)
+            .collect();
         let mut next_id = self
             .plan
             .modules
@@ -24940,6 +24971,36 @@ impl Engine {
             let Some(pin) = self.pinned.pinned().find(|pin| pin.key == *key) else {
                 continue;
             };
+            // Same-file fold across the proved overlay split: the note
+            // names a planned object the exact key joins miss (fd-domain
+            // note key vs maps-domain plan key), so it folds onto that
+            // row — forward-only, never clobbering an attached note —
+            // instead of publishing a ghost row for the same file. A
+            // planned-but-unprojected target still publishes: the file
+            // is otherwise unnamed, so the record is representation,
+            // not duplication.
+            if let Some(target) = self.pinned.resolve_split_note_target(*key, &planned_ids) {
+                let mut folded = false;
+                if let Some(module) = self
+                    .plan
+                    .modules
+                    .iter()
+                    .find(|module| module.object == target)
+                    && let Some(row) = self
+                        .discovery
+                        .modules
+                        .iter_mut()
+                        .find(|row| row.id == module.id)
+                {
+                    if row.first_loaded_by.is_none() {
+                        row.first_loaded_by = Some(note.clone());
+                    }
+                    folded = true;
+                }
+                if folded {
+                    continue;
+                }
+            }
             let (path, sha256, build_id) = (
                 pin.path.to_string(),
                 pin.sha256.to_string(),

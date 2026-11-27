@@ -10838,16 +10838,27 @@ impl JournalAdapter {
                     // faults stay counted and named. An in-bracket move,
                     // a regressed cell, a broken reader, or any
                     // independent loss still refuses below.
-                    if audit.fault_before != audit.fault_after
-                        || self
-                            .last_fault
-                            .is_some_and(|last| audit.fault_before != last)
-                    {
-                        self.audit_fault_absorbed_chain =
-                            self.audit_fault_absorbed_chain.saturating_add(1);
-                    } else {
-                        self.audit_fault_absorbed_reread =
-                            self.audit_fault_absorbed_reread.saturating_add(1);
+                    //
+                    // An absorb counts a DISTINCT fault move once: a seal
+                    // iteration that re-observes, through a pinned audit,
+                    // a moved cell equal to the already-absorbed
+                    // baseline absorbs again but counts nothing —
+                    // neither reread nor chain. Retried seals must not
+                    // inflate the count with the metering budget.
+                    let already_absorbed =
+                        self.last_fault.is_some_and(|last| last == epoch);
+                    if !already_absorbed {
+                        if audit.fault_before != audit.fault_after
+                            || self
+                                .last_fault
+                                .is_some_and(|last| audit.fault_before != last)
+                        {
+                            self.audit_fault_absorbed_chain =
+                                self.audit_fault_absorbed_chain.saturating_add(1);
+                        } else {
+                            self.audit_fault_absorbed_reread =
+                                self.audit_fault_absorbed_reread.saturating_add(1);
+                        }
                     }
                     let was_audit_failure = self.last_audit_failure;
                     self.last_audit_failure = Some(self.consumed_through);

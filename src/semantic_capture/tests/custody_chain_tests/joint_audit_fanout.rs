@@ -29075,6 +29075,72 @@ fn joint_commit_io_shares_capture_and_fresh_native_reads() {
     }
 }
 
+/// Absorb dedupe twin: one moved cell counts exactly one absorb no
+/// matter how many budgeted commit iterations re-observe it — at
+/// budget 1, 2 and unlimited alike. Retried seals absorb silently;
+/// the count must not depend on the metering budget.
+#[test]
+fn joint_commit_io_absorb_counts_distinct_move_once_per_budget() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use std::sync::atomic::Ordering;
+    for budget in [1usize, 2, usize::MAX] {
+        let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
+            1,
+            &["C_CreateObject", "C_SignInit"],
+            PublicationReceipts::All,
+        );
+        let h0 = fixture.scene.real.h0.clone();
+        let fault_cell = h0.0.borrow().io.script.fault_cell.clone();
+        let reads = Cell::new((0, 0));
+        let mut frame = Some(original);
+        // Move before the first seal: the frame-pinned audit predates it,
+        // so every iteration's seal re-observes the same move.
+        fault_cell.store(1, Ordering::SeqCst);
+        let mut published = false;
+        for _ in 0..256 {
+            let mut remaining = budget;
+            let CanonicalFanoutScene {
+                scene,
+                attached,
+                births,
+                ..
+            } = &mut fixture;
+            let progress = with_held_commit_io(&h0, attached, births, &reads, false, |io| {
+                scene.real.scene.coordinator.commit_joint_batch_with_io(
+                    io,
+                    &scene.producers,
+                    &mut frame,
+                    &mut remaining,
+                )
+            })
+            .expect("one disjoint borrow of the original H0 owner")
+            .expect("the real publication uses the same scoped readers");
+            if let JointCommitProgress::Published(_) = progress {
+                published = true;
+                break;
+            }
+        }
+        assert!(published, "budget {budget}: bounded commit must finish");
+        let diagnosis = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .joint_void_diagnosis();
+        assert_eq!(
+            (
+                diagnosis.audit_fault_absorbed_chain,
+                diagnosis.audit_fault_absorbed_reread,
+                diagnosis.void_audit
+            ),
+            (0, 1, 0),
+            "budget {budget}: one move counts one reread absorb, no void"
+        );
+    }
+}
+
 #[test]
 fn joint_commit_io_foreign_and_busy_reads_preserve_originals() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;

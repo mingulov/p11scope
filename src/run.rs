@@ -14846,6 +14846,425 @@ mod tests {
         assert!(result.is_err(), "unguarded install must panic");
     }
 
+    /// Static call-graph guard for the stop-install class: every
+    /// in-process caller of the installer — directly, through the
+    /// public `run_owned`/`capture` entry points, or through a
+    /// helper that reaches them — must textually hold
+    /// `ActualSignalTestGuard` between its `fn` line and the call.
+    /// The runtime assertion stays the backstop; this names a miss
+    /// with a file:line even when the cell is never curated or run.
+    /// Integration targets, examples and doctests link the normal
+    /// library where the assertion is compiled out, so only `src/`
+    /// is scanned. A bare `capture(` counts only in `run.rs`, and
+    /// a qualified one only for roots resolving to the installer
+    /// (other modules define their own helpers or methods of that
+    /// name). Limitations, kept explicit: block comments are not
+    /// stripped (no installer call sits in one), and `fn` detection
+    /// covers plain and simply-qualified definitions.
+    #[test]
+    fn installer_callers_hold_the_guard() {
+        // (file suffix, fn): callers that reach the installer
+        // without holding, each with its reason. Production fns run
+        // without the assertion in real builds; in test builds the
+        // calling test's hold covers them. Helpers run only under
+        // holding callers. Every entry must be hit below (no rot).
+        let production: &[(&str, &str)] = &[
+            ("src/run.rs", "run_owned"),
+            ("src/run.rs", "capture_with_host"),
+            ("src/run.rs", "capture"),
+            ("src/main.rs", "run"),
+        ];
+        let helpers: &[(&str, &str)] = &[
+            // Pause cells hold; the helpers only forward to run_owned.
+            ("src/discovery/pause.rs", "wrapper_profile_inner"),
+            ("src/discovery/pause.rs", "wrapper_profile"),
+            ("src/discovery/pause.rs", "wrapper_profile_prearmed"),
+            // Fork children inherit the holding thread's mark.
+            ("src/run.rs", "isolated_fidelity_observer"),
+            // Expects the panic; the assertion is the behavior.
+            ("src/run.rs", "installing_without_the_guard_panics"),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                .expect("src walk")
+                .map(|entry| entry.expect("src entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    let text = std::fs::read_to_string(&path).expect("src read");
+                    let rel = path
+                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .expect("src prefix")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    let code = strip_lines(&lines);
+                    sources.push((rel, lines, code));
+                }
+            }
+        }
+        assert!(!sources.is_empty(), "the src walk found files");
+        // Covered fns: (file index, fn name, fn start line, first
+        // covered call line). Seed: fns containing an installer
+        // call; then callers of allowlisted helpers (bounded
+        // fixpoint, depth 4).
+        let mut covered: Vec<(usize, String, usize, usize)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(usize, String)> =
+            std::collections::BTreeSet::new();
+        let mut seed_names: Vec<String> = Vec::new();
+        for (file, (_, lines, code_lines)) in sources.iter().enumerate() {
+            let bare_capture = sources[file].0 == "src/run.rs";
+            for (number, code) in code_lines.iter().enumerate() {
+                if is_fn_def(code) {
+                    continue;
+                }
+                // Joined with the next line so a call split across
+                // lines still reads as one; attributed to this line.
+                // A definition next door never joins (its own name
+                // must not leak into this line's match).
+                let joined;
+                let scan: &str = match code_lines.get(number + 1) {
+                    Some(next) if !is_fn_def(next) => {
+                        joined = format!("{code} {next}");
+                        &joined
+                    }
+                    _ => code,
+                };
+                if !is_installer_call(scan, &sources[file].0, bare_capture) {
+                    continue;
+                }
+                let Some((name, start)) = enclosing_fn(code_lines, number) else {
+                    panic!("{file} installer call outside a fn: {code}");
+                };
+                if seen.insert((file, name.clone())) {
+                    covered.push((file, name, start, number));
+                }
+            }
+        }
+        for name in helpers.iter().map(|(_, name)| name.to_string()) {
+            seed_names.push(name);
+        }
+        for _ in 0..4 {
+            let mut grown = false;
+            let helpers_now: Vec<String> = covered
+                .iter()
+                .filter(|(file, name, _, _)| {
+                    helpers.contains(&(sources[*file].0.as_str(), name.as_str()))
+                })
+                .map(|(_, name, _, _)| name.clone())
+                .chain(seed_names.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            seed_names.clear();
+            for helper in &helpers_now {
+                for (file, (_, lines, code_lines)) in sources.iter().enumerate() {
+                    for (number, code) in code_lines.iter().enumerate() {
+                        if is_fn_def(code) {
+                            continue;
+                        }
+                        let joined;
+                        let scan: &str = match code_lines.get(number + 1) {
+                            Some(next) if !is_fn_def(next) => {
+                                joined = format!("{code} {next}");
+                                &joined
+                            }
+                            _ => code,
+                        };
+                        if !is_name_call(scan, helper) {
+                            continue;
+                        }
+                        let Some((name, start)) = enclosing_fn(code_lines, number) else {
+                            continue;
+                        };
+                        if name == *helper || !seen.insert((file, name.clone())) {
+                            continue;
+                        }
+                        covered.push((file, name, start, number));
+                        grown = true;
+                    }
+                }
+            }
+            if !grown {
+                break;
+            }
+        }
+        let mut misses = Vec::new();
+        let mut hit_production = vec![false; production.len()];
+        let mut hit_helpers = vec![false; helpers.len()];
+        for (file, name, start, call) in covered.iter() {
+            let path = sources[*file].0.as_str();
+            if let Some(slot) = production
+                .iter()
+                .position(|(file, want)| *file == path && *want == name)
+            {
+                hit_production[slot] = true;
+                continue;
+            }
+            if let Some(slot) = helpers
+                .iter()
+                .position(|(file, want)| *file == path && *want == name)
+            {
+                hit_helpers[slot] = true;
+            }
+            let holds = sources[*file].2[*start..=*call]
+                .iter()
+                .any(|line| line.contains("ActualSignalTestGuard::hold()"));
+            if !holds && !helpers.iter().any(|(file, want)| *file == path && *want == name) {
+                misses.push(format!(
+                    "{}:{} fn {} calls the installer without the guard",
+                    path,
+                    *call + 1,
+                    name
+                ));
+            }
+        }
+        // Holders that never reach the installer are fine (exclusion
+        // holds); allowlist entries that nothing hits are rot.
+        for (slot, entry) in production.iter().enumerate() {
+            assert!(hit_production[slot], "stale production entry: {entry:?}");
+        }
+        for (slot, entry) in helpers.iter().enumerate() {
+            assert!(hit_helpers[slot], "stale helper entry: {entry:?}");
+        }
+        assert!(
+            misses.is_empty(),
+            "unguarded installer callers:\n{}",
+            misses.join("\n")
+        );
+    }
+
+    /// Lexer mode carried across lines: plain and raw strings
+    /// span line breaks, and their contents must not read as code.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StripMode {
+        Code,
+        Str,
+        RawStr(usize),
+    }
+
+    /// Strip line comments and string, raw-string and char literal
+    /// contents, so needles in text do not read as calls. State
+    /// carries across lines for multi-line literals.
+    fn strip_lines(lines: &[String]) -> Vec<String> {
+        let mut mode = StripMode::Code;
+        let mut escaped = false;
+        lines
+            .iter()
+            .map(|line| {
+                let chars: Vec<char> = line.chars().collect();
+                let mut out = String::new();
+                let mut index = 0;
+                while index < chars.len() {
+                    let char = chars[index];
+                    match mode {
+                        StripMode::Str => {
+                            if escaped {
+                                escaped = false;
+                            } else if char == '\\' {
+                                escaped = true;
+                            } else if char == '"' {
+                                mode = StripMode::Code;
+                            }
+                            index += 1;
+                        }
+                        StripMode::RawStr(hashes) => {
+                            if char == '"' {
+                                let mut found = 0;
+                                while index + 1 + found < chars.len()
+                                    && chars[index + 1 + found] == '#'
+                                {
+                                    found += 1;
+                                }
+                                if found == hashes {
+                                    mode = StripMode::Code;
+                                    index += 1 + found;
+                                    continue;
+                                }
+                            }
+                            index += 1;
+                        }
+                        StripMode::Code => {
+                            if char == '/'
+                                && index + 1 < chars.len()
+                                && chars[index + 1] == '/'
+                            {
+                                break;
+                            }
+                            if char == '"' {
+                                mode = StripMode::Str;
+                                index += 1;
+                                continue;
+                            }
+                            if char == 'r' {
+                                let mut end = index + 1;
+                                while end < chars.len() && chars[end] == '#' {
+                                    end += 1;
+                                }
+                                if end < chars.len() && chars[end] == '"' {
+                                    mode = StripMode::RawStr(end - index - 1);
+                                    index = end + 1;
+                                    continue;
+                                }
+                            }
+                            if char == '\'' {
+                                // A char literal ('x', an escape, or
+                                // '\'') is skipped whole; otherwise
+                                // this is a lifetime.
+                                let literal = index + 1 < chars.len()
+                                    && chars[index + 1] == '\\'
+                                    && index + 3 < chars.len()
+                                    && chars[index + 3] == '\'';
+                                let plain = index + 2 < chars.len()
+                                    && chars[index + 2] == '\'';
+                                if literal {
+                                    index += 4;
+                                    continue;
+                                }
+                                if plain {
+                                    index += 3;
+                                    continue;
+                                }
+                            }
+                            out.push(char);
+                            index += 1;
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// True for a call to the installer or one of the public entry
+    /// points that reaches it. Definitions, methods (`.name(`) and
+    /// associated functions (`Type::name(`) never match. A bare
+    /// `capture(` counts only when `bare_capture` holds (see the
+    /// test doc); a qualified `capture` counts only for the roots
+    /// that resolve to the installer.
+    fn is_installer_call(code: &str, file: &str, bare_capture: bool) -> bool {
+        is_entry_call(code, "install_stop_flag", file, true)
+            || is_entry_call(code, "run_owned", file, true)
+            || is_entry_call(code, "capture_with_host", file, true)
+            || is_entry_call(code, "capture", file, bare_capture)
+    }
+
+    /// True when `code` calls the free function or re-export `name`.
+    /// An unqualified call counts only when `bare` holds; a
+    /// path-qualified call counts for any lowercase root, except
+    /// `capture`, whose root must resolve to the installer
+    /// (`crate`/`run`, or `super` inside the `run` module tree).
+    fn is_entry_call(code: &str, name: &str, file: &str, bare: bool) -> bool {
+        for (index, _) in code.match_indices(name) {
+            let after = &code[index + name.len()..];
+            let paren = after.trim_start().strip_prefix('(').is_some();
+            if !paren {
+                continue;
+            }
+            let before: Vec<char> = code[..index].chars().collect();
+            let Some(prev) = before.last() else {
+                return bare;
+            };
+            let prev = *prev;
+            if prev == '.' || prev.is_alphanumeric() || prev == '_' {
+                continue;
+            }
+            if prev == ':' {
+                // A `path::name` call: allowed only for lowercase
+                // path roots (`crate::`, `run::`, ...); an uppercase
+                // root is an associated function, not the entry.
+                let mut root_end = before.len() - 1;
+                while root_end > 0 && before[root_end - 1] == ':' {
+                    root_end -= 1;
+                }
+                let mut root_start = root_end;
+                while root_start > 0
+                    && (before[root_start - 1].is_alphanumeric() || before[root_start - 1] == '_')
+                {
+                    root_start -= 1;
+                }
+                let root: String = before[root_start..root_end].iter().collect();
+                if root.chars().next().is_some_and(|char| char.is_uppercase()) {
+                    continue;
+                }
+                if name == "capture" && !capture_root_ok(&root, file) {
+                    continue;
+                }
+                return true;
+            }
+            return bare;
+        }
+        false
+    }
+
+    /// True when `code` calls the helper `name` (same non-method,
+    /// non-associated rule as entry points).
+    fn is_name_call(code: &str, name: &str) -> bool {
+        is_entry_call(code, name, "", true)
+    }
+
+    /// True when a `root::capture` path resolves to the installer:
+    /// the crate or `run` roots anywhere, or `super` inside the
+    /// `run` module tree (whose parent is `run` itself).
+    fn capture_root_ok(root: &str, file: &str) -> bool {
+        root == "crate"
+            || root == "run"
+            || (root == "super" && (file == "src/run.rs" || file.starts_with("src/run/")))
+    }
+
+    /// True for a `fn` definition line (plain or simply qualified).
+    fn is_fn_def(code: &str) -> bool {
+        fn_name(code).is_some()
+    }
+
+    /// The defined name on a `fn` definition line, if any.
+    fn fn_name(code: &str) -> Option<String> {
+        let mut rest = code.trim_start();
+        loop {
+            let next = rest
+                .strip_prefix("pub(crate)")
+                .or_else(|| rest.strip_prefix("pub(super)"))
+                .or_else(|| rest.strip_prefix("pub"))
+                .or_else(|| rest.strip_prefix("async"))
+                .or_else(|| rest.strip_prefix("unsafe"))
+                .or_else(|| rest.strip_prefix("const"));
+            let Some(stripped) = next else {
+                break;
+            };
+            rest = stripped.trim_start();
+        }
+        let body = rest.strip_prefix("fn ")?;
+        let name: String = body
+            .chars()
+            .take_while(|char| char.is_alphanumeric() || *char == '_')
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        let after = body[name.len()..].trim_start();
+        if !(after.starts_with('(') || after.starts_with('<')) {
+            return None;
+        }
+        Some(name)
+    }
+
+    /// The nearest enclosing `fn` at or above `line`, with its name
+    /// and start line. Takes stripped code lines.
+    fn enclosing_fn(code: &[String], line: usize) -> Option<(String, usize)> {
+        for (index, above) in code[..=line].iter().enumerate().rev() {
+            if let Some(name) = fn_name(above) {
+                return Some((name, index));
+            }
+        }
+        None
+    }
+
     /// CLI text: an all-clear newcomer-queue line stays off default
     /// stderr (statistics print under `-v` or
     /// `P11SCOPE_CAPTURE_DIAGNOSTICS=1`, per the documented stderr

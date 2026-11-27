@@ -98656,6 +98656,7 @@ fn member_stop_superseded_staging_key_refuses_the_hold() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(
         engine.pending_superseded_keys.contains(&staged_key),
@@ -98733,6 +98734,7 @@ fn member_stop_superseded_key_attaches_once_proven() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(
         engine.pending_superseded_keys.contains(&staged_key),
@@ -98805,6 +98807,7 @@ fn member_stop_superseded_attached_provider_with_queued_retry_never_refuses() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(engine.pending_superseded_keys.contains(&staged_key));
     engine.pause_owned_batch = false;
@@ -98822,6 +98825,7 @@ fn member_stop_superseded_attached_provider_with_queued_retry_never_refuses() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: None,
             loader_unknown_reason: Some("test"),
+            loader_pid: None,
             run_learned: false,
             proving_retained: false,
         });
@@ -98885,6 +98889,7 @@ fn member_stop_superseded_attached_provider_waits_for_another_provider() {
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
+        None,
     );
     assert!(engine.pending_superseded_keys.contains(&staged_key));
     engine.pause_owned_batch = false;
@@ -98972,6 +98977,7 @@ fn member_stop_retry_staged_rotation_keeps_stable_object() {
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
+            None,
         )
         .expect("the candidate builds");
     assert!(
@@ -99013,6 +99019,7 @@ fn member_stop_retry_staged_rotation_keeps_stable_object() {
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
+            None,
         )
         .expect("the candidate builds");
     assert!(
@@ -99173,6 +99180,7 @@ fn member_stop_committed_supersede_refuses_the_hold() {
         display_path: library.to_string_lossy().into_owned(),
         loader_exe: None,
         loader_unknown_reason: None,
+        loader_pid: None,
         run_learned: false,
         proving_retained: false,
     });
@@ -99490,6 +99498,7 @@ fn member_stop_trial_only_rejection_keeps_a_live_hold_attached() {
         &mut skipped,
         &std::collections::BTreeSet::new(),
         saved.clone(),
+        engine.pending_superseded_keys.clone(),
         &mut tick,
     );
     assert!(
@@ -99604,6 +99613,7 @@ fn member_stop_trial_mixed_newcomers_clear_trial_keys_before_rebuild() {
         &mut skipped,
         &std::collections::BTreeSet::new(),
         saved.clone(),
+        engine.pending_superseded_keys.clone(),
         &mut tick,
     );
     engine.fail_candidate_with_pid_after_bind_for_test = None;
@@ -99853,6 +99863,7 @@ fn member_stop_trial_entry_discards_first_build_pollution() {
         &mut skipped,
         &std::collections::BTreeSet::new(),
         saved.clone(),
+        std::collections::BTreeSet::new(),
         &mut tick,
     );
     assert!(
@@ -99953,6 +99964,7 @@ fn member_stop_trial_all_broken_discards_the_broken_trial_key() {
         &mut skipped,
         &std::collections::BTreeSet::new(),
         saved.clone(),
+        engine.pending_superseded_keys.clone(),
         &mut tick,
     );
     engine.fail_candidate_with_pid_after_bind_for_test = None;
@@ -100027,6 +100039,7 @@ fn member_stop_trial_all_broken_keeps_the_baseline_pending() {
         &mut skipped,
         &std::collections::BTreeSet::new(),
         saved.clone(),
+        engine.pending_superseded_keys.clone(),
         &mut tick,
     );
     engine.fail_candidate_with_pid_for_test = None;

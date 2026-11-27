@@ -14429,7 +14429,7 @@ mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, manifest_pin, mark_pre_copy_up,
         module, overlay, own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin,
-        prearm_pin, reback, repath_single_pin, view_pin,
+        reback, repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -21177,7 +21177,7 @@ mod tests {
         acc.raw_ownership
             .entry(view)
             .or_default()
-            .insert(kept_raw.clone());
+            .file_fresh(kept_raw.clone());
         acc.ownership.entry(view).or_default().pins.push(kept);
         acc.ownership
             .entry(view)
@@ -21312,7 +21312,7 @@ mod tests {
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(first).is_empty());
         let kept = acc.pinned().next().unwrap().id;
-        acc.alias_scanned_module_under(&module_a, view_a);
+        acc.alias_scanned_module_under_capped(&module_a, view_a, usize::MAX);
         let mut second = view_pin(&module_b, key.device.minor + 1, "aaaaaaaa", 2, false);
         reback(&mut second, &file);
         let kept_mapping = acc.by_id.values().next().unwrap().mapping;
@@ -21326,7 +21326,7 @@ mod tests {
         assert!(acc.by_id.contains_key(&kept), "the id is stable");
         assert_eq!(acc.raw_to_id.get(&raw_a), Some(&kept), "A's raw survives");
         assert_eq!(acc.raw_to_id.get(&raw_b), Some(&kept), "B's raw merges");
-        acc.alias_scanned_module_under(&module_b, view_b);
+        acc.alias_scanned_module_under_capped(&module_b, view_b, usize::MAX);
         assert!(
             acc.module_aliased_under(&module_a, view_a),
             "the long-lived view stays aliased"
@@ -21365,7 +21365,7 @@ mod tests {
             view_b,
         } = custody;
         // The newcomer view goes: only its raw is pruned.
-        let removed = acc.remove_view(view_b);
+        let removed = acc.retire_view_only_if_proven_gone(view_b, RetirementProof::Exited);
         assert!(removed.is_some(), "the newcomer view removal must execute");
         assert!(
             removed.unwrap().pins.contains(&kept),
@@ -21420,7 +21420,7 @@ mod tests {
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(first).is_empty());
         let kept = acc.pinned().next().unwrap().id;
-        acc.alias_scanned_module_under(&module_a, view_a);
+        acc.alias_scanned_module_under_capped(&module_a, view_a, usize::MAX);
         let mut second = view_pin(&module_b, key.device.minor + 1, "aaaaaaaa", 2, false);
         reback(&mut second, &file);
         let kept_mapping = acc.by_id.values().next().unwrap().mapping;
@@ -21431,8 +21431,8 @@ mod tests {
         assert!(!acc.rejects(key), "a touched file is not a collision");
         assert!(acc.supersedes(key), "the rotation is recorded");
         assert!(skipped.is_empty(), "{skipped:?}");
-        acc.alias_scanned_module_under(&module_b, view_b);
-        let removed = acc.remove_view(view_b);
+        acc.alias_scanned_module_under_capped(&module_b, view_b, usize::MAX);
+        let removed = acc.retire_view_only_if_proven_gone(view_b, RetirementProof::Exited);
         assert!(removed.is_some(), "the newcomer view removal must execute");
         assert!(
             acc.by_id.contains_key(&kept),
@@ -21470,7 +21470,7 @@ mod tests {
             view_a,
             view_b,
         } = custody;
-        let removed = acc.remove_view_except(view_b, &std::collections::BTreeSet::from([kept]));
+        let removed = acc.retire_view_except_proven(view_b, RetirementProof::Exited, &std::collections::BTreeSet::from([kept]));
         assert!(removed.is_some(), "the newcomer view removal must execute");
         assert!(
             acc.by_id.contains_key(&kept),
@@ -21512,7 +21512,7 @@ mod tests {
             view_b,
         } = custody;
         acc.drop_view_claims(view_a);
-        let removed = acc.remove_view(view_b);
+        let removed = acc.retire_view_only_if_proven_gone(view_b, RetirementProof::Exited);
         assert!(removed.is_some(), "the newcomer view removal must execute");
         assert!(
             !acc.by_id.contains_key(&kept),
@@ -21557,7 +21557,7 @@ mod tests {
             "the pre-arm alias files namespace-less"
         );
         acc.ownership.entry(view).or_default().pins.push(id);
-        let removed = acc.remove_view(view);
+        let removed = acc.retire_view_only_if_proven_gone(view, RetirementProof::Exited);
         assert!(removed.is_some(), "the retirement must execute");
         assert!(
             acc.by_id.contains_key(&id),
@@ -21595,7 +21595,7 @@ mod tests {
             "the manifest alias files namespace-less"
         );
         acc.ownership.entry(view).or_default().pins.push(id);
-        let removed = acc.remove_view(view);
+        let removed = acc.retire_view_only_if_proven_gone(view, RetirementProof::Exited);
         assert!(removed.is_some(), "the retirement must execute");
         assert!(
             acc.by_id.contains_key(&id),
@@ -21632,14 +21632,14 @@ mod tests {
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(pins).is_empty());
         let carried = acc.pinned().next().unwrap().id;
-        acc.alias_scanned_module_under(&module_v, view_v);
+        acc.alias_scanned_module_under_capped(&module_v, view_v, usize::MAX);
         acc.drop_view_claims(view_v);
         assert!(
             acc.view_claims(view_v).is_none(),
             "the carried view files no claims"
         );
         acc.ownership.entry(view_w).or_default();
-        let removed = acc.remove_view(view_w);
+        let removed = acc.retire_view_only_if_proven_gone(view_w, RetirementProof::Exited);
         assert!(removed.is_some(), "the retirement must execute");
         assert!(
             acc.by_id.contains_key(&carried),
@@ -21671,7 +21671,7 @@ mod tests {
         reback(&mut pins, &file);
         let mut acc = PinnedObjects::empty();
         assert!(acc.absorb(pins).is_empty());
-        acc.alias_scanned_module_under(&module_v, view);
+        acc.alias_scanned_module_under_capped(&module_v, view, usize::MAX);
         assert!(
             acc.view_claims(view).is_some(),
             "the fixture files claims before the drop"

@@ -127,6 +127,9 @@ def receipt_facts(receipt: Path, head: str, tree: str):
     value = facts.get("release_artifacts_sha256", "")
     if not re.fullmatch(r"[a-f0-9]{64}", value):
         raise ValueError("missing release artifact ledger digest")
+    clang = facts.get("clang_18_version", "")
+    if not clang or any(ord(char) < 32 for char in clang):
+        raise ValueError("missing or malformed clang compiler provenance fact")
     return facts
 
 
@@ -541,7 +544,7 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         "source": {"file": source_name, "sha256": digest(source_data), "format": "networked-source-export-v1"},
         "p11scope_features": list(OFFICIAL_P11SCOPE_FEATURES[capture_mode]),
         "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
-        "clang-18": facts.get("clang_18_version", "unrecorded"),
+        "clang-18": facts["clang_18_version"],
         "package_tools": package_tool_versions(),
         "scope": OFFICIAL_SCOPE[capture_mode],
     }

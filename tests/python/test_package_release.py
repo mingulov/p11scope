@@ -90,6 +90,7 @@ class PackageReleaseTests(unittest.TestCase):
             f"release_artifacts_sha256\t{digest(self.ledger.read_bytes())}\n"
             "checker_status\t0\nterminal_status\t0\n"
             "capture_mode\tfull\n"
+            "clang_18_version\tUbuntu clang version 18.1.8 (fixture)\n"
             "cwd\t/private/host/path\nsecret\tPRIVATE-CAPTURE-CANARY\n"
         )
         (self.receipt / "facts.log").write_text(self.facts)
@@ -422,7 +423,9 @@ class PackageReleaseTests(unittest.TestCase):
 
     def test_release_records_packaging_tool_versions(self):
         clang = "Ubuntu clang version 18.1.3 (1ubuntu1)"
-        (self.receipt / "facts.log").write_text(self.facts + f"clang_18_version\t{clang}\n")
+        (self.receipt / "facts.log").write_text(self.facts.replace(
+            "clang_18_version\tUbuntu clang version 18.1.8 (fixture)",
+            f"clang_18_version\t{clang}"))
         self.package()
         release = json.loads((self.output / "RELEASE.json").read_bytes())
         # The receipt's clang fact flows through verbatim: a rebuild
@@ -434,6 +437,29 @@ class PackageReleaseTests(unittest.TestCase):
             self.assertTrue(value and value == value.strip()
                             and all(ord(char) >= 32 for char in value),
                             f"packaging tool version must be one clean line: {name}")
+
+    def test_missing_clang_provenance_refuses_packaging(self):
+        lines = [line for line in self.facts.splitlines()
+                 if not line.startswith("clang_18_version\t")]
+        (self.receipt / "facts.log").write_text("\n".join(lines) + "\n")
+        self.refused("missing or malformed clang compiler provenance fact")
+
+    def test_empty_clang_provenance_refuses_packaging(self):
+        (self.receipt / "facts.log").write_text(self.facts.replace(
+            "clang_18_version\tUbuntu clang version 18.1.8 (fixture)",
+            "clang_18_version\t"))
+        self.refused("missing or malformed clang compiler provenance fact")
+
+    def test_control_char_clang_provenance_refuses_packaging(self):
+        (self.receipt / "facts.log").write_text(self.facts.replace(
+            "clang_18_version\tUbuntu clang version 18.1.8 (fixture)",
+            "clang_18_version\tUbuntu\x01clang"))
+        self.refused("missing or malformed clang compiler provenance fact")
+
+    def test_duplicate_clang_provenance_refuses_packaging(self):
+        (self.receipt / "facts.log").write_text(
+            self.facts + "clang_18_version\tUbuntu clang version 18.1.8 (other)\n")
+        self.refused("malformed or duplicate receipt fact")
 
     def test_default_provenance_is_full_capture(self):
         result = self.package()

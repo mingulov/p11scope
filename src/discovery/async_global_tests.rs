@@ -23,8 +23,10 @@ impl Case {
 
     fn with_close_failure(fail_return: bool) -> Self {
         let (child, mut engine, modules) = engine_with_one_accepted_provider();
-        // Explicit custody transfer: `Case::drop` below owns kill+wait.
-        let child = child.into_inner();
+        // The ParkedSleep stays intact through all fallible fixture
+        // setup below; the transfer happens inside the `Self`
+        // construction in one expression, so no panic can intervene
+        // before `Case::drop` owns kill+wait.
         engine.scope = Scope::System;
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let gate = Arc::clone(&release);
@@ -57,7 +59,7 @@ impl Case {
         let mut session = ScriptedSession::default();
         session.global_retirement = Some(RefCell::new(fixture));
         Self {
-            child,
+            child: child.into_inner(),
             engine,
             session,
             modules,

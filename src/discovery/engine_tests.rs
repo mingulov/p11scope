@@ -23323,18 +23323,34 @@ fn kill_sh_sleep_grandchildren(grandchildren: &[i32]) {
     }
 }
 
+/// The construction-time recorded set, filtered to pids that still are
+/// the same process (start time matches): a reused pid shows a
+/// different start (or no start) and is skipped, never signalled.
+/// Fresh lists skip this check (listed microseconds ago, same
+/// no-reuse argument); records may be minutes old.
+fn verified_recorded_sh_sleep_grandchildren(recorded: &[(i32, u64)]) -> Vec<i32> {
+    recorded
+        .iter()
+        .filter(|(pid, start)| {
+            crate::process::process_start_time(*pid as u32).is_ok_and(|now| now == *start)
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
 /// An `sh -c "sleep 600"` fixture member that reaps its whole tree.
 /// Spawning returns only after the sleep grandchild exists (so the shell
 /// is exec'd and settled, and pre-scan maps reads are stable); `close`
 /// SIGKILLs shell and grandchild and verifies both gone, loudly; `Drop`
 /// repeats best-effort so a mid-test panic cannot strand a 600 s
 /// orphan visible to system-wide enumerations. The grandchild set is
-/// recorded at construction: if the fresh list is ever unreadable,
-/// `Drop` still kills the recorded set instead of stranding it.
+/// recorded at construction with start times: both `close` and `Drop`
+/// kill the union of the fresh list and the verified record, because a
+/// zombie shell lists empty while its reparented sleep lives on.
 struct ShWrappedSleep {
     pid: u32,
     child: Option<std::process::Child>,
-    grandchildren: Vec<i32>,
+    grandchildren: Vec<(i32, u64)>,
 }
 
 impl ShWrappedSleep {
@@ -23377,8 +23393,18 @@ impl ShWrappedSleep {
     /// constructed guard because `Drop` owns cleanup on unwind.
     fn prove_tree(&mut self) {
         let observed = wait_sh_wrapped_sleep_spawned(self.pid);
-        self.grandchildren = parse_sh_children_list(&observed, self.pid)
+        let grands = parse_sh_children_list(&observed, self.pid)
             .expect("ShWrappedSleep prove records its grandchild");
+        // Stamp each recorded pid: the union kill below verifies
+        // identity before signalling, so a recycled pid is skipped.
+        self.grandchildren = grands
+            .into_iter()
+            .map(|pid| {
+                let start = crate::process::process_start_time(pid as u32)
+                    .expect("ShWrappedSleep prove stamps its grandchild");
+                (pid, start)
+            })
+            .collect();
     }
 
     /// Wrap an arbitrary child for error-path tests: no recorded
@@ -23408,12 +23434,16 @@ impl ShWrappedSleep {
             .kill()
             .expect("kill wrapped shell");
         kill_sh_sleep_grandchildren(&grandchildren);
+        // Union with the verified record: a zombie shell lists empty
+        // while its reparented sleep lives on.
+        let recorded = verified_recorded_sh_sleep_grandchildren(&self.grandchildren);
+        kill_sh_sleep_grandchildren(&recorded);
         let mut child = self.child.take().expect("ShWrappedSleep closed twice");
         child.wait().expect("reap wrapped shell");
         // SIGKILL lands asynchronously and init reaps on its own
         // schedule: poll for disappearance, then fail loudly on a
         // survivor (never silently orphan it).
-        for pid in grandchildren {
+        for pid in grandchildren.into_iter().chain(recorded) {
             let mut gone = false;
             for _ in 0..500 {
                 if crate::process::process_proven_exited(pid as u32) {
@@ -23433,17 +23463,17 @@ impl ShWrappedSleep {
 impl Drop for ShWrappedSleep {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
+            // Union of the fresh list and the verified record: a zombie
+            // shell lists successfully but empty while its reparented
+            // sleep lives on, so the fresh list alone strands it.
+            let recorded = verified_recorded_sh_sleep_grandchildren(&self.grandchildren);
             match sh_wrapped_sleep_grandchildren(self.pid) {
                 Ok(grandchildren) => kill_sh_sleep_grandchildren(&grandchildren),
-                // Unlistable (the shell died unexpectedly): fall back to
-                // the set recorded at construction. Reuse cannot
-                // intervene — a `sleep 600` that never exited still holds
-                // its pid — so this never silently strands.
                 Err(reason) => {
                     eprintln!("ShWrappedSleep drop cannot list grandchildren: {reason}");
-                    kill_sh_sleep_grandchildren(&self.grandchildren);
                 }
             }
+            kill_sh_sleep_grandchildren(&recorded);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -23526,10 +23556,40 @@ fn sh_wrapped_sleep_close_fails_closed_on_unreadable_children() {
     );
 }
 
+/// The recorded-set filter keeps live same-start pids and skips
+/// everything else: unknown pids, wrong starts, and unborn maxima
+/// never reach a signal.
+#[test]
+fn sh_wrapped_sleep_recorded_filter_verifies_identity() {
+    let mut live = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn identity probe");
+    let pid = live.id() as i32;
+    let start = crate::process::process_start_time(pid as u32).expect("probe has a start time");
+    assert_eq!(
+        verified_recorded_sh_sleep_grandchildren(&[(pid, start)]),
+        vec![pid],
+        "a live same-start pid is kept"
+    );
+    assert_eq!(
+        verified_recorded_sh_sleep_grandchildren(&[(pid, start.wrapping_add(1))]),
+        Vec::<i32>::new(),
+        "a wrong start time is skipped, never signalled"
+    );
+    assert_eq!(
+        verified_recorded_sh_sleep_grandchildren(&[(i32::MAX, 0)]),
+        Vec::<i32>::new(),
+        "an unborn pid is skipped"
+    );
+    live.kill().expect("kill identity probe");
+    live.wait().expect("reap identity probe");
+}
+
 /// `Drop` on an unlistable shell neither panics nor strands: it runs
 /// the recorded-set fallback and reaps the shell. The `i32::MAX`
-/// record is deterministically unkillable (ESRCH), so the fallback
-/// line executes with no observable side effect.
+/// record fails verification, so the union line executes with no
+/// observable side effect.
 #[test]
 fn sh_wrapped_sleep_drop_covers_an_unlistable_shell() {
     let sleeper = std::process::Command::new("sleep")
@@ -23539,12 +23599,80 @@ fn sh_wrapped_sleep_drop_covers_an_unlistable_shell() {
     let pid = sleeper.id();
     let mut guard = ShWrappedSleep::from_child_for_test(sleeper);
     guard.pid = u32::MAX;
-    guard.grandchildren = vec![i32::MAX];
+    guard.grandchildren = vec![(i32::MAX, 0)];
     drop(guard);
     assert!(
         crate::process::process_proven_exited(pid),
         "drop still reaps an unlistable shell"
     );
+}
+
+/// Wait until `pid` is a zombie (bounded, loud): the caller killed
+/// without reaping and needs the zombie shape proven, not assumed.
+fn wait_for_zombie_state(pid: u32) {
+    for _ in 0..500 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if stat.split_whitespace().nth(2) == Some("Z") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("pid {pid} never became a zombie");
+}
+
+/// Poll until `pid` is gone (bounded, loud): SIGKILL and init's reap
+/// land asynchronously.
+fn wait_for_pid_gone(pid: u32, what: &str) {
+    for _ in 0..500 {
+        if crate::process::process_proven_exited(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("pid {pid} ({what}) never disappeared");
+}
+
+/// Dead-shell twin (`Drop`): kill only the shell without reaping it.
+/// Its `children` stays readable-but-empty while the reparented sleep
+/// lives, so only the verified-recorded union kills the grandchild.
+#[test]
+fn sh_wrapped_sleep_drop_kills_recorded_sleep_of_zombie_shell() {
+    let guard = ShWrappedSleep::spawn();
+    let shell = guard.pid;
+    assert_eq!(
+        guard.grandchildren.len(),
+        1,
+        "construction records exactly the one sleep grandchild"
+    );
+    let (grand, _) = guard.grandchildren[0];
+    // SAFETY: SIGKILL to our own live shell; the guard still owns it.
+    unsafe {
+        libc::kill(shell as libc::pid_t, libc::SIGKILL);
+    }
+    wait_for_zombie_state(shell);
+    assert_eq!(
+        sh_wrapped_sleep_grandchildren(shell),
+        Ok(Vec::new()),
+        "a zombie shell lists readable-but-empty"
+    );
+    drop(guard);
+    wait_for_pid_gone(grand as u32, "recorded sleep grandchild");
+}
+
+/// Dead-shell twin (`close`): same zombie-shell shape through the
+/// loud path — the union kill plus the disappearance proof.
+#[test]
+fn sh_wrapped_sleep_close_kills_recorded_sleep_of_zombie_shell() {
+    let guard = ShWrappedSleep::spawn();
+    let shell = guard.pid;
+    let (grand, _) = guard.grandchildren[0];
+    // SAFETY: SIGKILL to our own live shell; the guard still owns it.
+    unsafe {
+        libc::kill(shell as libc::pid_t, libc::SIGKILL);
+    }
+    wait_for_zombie_state(shell);
+    guard.close();
+    wait_for_pid_gone(grand as u32, "recorded sleep grandchild");
 }
 
 /// Error-path twin: a tree-proof failure on a constructed guard still

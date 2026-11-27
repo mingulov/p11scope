@@ -1983,8 +1983,9 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 }
 
 /// Arming-exhaustion run: 280 sleepers in 14 waves of 20, started 3 s
-/// apart and each living 50 s, so all of them are live together once the
-/// last wave starts; then 32 sequential SoftHSM grandchildren (each 1
+/// apart and living until a common death once the last wave's 50 s end,
+/// so all of them are live together from the last start to the run's end;
+/// then 32 sequential SoftHSM grandchildren (each 1
 /// iteration, 150 ms linger) with NO prearm hint — all under `--pause
 /// never`. Every owned member arms a loader context (E1, even
 /// provider-free sleepers). Loader slots are recycled once their member
@@ -2012,7 +2013,16 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     const SLEEPER_WAVES: u32 = 14;
     const SLEEPERS_PER_WAVE: u32 = 20;
     const WAVE_GAP_SECS: u32 = 3;
-    const SLEEPER_LIFE_SECS: u32 = 50;
+    // Every wave dies with the last one (spawned ~3k s in, living
+    // LAST_DEATH_SECS - 3k s): no member exits before the run's end, so
+    // live loader contexts grow monotonically with completed arms and the
+    // 248 line is hit iff 248 arms complete before the wait. Arm lag then
+    // delays the crossing instead of losing it to mid-run deaths (a
+    // loaded host arms too slowly for 50 s uniform lives: the line is
+    // touched in one narrow window before the provider phase, and any
+    // lag pushes the climb past it). The run still ends when the last
+    // wave dies, so its length is unchanged.
+    const LAST_DEATH_SECS: u32 = 89;
     const PROVIDER_WORKERS: u32 = 32;
     let dir = tempfile::tempdir().expect("cell dir");
     let module = softhsm_path();
@@ -2026,15 +2036,17 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     // observer has scanned and armed it, so the per-member scan must stay
     // cheap: the cell's own sleeper maps only libc and ld.so (the system
     // `sleep` may be a multicall binary mapping a dozen libraries). Waves
-    // start 3 s apart (admission keeps up with 20 per gap) and live 50 s,
-    // so every wave is still live when the last one starts; the provider
-    // phase runs inside that window, and the run then waits for the
-    // sleepers so no member outlives the command. The whole run stays
-    // inside this file's 120 s harness bound.
+    // start 3 s apart (admission keeps up with 20 per gap) and live until
+    // the common death at LAST_DEATH_SECS, so every wave is still live
+    // when the last one starts AND none exits mid-run; the provider phase
+    // runs inside that window, and the run then waits for the sleepers so
+    // no member outlives the command. The whole run stays inside this
+    // file's 120 s harness bound.
     let sleeper = build_c(dir.path(), "rt-sleeper", SLEEPER_C);
-    for _ in 0..SLEEPER_WAVES {
+    for wave in 0..SLEEPER_WAVES {
+        let life = LAST_DEATH_SECS - wave * WAVE_GAP_SECS;
         for _ in 0..SLEEPERS_PER_WAVE {
-            script.push_str(&format!("{} {SLEEPER_LIFE_SECS} & ", sleeper.display()));
+            script.push_str(&format!("{} {life} & ", sleeper.display()));
         }
         script.push_str(&format!("sleep {WAVE_GAP_SECS}; "));
     }

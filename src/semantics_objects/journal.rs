@@ -10895,8 +10895,7 @@ impl JournalAdapter {
                     // baseline absorbs again but counts nothing —
                     // neither reread nor chain. Retried seals must not
                     // inflate the count with the metering budget.
-                    let already_absorbed =
-                        self.last_fault.is_some_and(|last| last == epoch);
+                    let already_absorbed = self.last_fault.is_some_and(|last| last == epoch);
                     if !already_absorbed {
                         if audit.fault_before != audit.fault_after
                             || self

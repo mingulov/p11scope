@@ -2545,14 +2545,7 @@ impl IngestedJointQuantum {
                 pools.steps(),
             ));
         }
-        Ok(self.settle_outcome(
-            ports,
-            index,
-            outcome,
-            storage,
-            bytes,
-            pools.steps(),
-        ))
+        Ok(self.settle_outcome(ports, index, outcome, storage, bytes, pools.steps()))
     }
 
     /// Settle one selected seal outcome (filled): a broad failure

@@ -3513,8 +3513,8 @@ impl LiveJointMachine {
                 // before collection. Unchanged inputs keep skipping.
                 let cur_revision = coordinator.semantic_absence_revision();
                 let cur_required = lane.subset().required().len();
-                let inputs_moved = cur_revision != self.absence_revision
-                    || cur_required != self.absence_required;
+                let inputs_moved =
+                    cur_revision != self.absence_revision || cur_required != self.absence_required;
                 if inputs_moved {
                     self.absence_done = false;
                     self.absence_binding = 0;
@@ -3533,8 +3533,7 @@ impl LiveJointMachine {
                 // skips new inputs: when the revision or required set
                 // moved (an admission during the drain), the rescan
                 // runs before any collection.
-                let skip_absence =
-                    std::mem::take(&mut self.skip_absence_once) && !inputs_moved;
+                let skip_absence = std::mem::take(&mut self.skip_absence_once) && !inputs_moved;
                 // An Idle episode whose absence scan already completed
                 // skips the re-scan and runs the void every poll.
                 let scan_open =

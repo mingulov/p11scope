@@ -39738,15 +39738,10 @@ fn key_operation_absorbable_fault_counts_distinct_moves_reread_then_chain() {
     let mut scene = JointScene::new();
     let call = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
     let admitted = admit_call_input(&mut scene, &call);
-    scene
-        .adapter
-        .attest_key(&admitted)
-        .expect("call attests");
+    scene.adapter.attest_key(&admitted).expect("call attests");
     ingest_call(&mut scene, &call, admitted.h0_ordinal());
     let voids_before = scene.adapter.joint_void_diagnosis();
-    scene
-        .seal_with_fault(7, 8)
-        .expect("the first move absorbs");
+    scene.seal_with_fault(7, 8).expect("the first move absorbs");
     let voids_mid = scene.adapter.joint_void_diagnosis();
     assert_eq!(
         voids_mid.audit_fault_absorbed_reread,
@@ -39754,8 +39749,7 @@ fn key_operation_absorbable_fault_counts_distinct_moves_reread_then_chain() {
         "the first observation counts a reread"
     );
     assert_eq!(
-        voids_mid.audit_fault_absorbed_chain,
-        voids_before.audit_fault_absorbed_chain,
+        voids_mid.audit_fault_absorbed_chain, voids_before.audit_fault_absorbed_chain,
         "no chain yet"
     );
     let waited = scene.seal_with_fault(7, 9);
@@ -39766,8 +39760,7 @@ fn key_operation_absorbable_fault_counts_distinct_moves_reread_then_chain() {
     );
     let voids_after = scene.adapter.joint_void_diagnosis();
     assert_eq!(
-        voids_after.audit_fault_absorbed_reread,
-        voids_mid.audit_fault_absorbed_reread,
+        voids_after.audit_fault_absorbed_reread, voids_mid.audit_fault_absorbed_reread,
         "no second reread"
     );
     assert_eq!(

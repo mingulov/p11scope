@@ -87907,10 +87907,9 @@ fn candidate_build_with_retired_owner_files_fail_closed_gap() {
     let (mut engine, victim, _healthy, victim_reconciled) =
         committed_two_provider_engine_with_pin_loss();
     let victim_view = victim_reconciled.scanned.view;
-    engine.pinned.retire_view_only_if_proven_gone(
-        victim_view,
-        RetirementProof::OperatorRemoval,
-    );
+    engine
+        .pinned
+        .retire_view_only_if_proven_gone(victim_view, RetirementProof::OperatorRemoval);
     engine.views.retain(|view| view.id() != victim_view);
     let victim_key = engine
         .plan
@@ -98502,7 +98501,7 @@ fn learned_staging_refusals_record_the_hold_refusal() {
             display_path: bogus.to_string_lossy().into_owned(),
             loader_exe: None,
             loader_unknown_reason: None,
-        loader_pid: None,
+            loader_pid: None,
             run_learned: false,
             proving_retained: false,
         },
@@ -98617,7 +98616,7 @@ fn member_stop_drain_first_staging_key_refuses_the_later_hold() {
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: None,
             loader_unknown_reason: None,
-        loader_pid: None,
+            loader_pid: None,
             run_learned: false,
             proving_retained: false,
         },
@@ -109410,8 +109409,7 @@ fn s1_two_retired_views_with_unreadable_names_stay_distinct() {
     // Retire both views: the carrier re-views and merges by file key,
     // so the two files must ride as two rows.
     let mut raws = vec![older, newer];
-    let removed: BTreeSet<ProcessViewId> =
-        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]);
+    let removed: BTreeSet<ProcessViewId> = BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]);
     let live: BTreeSet<ProcessViewId> = BTreeSet::new();
     normalize_carried_modules(&mut raws, &pins, &removed, &live, false);
     assert_eq!(raws.len(), 2, "both files ride the carrier");

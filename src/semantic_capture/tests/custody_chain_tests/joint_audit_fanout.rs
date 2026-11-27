@@ -21521,10 +21521,7 @@ fn joint_machine_idle_admission_between_polls_rescans_before_collection() {
             "no collection starts before the drain ends"
         );
         let (_, _, _, binding, _, _) = fixture.machine.absence_episode_for_test();
-        assert_eq!(
-            binding, 0,
-            "no rescan visit runs during the drain"
-        );
+        assert_eq!(binding, 0, "no rescan visit runs during the drain");
         drain_polls += 1;
     }
     let drain_units = fixture

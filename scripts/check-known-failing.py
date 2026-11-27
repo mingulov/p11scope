@@ -321,7 +321,7 @@ def load_list(path):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return [], [f"{path}: missing known-failing list"]
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return [], [f"{path}: cannot read known-failing list: {exc}"]
     data, problems = strict_json(text, str(path))
     if data is PARSE_FAILED:
@@ -359,7 +359,7 @@ def load_issue_registry(root):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return False, {}, []
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return True, {}, [f"known-issue registry: cannot read {path}: {exc}"]
     section = issue_section(text)
     if section is None:
@@ -463,7 +463,7 @@ def cargo_list_probe(root, row):
     toolchain_file = root / ".release-rust-version"
     try:
         toolchain = toolchain_file.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     cargo_wrapper = root / "scripts/cargo.sh"
     if not os.access(cargo_wrapper, os.X_OK):
@@ -525,7 +525,7 @@ def python_suite_registered(root, row):
     try:
         namespace = {}
         exec(compile(registry_path.read_text(encoding="utf-8"), str(registry_path), "exec"), namespace)
-    except (OSError, SyntaxError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return False
     name = row["path"][len(prefix):]
     invocation = row_invocation(row)
@@ -546,7 +546,10 @@ def validate_privileged_runner(root, rows):
         if wanted_new:
             return ["privileged-lib rows exist but scripts/run-privileged-lib-tests.sh is missing"]
         return []
-    text = runner_path.read_text(encoding="utf-8")
+    try:
+        text = runner_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f"privileged-lib runner declaration cannot be read: {exc}"]
     legacy_actual = shell_string_array(text, "EXPECTED_FAILURE_TESTS")
     typed_actual = shell_string_array(text, "KNOWN_FAILING_TYPED_TESTS")
     if legacy_actual is None:
@@ -664,7 +667,7 @@ def workflow_invocations(root):
     for path in sorted(workflow_dir.glob("*.yml")):
         try:
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
             problems.append(f"{path}: cannot parse workflow: {exc}")
             continue
         jobs = document.get("jobs") if isinstance(document, dict) else None
@@ -809,20 +812,23 @@ def validate_cell_runner_declarations(root, rows):
 def load_ignored_registry(path):
     """Strictly load an ignored-test registry file for test->file mapping.
 
-    Returns (files, problems). A missing file yields ({}, []) so
-    registry-less trees keep their fallback path; a present file must
-    parse strictly and be an object with a sites list, else problems
-    holds a typed rejection the caller must surface. Entries that are
-    not {file, path} string pairs are skipped; paths claimed by more
-    than one file are dropped as ambiguous.
+    Returns (files, problems). A missing file raises FileNotFoundError
+    so each caller applies its own missing-file policy visibly; every
+    other read failure yields a typed problem, as does a present file
+    that fails strict parsing or is not an object with a sites list.
+    Entries that are not {file, path} string pairs are skipped; paths
+    claimed by more than one file are dropped as ambiguous.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return {}, []
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        return {}, [f"{path}: cannot read ignored-test registry: {exc}"]
     registry, load_problems = strict_json(text, str(path))
     if load_problems or type(registry) is not dict or type(registry.get("sites")) is not list:
-        return {}, [f"{path}: ignored-test registry must be an object with a sites list"]
+        detail = f" ({load_problems[0]})" if load_problems else ""
+        return {}, [f"{path}: ignored-test registry must be an object with a sites list{detail}"]
     files = {}
     ambiguous = set()
     for site in registry["sites"]:
@@ -844,7 +850,7 @@ def validate_ignored_known_failing(root, rows):
         if any(row["path"].endswith(".rs") for row in rows):
             return [f"{path}: missing ignored-test registry for Rust known-failing rows"]
         return []
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return [f"{path}: cannot read ignored-test registry: {exc}"]
     data, problems = strict_json(text, str(path))
     if data is PARSE_FAILED:
@@ -942,7 +948,7 @@ def validate_result_document(path):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None, [f"results: missing file {path}"]
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return None, [f"results: cannot read {path}: {exc}"]
     data, problems = strict_json(text, f"results {path}")
     if data is PARSE_FAILED:

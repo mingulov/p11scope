@@ -433,7 +433,7 @@ def read_driver(root):
     def read(path):
         try:
             return (root / path).read_text(encoding="utf-8")
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
             return None
 
     return read
@@ -486,7 +486,7 @@ def merge_typed_fragments(fragment_specs, output, host):
         invalid = True
         try:
             text = fragment_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             fragment = None
         else:
             fragment, _load_problems = checker.strict_json(text, str(fragment_path))

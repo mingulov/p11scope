@@ -135,7 +135,7 @@ def main(argv):
             require_path = Path(require_file)
             try:
                 require_text = require_path.read_text(encoding="utf-8")
-            except OSError as error:
+            except (OSError, UnicodeDecodeError) as error:
                 return fail(f"require file {require_path}: cannot read: {error}")
             for number, line in enumerate(require_text.splitlines(), 1):
                 if not line or line.strip() != line or any(character.isspace() for character in line):
@@ -155,7 +155,7 @@ def main(argv):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return fail(f"missing results file: {path}")
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         return fail(f"cannot read {path}: {error}")
     rows = []
     seen = set()
@@ -294,7 +294,12 @@ def main(argv):
 def ignored_test_files():
     registry_path = Path(__file__).resolve().parents[2] / "tests" / "ignored-tests.json"
     checker = known_failing_checker_module()
-    return checker.load_ignored_registry(registry_path)
+    try:
+        return checker.load_ignored_registry(registry_path)
+    except FileNotFoundError:
+        # Registry-less trees keep the runner-path fallback; every other
+        # read failure is a typed problem the caller must surface.
+        return {}, []
 
 
 def known_failing_checker_module():
@@ -313,7 +318,7 @@ def cell_sidecar_signature(result_dir, cell):
         return None, None
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None, f"typed failure record for {cell} is missing or invalid JSON"
     checker = known_failing_checker_module()
     value, _load_problems = checker.strict_json(text, str(path))

@@ -69,7 +69,7 @@ def typed_sidecar_signature(path_text):
     path = Path(path_text)
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None, "typed signature sidecar is missing or invalid JSON"
     checker = checker_module()
     value, _load_problems = checker.strict_json(text, str(path))
@@ -101,7 +101,7 @@ def main(argv):
                 print(f"privileged-lib-results: malformed verdict line {number}", file=sys.stderr)
                 return 1
             verdict_rows.append(tuple(parts))
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         print(f"privileged-lib-results: cannot read structured records: {error}", file=sys.stderr)
         return 1
     if not selected or len(selected) != len(set(selected)):
@@ -111,7 +111,11 @@ def main(argv):
     if len(verdict_names) != len(set(verdict_names)) or set(verdict_names) != set(selected):
         print("privileged-lib-results: verdict rows are not exactly one-to-one with the selection", file=sys.stderr)
         return 1
-    files, registry_problems = checker_module().load_ignored_registry(ROOT / "tests/ignored-tests.json")
+    try:
+        files, registry_problems = checker_module().load_ignored_registry(ROOT / "tests/ignored-tests.json")
+    except FileNotFoundError as error:
+        print(f"privileged-lib-results: cannot read ignored-test registry: {error}", file=sys.stderr)
+        return 1
     if registry_problems:
         print(f"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}", file=sys.stderr)
         return 1

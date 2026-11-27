@@ -283,6 +283,28 @@ class StaticValidationTests(unittest.TestCase):
         self.assertIn("signature branch must be a typed token string", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_undecodable_suite_registry_fails_registration_typed(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        (f.root / "scripts/run-python-suites.py").write_bytes(b"RUN = [\xff\n")
+        f.rows([row()])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("suite invocation is not registered in scripts/run-python-suites.py", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_undecodable_privileged_runner_is_typed_refusal(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        (f.root / "scripts/run-privileged-lib-tests.sh").write_bytes(b"#!/bin/sh\n\xff\n")
+        f.rows([row(runner="privileged-lib")])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("privileged-lib runner declaration cannot be read", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_privileged_lib_rows_are_refused_until_coverage_counts_xfail(self):
         self.assert_bad_row(row(runner="privileged-lib"), "refused until")
 
@@ -804,6 +826,11 @@ class ResultDocumentTests(unittest.TestCase):
         self.assertIn("state is not in the closed terminal-state vocabulary", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_bogus_results_host_is_refused(self):
+        doc = result_doc([{"path": "tests/python/test_sample.py", "test": "Sample.test_x"}],
+                         host="mars")
+        self.assert_bad_results(doc, "host must be one of")
+
     def test_unhashable_result_keys_stay_typed(self):
         for side in ("selection", "results"):
             with self.subTest(side=side):
@@ -944,6 +971,23 @@ class StaticWiringTests(unittest.TestCase):
 class StrictNullAdmissionTests(unittest.TestCase):
     SCALARS = ("null", "0", "[]")
 
+    def test_undecodable_documents_are_typed_refusals(self):
+        cases = (
+            ("null-known-failing.json", b'{"rows": [\xff]}\n', ["--list"], "cannot read known-failing list"),
+            ("docs/known-limitations.md", b'# Known limitations\n\xff\n', [], "known-issue registry: cannot read"),
+            ("results.json", b'{"results": [\xff]}\n', ["--results"], "cannot read"),
+            (".github/workflows/main.yml", b'jobs:\n  test: \xff\n', [], "cannot parse workflow"),
+        )
+        for name, content, flag, needle in cases:
+            with self.subTest(name=name):
+                f = fixture(self)
+                target = f.root / name
+                target.write_bytes(content)
+                result = f.run_checker(*flag, str(target)) if flag else f.run_checker()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(needle, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_null_and_scalar_lists_are_rejected(self):
         for text in self.SCALARS:
             with self.subTest(text=text):
@@ -989,6 +1033,48 @@ class StrictNullAdmissionTests(unittest.TestCase):
                 self.assertIn("top level must have exactly schema/runner/host/complete/selection/results",
                               result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+
+
+class RegistryReadStateTests(unittest.TestCase):
+    def load_checker(self, label):
+        return load_script(ROOT / "scripts/check-known-failing.py", f"checker_read_state_{label}")
+
+    def test_missing_registry_raises_for_caller_policy(self):
+        checker = self.load_checker("missing")
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "absent.json"
+            with self.assertRaises(FileNotFoundError):
+                checker.load_ignored_registry(missing)
+
+    def test_unreadable_registry_is_typed_problem(self):
+        checker = self.load_checker("unreadable")
+        with tempfile.TemporaryDirectory() as temporary:
+            blocked = Path(temporary) / "ignored-tests.json"
+            blocked.mkdir()
+            files, problems = checker.load_ignored_registry(blocked)
+            self.assertEqual(files, {})
+            self.assertTrue(problems)
+            self.assertIn("cannot read ignored-test registry", problems[0])
+
+    def test_undecodable_registry_is_typed_problem(self):
+        checker = self.load_checker("undecodable")
+        with tempfile.TemporaryDirectory() as temporary:
+            bad = Path(temporary) / "ignored-tests.json"
+            bad.write_bytes(b'{"sites": [\xff]}\n')
+            files, problems = checker.load_ignored_registry(bad)
+            self.assertEqual(files, {})
+            self.assertTrue(problems)
+
+    def test_rejection_preserves_parse_detail(self):
+        checker = self.load_checker("detail")
+        with tempfile.TemporaryDirectory() as temporary:
+            dup = Path(temporary) / "ignored-tests.json"
+            dup.write_text('{"schema": "p11scope/ignored-tests/v1", "sites": ['
+                           '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n',
+                           encoding="utf-8")
+            files, problems = checker.load_ignored_registry(dup)
+            self.assertEqual(files, {})
+            self.assertIn("duplicate", problems[0])
 
 
 class ProducerTests(unittest.TestCase):
@@ -1073,6 +1159,15 @@ class RustDiscoveryTests(unittest.TestCase):
                 self.assertTrue(checker.cargo_list_probe(root, rust_row))
                 missing = dict(rust_row, test="inventory::privileged_tests::example_cell:")
                 self.assertFalse(checker.cargo_list_probe(root, missing))
+
+    def test_undecodable_toolchain_file_fails_probe_closed(self):
+        checker = load_script(CHECKER, "known_failing_checker_toolchain")
+        rust_row = row(path="tests/inventory_command.rs", test="inventory::privileged_tests::example_cell",
+                       runner="privileged-lib")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".release-rust-version").write_bytes(b"1.99.1\xff\n")
+            self.assertFalse(checker.cargo_list_probe(root, rust_row))
 
 
 class ScopedLegacyDeclarationTests(unittest.TestCase):
@@ -1316,6 +1411,23 @@ class FragmentAdmissionTests(unittest.TestCase):
                     self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
                                      "fragment_invalid")
 
+    def test_undecodable_fragment_is_fragment_invalid(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_undecodable")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            fragment = temp / "fragment.json"
+            fragment.write_bytes(b'{"process_exit": \xff}\n')
+            output = temp / "merged.json"
+            problems = runner.merge_typed_fragments(
+                [(fragment, "test_sample.py", [], 1)], output, "github")
+            document = json.loads(output.read_text(encoding="utf-8"))
+            rows = {item["test"]: item for item in document["results"]}
+            self.assertTrue(problems)
+            self.assertEqual(rows["<suite-process>"]["state"], "failed")
+            self.assertEqual(rows["<suite-process>"]["signature"]["branch"],
+                             "fragment_invalid")
+
     def test_nonstring_suite_event_state_is_fragment_invalid(self):
         for literal in ("[]", "{}", "1", "null", "true"):
             with self.subTest(literal=literal):
@@ -1364,6 +1476,103 @@ class FragmentAdmissionTests(unittest.TestCase):
         self.assertEqual(rows["<suite-events>"]["state"], "failed")
         self.assertEqual(rows["<suite-events>"]["signature"]["events"][0]["event"],
                          "tearDownModule")
+
+
+class TypedEnvironmentTests(unittest.TestCase):
+    BODY = ("import unittest\nclass Sample(unittest.TestCase):\n"
+            "    def test_x(self): pass\n"
+            "if __name__ == '__main__': unittest.main()\n")
+
+    def run_tiny_suite(self, env):
+        f = fixture(self)
+        shutil.copy2(ROOT / "scripts/run-python-suites.py",
+                     f.root / "scripts/run-python-suites.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     f.root / "scripts/check-known-failing.py")
+        suite = f.root / "tests/python/test_sample.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(self.BODY, encoding="utf-8")
+        runner = load_script(f.root / "scripts/run-python-suites.py",
+                             "python_suite_runner_typed_env")
+        runner.RUN = [("test_sample.py", [])]
+        merged = f.root / "merged.json"
+        full_env = {"PATH": os.environ.get("PATH", "")}
+        full_env.update(env)
+        if "P11SCOPE_KNOWN_FAILING_RESULTS" in full_env:
+            full_env["P11SCOPE_KNOWN_FAILING_RESULTS"] = str(merged)
+        with mock.patch.dict(os.environ, full_env, clear=True):
+            return runner.run_suites(set())
+
+    def test_partial_typed_environment_fails_typed(self):
+        failed = self.run_tiny_suite({"P11SCOPE_KNOWN_FAILING_RESULTS": "x"})
+        self.assertIn("typed-result configuration", " ".join(failed))
+
+    def test_missing_typed_environment_runs_untyped(self):
+        self.assertEqual(self.run_tiny_suite({}), [])
+
+
+class CliUsageTests(unittest.TestCase):
+    def test_checker_usage_error_is_typed(self):
+        result = subprocess.run([sys.executable, "-I", str(CHECKER), "--bogus-flag"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+
+    def test_runner_unknown_suite_is_typed(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_cli")
+        self.assertEqual(runner.main(["no-such-suite.py"]), 2)
+
+    def test_wrapper_usage_error_is_typed(self):
+        wrapper = load_script(ROOT / "scripts/typed-python-suite.py", "typed_python_suite_cli")
+        self.assertEqual(wrapper.main([]), 2)
+
+    def test_privileged_converter_usage_error_is_typed(self):
+        converter = ROOT / "scripts/ci/privileged-lib-results.py"
+        result = subprocess.run([sys.executable, "-I", str(converter)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: privileged-lib-results.py", result.stderr)
+
+
+class WrapperFileTests(unittest.TestCase):
+    def run_wrapper(self, temp, suite_arg):
+        fragment = temp / "fragment.json"
+        result = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts/typed-python-suite.py"),
+             str(suite_arg), str(fragment)],
+            capture_output=True, text=True)
+        return result, fragment
+
+    def test_missing_suite_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            result, fragment = self.run_wrapper(temp, temp / "absent.py")
+            self.assertNotEqual(result.returncode, 0)
+            document = json.loads(fragment.read_text(encoding="utf-8"))
+            self.assertFalse(document["complete"])
+
+    def test_syntax_broken_suite_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            suite = temp / "test_broken.py"
+            suite.write_text("def broken(:\n", encoding="utf-8")
+            result, fragment = self.run_wrapper(temp, suite)
+            self.assertNotEqual(result.returncode, 0)
+            document = json.loads(fragment.read_text(encoding="utf-8"))
+            self.assertFalse(document["complete"])
+
+
+class DriverReadTests(unittest.TestCase):
+    def test_unreadable_driver_reports_typed(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_driver")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "driver").mkdir()
+            (temp / "driver/bad.py").write_bytes(b"x = \xff\n")
+            read = runner.read_driver(temp)
+            self.assertIsNone(read("driver/bad.py"))
+            problems = runner.registry_problems(set(), [], {"x.py": "driver/bad.py"}, {}, read)
+            self.assertTrue(any("does not exist" in problem for problem in problems))
 
 
 class ScopeSkipTests(unittest.TestCase):
@@ -1741,6 +1950,55 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
                     self.assertIn("must be an object with a sites list", result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
 
+    def test_converter_fails_loud_on_missing_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "scripts/ci").mkdir(parents=True)
+            (temp / "tests").mkdir()
+            shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                         temp / "scripts/ci/privileged-lib-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            selection = temp / "selection.txt"
+            verdicts = temp / "verdicts.tsv"
+            output = temp / "out.json"
+            selection.write_text("X\n")
+            verdicts.write_text("X\tPASS\n")
+            converter = temp / "scripts/ci/privileged-lib-results.py"
+            result = subprocess.run([sys.executable, "-I", str(converter), str(selection), str(verdicts), str(output), "github"],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot read ignored-test registry", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_converter_rejects_undecodable_inputs_typed(self):
+        cases = (("verdicts", "cannot read structured records"),
+                 ("sidecar", "missing or invalid JSON"))
+        for name, needle in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    test_name = "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64"
+                    selection = temp / "selection.txt"
+                    verdicts = temp / "verdicts.tsv"
+                    sidecar = temp / "sidecar.json"
+                    output = temp / "out.json"
+                    selection.write_text(test_name + "\n")
+                    if name == "verdicts":
+                        verdicts.write_bytes(f"{test_name}\tFAIL\t{sidecar}\n".encode() + b"\xff")
+                    else:
+                        verdicts.write_text(test_name + "\tFAIL\t" + str(sidecar) + "\n")
+                    sidecar.write_bytes(b'{"branch": "\xff"}\n' if name == "sidecar"
+                                        else b'{"cell": "X", "branch": "B"}\n')
+                    converter = ROOT / "scripts/ci/privileged-lib-results.py"
+                    result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                             str(verdicts), str(output), "github"],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(needle, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
     def test_converter_maps_healthy_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
@@ -1765,6 +2023,22 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             document = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(document["results"][0]["path"], "src/b.rs")
+
+    def test_token_index_skips_undecodable_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts/ci/privileged-lib-results.py",
+                         temp / "scripts/ci/privileged-lib-results.py")
+            shutil.copy2(ROOT / "scripts/check-ignored-tests.py",
+                         temp / "scripts/check-ignored-tests.py")
+            (temp / "src").mkdir()
+            (temp / "src/bad.rs").write_bytes(b"fn broken_\xff() {}\n")
+            (temp / "src/good.rs").write_text("fn ExampleToken() {}\n", encoding="utf-8")
+            module = load_script(temp / "scripts/ci/privileged-lib-results.py",
+                                 "privileged_token_index_decode")
+            index = module.rust_token_index()
+            self.assertEqual(index.get("ExampleToken"), {"src/good.rs"})
 
     def test_converter_refuses_duplicate_key_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2382,11 +2656,12 @@ class ProducerMutationSweepTests(unittest.TestCase):
         # fails instead of collapsing to one mapping.
         propagate_mutant = self.mutate_source(
             ROOT / "scripts/ci/privileged-lib-results.py",
-            "    files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")\n"
             "    if registry_problems:\n"
             "        print(f\"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}\", file=sys.stderr)\n"
             "        return 1",
-            "    files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")")
+            "    if False:\n"
+            "        print(f\"privileged-lib-results: cannot read ignored-test registry: {'; '.join(registry_problems)}\", file=sys.stderr)\n"
+            "        return 1")
         outcomes = {}
         for label, source in (("original", privileged_source), ("mutant", propagate_mutant)):
             with tempfile.TemporaryDirectory() as temporary:
@@ -2407,6 +2682,219 @@ class ProducerMutationSweepTests(unittest.TestCase):
                                      capture_output=True, text=True)
                 outcomes[label] = run.returncode != 0
         self.record(results, "privileged-registry-propagate", outcomes["original"], outcomes["mutant"])
+
+        # The shared loader lets missing files raise so each caller applies
+        # its own missing-file policy visibly; swallowing the raise back
+        # into an empty mapping hides absence from the loud consumer.
+        missing_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except FileNotFoundError:\n        raise",
+            "    except FileNotFoundError:\n        return {}, []")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", missing_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"registry_missing_{label}")
+                try:
+                    module.load_ignored_registry(temp / "absent.json")
+                    outcomes[label] = False
+                except FileNotFoundError:
+                    outcomes[label] = True
+        self.record(results, "ignored-registry-missing", outcomes["original"], outcomes["mutant"])
+
+        # Unreadable registries are typed problems, not silent empty maps.
+        unreadable_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, UnicodeDecodeError) as exc:\n"
+            "        return {}, [f\"{path}: cannot read ignored-test registry: {exc}\"]",
+            "    except OSError:\n"
+            "        return {}, []")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", unreadable_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                blocked = temp / "ignored-tests.json"
+                blocked.mkdir()
+                module = load_script(script, f"registry_unreadable_{label}")
+                _files, problems = module.load_ignored_registry(blocked)
+                outcomes[label] = problems != []
+        self.record(results, "ignored-registry-unreadable", outcomes["original"], outcomes["mutant"])
+
+        # Undecodable registries are typed problems, never tracebacks.
+        undecodable_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, UnicodeDecodeError) as exc:\n"
+            "        return {}, [f\"{path}: cannot read ignored-test registry: {exc}\"]",
+            "    except OSError as exc:\n"
+            "        return {}, [f\"{path}: cannot read ignored-test registry: {exc}\"]")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", undecodable_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                bad = temp / "ignored-tests.json"
+                bad.write_bytes(b'{"sites": [\xff]}\n')
+                module = load_script(script, f"registry_undecodable_{label}")
+                try:
+                    _files, problems = module.load_ignored_registry(bad)
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+                else:
+                    outcomes[label] = problems != []
+        self.record(results, "ignored-registry-undecodable", outcomes["original"], outcomes["mutant"])
+
+        # The cell fallback on a missing registry is deliberate and pinned:
+        # re-raising instead breaks registry-less runner-path operation.
+        fallback_mutant = self.mutate_source(
+            ROOT / "scripts/ci/check-cell-results.py",
+            "    except FileNotFoundError:\n"
+            "        # Registry-less trees keep the runner-path fallback; every other\n"
+            "        # read failure is a typed problem the caller must surface.\n"
+            "        return {}, []",
+            "    except FileNotFoundError:\n"
+            "        raise")
+        outcomes = {}
+        for label, source in (("original", cell_source), ("mutant", fallback_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                script = temp / "scripts/ci/check-cell-results.py"
+                script.write_text(source, encoding="utf-8")
+                module = load_script(script, f"cell_fallback_{label}")
+                try:
+                    outcomes[label] = module.ignored_test_files() == ({}, [])
+                except FileNotFoundError:
+                    outcomes[label] = False
+        self.record(results, "cell-missing-fallback", outcomes["original"], outcomes["mutant"])
+
+        # The privileged converter fails loud on a missing registry: falling
+        # back silently would let the token index green the run instead.
+        priv_missing_mutant = self.mutate_source(
+            ROOT / "scripts/ci/privileged-lib-results.py",
+            "    try:\n"
+            "        files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")\n"
+            "    except FileNotFoundError as error:\n"
+            "        print(f\"privileged-lib-results: cannot read ignored-test registry: {error}\", file=sys.stderr)\n"
+            "        return 1",
+            "    try:\n"
+            "        files, registry_problems = checker_module().load_ignored_registry(ROOT / \"tests/ignored-tests.json\")\n"
+            "    except FileNotFoundError:\n"
+            "        files, registry_problems = {}, []")
+        outcomes = {}
+        for label, source in (("original", privileged_source), ("mutant", priv_missing_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                (temp / "scripts/ci").mkdir(parents=True)
+                (temp / "scripts/check-known-failing.py").write_text(CHECKER.read_text(encoding="utf-8"), encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-ignored-tests.py", temp / "scripts/check-ignored-tests.py")
+                os.symlink(ROOT / "src", temp / "src")
+                script = temp / "scripts/ci/privileged-lib-results.py"
+                script.write_text(source, encoding="utf-8")
+                name = "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n2048_lp64"
+                selection = temp / "selection.txt"; verdicts = temp / "verdicts.tsv"; output = temp / "out.json"
+                selection.write_text(name + "\n", encoding="utf-8")
+                verdicts.write_text(name + "\tPASS\n", encoding="utf-8")
+                run = subprocess.run([sys.executable, "-I", str(script), str(selection), str(verdicts), str(output), "github"],
+                                     capture_output=True, text=True)
+                outcomes[label] = run.returncode != 0
+        self.record(results, "privileged-missing-loud", outcomes["original"], outcomes["mutant"])
+
+        # An undecodable fragment is fragment_invalid, never a traceback.
+        fragment_decode_mutant = self.mutate_source(
+            ROOT / "scripts/run-python-suites.py",
+            "        except (OSError, UnicodeDecodeError):\n"
+            "            fragment = None",
+            "        except OSError:\n"
+            "            fragment = None")
+        outcomes = {}
+        for label, source in (("original", runner_source), ("mutant", fragment_decode_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
+                module = load_script(script, f"runner_fragment_decode_{label}")
+                fragment = temp / "fragment.json"
+                fragment.write_bytes(b'{"process_exit": \xff}\n')
+                output = temp / "merged.json"
+                try:
+                    problems = module.merge_typed_fragments(
+                        [(fragment, "test_sample.py", [], 1)], output, "github")
+                    rows = {row_["test"]: row_ for row_ in json.loads(output.read_text())["results"]}
+                    outcomes[label] = bool(problems) and rows["<suite-process>"]["state"] == "failed"
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+        self.record(results, "merge-fragment-decode", outcomes["original"], outcomes["mutant"])
+
+        # An undecodable toolchain file fails discovery closed, never a traceback.
+        toolchain_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "        toolchain = toolchain_file.read_text(encoding=\"utf-8\").strip()\n"
+            "    except (OSError, UnicodeDecodeError):\n"
+            "        return False",
+            "        toolchain = toolchain_file.read_text(encoding=\"utf-8\").strip()\n"
+            "    except OSError:\n"
+            "        return False")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", toolchain_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / ".release-rust-version").write_bytes(b"1.99.1\xff\n")
+                module = load_script(script, f"checker_toolchain_{label}")
+                try:
+                    outcomes[label] = module.cargo_list_probe(temp, {"path": "tests/x.rs"}) is False
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+        self.record(results, "toolchain-decode", outcomes["original"], outcomes["mutant"])
+
+        # An undecodable suite registry fails registration closed, never a traceback.
+        registry_exec_mutant = self.mutate_source(
+            ROOT / "scripts/check-known-failing.py",
+            "    except (OSError, SyntaxError, UnicodeDecodeError):",
+            "    except (OSError, SyntaxError):")
+        outcomes = {}
+        for label, source in (("original", helper_source), ("mutant", registry_exec_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "check-known-failing.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / "scripts").mkdir()
+                (temp / "scripts/run-python-suites.py").write_bytes(b"RUN = [\xff\n")
+                module = load_script(script, f"checker_registry_exec_{label}")
+                probe_row = {"path": "tests/python/test_sample.py", "runner": "python-suite"}
+                try:
+                    outcomes[label] = module.python_suite_registered(temp, probe_row) is False
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+        self.record(results, "registry-exec-decode", outcomes["original"], outcomes["mutant"])
+
+        # An undecodable drift driver reads as missing, never a traceback.
+        driver_mutant = self.mutate_source(
+            ROOT / "scripts/run-python-suites.py",
+            "        except (FileNotFoundError, OSError, UnicodeDecodeError):",
+            "        except FileNotFoundError:")
+        outcomes = {}
+        for label, source in (("original", runner_source), ("mutant", driver_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                (temp / "driver").mkdir()
+                (temp / "driver/bad.py").write_bytes(b"x = \xff\n")
+                module = load_script(script, f"runner_driver_{label}")
+                try:
+                    outcomes[label] = module.read_driver(temp)("driver/bad.py") is None
+                except UnicodeDecodeError:
+                    outcomes[label] = False
+        self.record(results, "driver-decode", outcomes["original"], outcomes["mutant"])
 
         # Promoted curated tests outside the ignored registry are mapped by
         # the Rust-source fallback; disabling it recreates the shard failure.
@@ -2750,7 +3238,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = run.returncode == 0
         self.record(results, "workflow-require-file-empty-selection", outcomes["original"], outcomes["mutant"])
 
-        total = 43
+        total = 52
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

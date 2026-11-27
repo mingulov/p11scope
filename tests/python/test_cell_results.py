@@ -706,6 +706,94 @@ class TypedCellResultsTests(unittest.TestCase):
             self.assertEqual(problems, [])
             self.assertEqual(files, {"X": "b.rs"})
 
+    def test_missing_registry_keeps_runner_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            module = load_script(temp / "scripts/ci/check-cell-results.py",
+                                 "cell_checker_registry_absent")
+            self.assertEqual(module.ignored_test_files(), ({}, []))
+
+    def test_undecodable_rows_file_is_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_bytes(b'{"cell": "\xff"}\n')
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path), "--require", "a"],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot read", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_undecodable_sidecar_is_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(json.dumps({"cell": "a", "pass": False, "detail": "d",
+                                             "qualification": "qualified"}) + "\n", encoding="utf-8")
+            (temp / "a.typed-failure.json").write_bytes(b'{"branch": "\xff"}\n')
+            output = temp / "typed.json"
+            script = temp / "scripts/ci/check-cell-results.py"
+            result = subprocess.run(
+                [sys.executable, "-I", str(script), str(rows_path), "--require", "a",
+                 "--known-failing-results", str(output),
+                 "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                 "--known-failing-host", "github"],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing or invalid JSON", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_undecodable_require_file_is_typed_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                             "qualification": "qualified"}) + "\n", encoding="utf-8")
+            require_path = temp / "require.txt"
+            require_path.write_bytes(b"a\xff\n")
+            result = subprocess.run(
+                [sys.executable, "-I", str(CHECKER), str(rows_path),
+                 "--require-file", str(require_path)],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("require file", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_unreadable_registry_fails_typed_emit_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            (temp / "scripts/ci").mkdir(parents=True)
+            shutil.copy2(CHECKER, temp / "scripts/ci/check-cell-results.py")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         temp / "scripts/check-known-failing.py")
+            (temp / "scripts/qualify-public-cli.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (temp / "tests").mkdir()
+            (temp / "tests/ignored-tests.json").mkdir()
+            rows_path = temp / "results.jsonl"
+            rows_path.write_text(json.dumps({"cell": "a", "pass": True, "detail": "d",
+                                             "qualification": "qualified"}) + "\n", encoding="utf-8")
+            output = temp / "typed.json"
+            script = temp / "scripts/ci/check-cell-results.py"
+            run = subprocess.run([sys.executable, "-I", str(script), str(rows_path), "--require", "a",
+                                  "--known-failing-results", str(output),
+                                  "--known-failing-runner", "cell:scripts/qualify-public-cli.sh",
+                                  "--known-failing-host", "github"],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("cannot read ignored-test registry", run.stderr)
+            self.assertNotIn("Traceback", run.stderr)
+            self.assertFalse(output.exists())
+
     def test_invalid_registry_fails_typed_emit_without_traceback(self):
         for name, text in (("null", "null\n"),
                            ("sites-null", '{"schema": "p11scope/ignored-tests/v1", '

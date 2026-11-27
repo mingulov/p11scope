@@ -2497,6 +2497,56 @@ struct SettleReport {
     wall: Duration,
 }
 
+/// The waits [`wait_for_global_retirement`] spent behind in-flight
+/// global native retirements: every poll, and the summed wall time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetirementWaits {
+    pub(crate) polls: u64,
+    pub(crate) total: Duration,
+}
+
+/// Waits out an in-flight global native retirement through the
+/// production backlog poll, only while one is actually pending, and
+/// records the wait in `waits`. Returns this call's wait. A close that
+/// never settles fails by name at [`SETTLE_DEADLINE`], with this tick's
+/// and the accumulated waits: the wait is for the worker's actual close,
+/// never a skipped check.
+pub(crate) fn wait_for_global_retirement(
+    engine: &mut Engine,
+    session: &mut dyn EngineSession,
+    waits: &mut RetirementWaits,
+    tick: u32,
+    what: &str,
+) -> Duration {
+    let start = Instant::now();
+    let mut polls = 0u64;
+    while engine.pending_global_retirement.is_some() {
+        let waited = start.elapsed();
+        assert!(
+            waited < SETTLE_DEADLINE,
+            "{what}: the global native retirement did not settle within {SETTLE_DEADLINE:?} \
+             (tick {tick}: {polls} polls over {waited:?}; total {} polls over {:?})",
+            waits.polls + polls,
+            waits.total + waited,
+        );
+        engine
+            .service_backlog_quantum(session)
+            .unwrap_or_else(|error| panic!("{what}: retirement poll failed: {error:#}"));
+        polls += 1;
+        if engine.pending_global_retirement.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let waited = if polls == 0 {
+        Duration::ZERO
+    } else {
+        start.elapsed()
+    };
+    waits.polls += polls;
+    waits.total += waited;
+    waited
+}
+
 /// Drive the production cadence (shallow drains, periodic full frames,
 /// one service quantum per tick) until every owned pid has settled and
 /// no pressure episode remains. Ambient newcomers may come and go; they
@@ -4532,8 +4582,20 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // slots, which legitimately grows the arm count past 256 — only the
     // head's own ticketlessness is pinned below). Thirty ticks bounds
     // the wait with margin; the loop exits on admission.
+    //
+    // A tick that starts behind an in-flight global native retirement
+    // does no engine work by design: the pending batch owns the whole
+    // candidate boundary until the worker has actually closed its links
+    // (`async_global_cgroup_departure_defers_conservative_replay_until_
+    // actual_close` pins that). Such a tick returns in microseconds while
+    // the kernel detach takes hundreds of milliseconds, so it is not an
+    // admission opportunity: each counted tick first waits out the actual
+    // close, within the same settle deadline the episode settles use.
     let mut admitted_tick = None;
+    let mut waits = RetirementWaits::default();
     for tick in 0..30u32 {
+        let tick_wait =
+            wait_for_global_retirement(&mut engine, &mut session, &mut waits, tick, WHAT);
         engine
             .drain_discovery_shallow(&mut session, true)
             .unwrap_or_else(|error| panic!("{WHAT}: admission drain {tick} failed: {error:#}"));
@@ -4545,10 +4607,11 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             .iter()
             .any(|view| view.pid() == head_pid && view.still_the_same());
         println!(
-            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} minted={} truncated={}",
+            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} minted={} truncated={} close_wait={tick_wait:?} close_waits_total={:?}",
             engine.views.len(),
             minted_ids(&engine).len(),
             engine.discovery_truncated,
+            waits,
         );
         if head_view {
             admitted_tick = Some(tick);

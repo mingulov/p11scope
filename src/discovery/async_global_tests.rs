@@ -3957,3 +3957,90 @@ fn exit_proof_with_a_plan_listing_but_no_scan_parks_the_retire() {
     assert!(!retire_skip_filed(&engine));
     assert_eq!(engine.coverage_retire_parked(), retired);
 }
+
+/// One accepted provider whose final `p11_return` close the test holds
+/// open until the returned guard drops (no timeout: the close stays
+/// pending for as long as the test keeps the guard), with the global
+/// native retirement already handed off to the worker.
+fn held_open_retirement() -> (Case, impl Drop) {
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+    let mut case = Case::new();
+    let hold = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate = Arc::clone(&hold);
+    let (sender, entered) = mpsc::channel();
+    case.session.global_retirement = Some(RefCell::new(RetirementFixture::new(
+        &case.engine.plan.slots,
+        &case.engine.pinned,
+        Box::new(move |owned: OwnedLink, producer| {
+            if producer == ProducerProgram::UProbe("p11_return") {
+                sender.send(()).map_err(|error| error.to_string())?;
+                let (lock, changed) = &*gate;
+                let _released = changed
+                    .wait_while(lock.lock().unwrap(), |released| !*released)
+                    .map_err(|error| error.to_string())?;
+            }
+            drop(owned);
+            Ok(())
+        }),
+    )));
+    case.entered = entered;
+    case.hold_pending();
+    (case, ReleaseOnDrop(hold))
+}
+
+/// The kill-leg wait fails by name when the actual close is held open
+/// past the settle deadline: the named message carries this tick's and
+/// the accumulated waits, so a never-finishing close is never mistaken
+/// for slow admission.
+#[test]
+#[should_panic(expected = "twin: the global native retirement did not settle within 120s (tick 3:")]
+fn kill_leg_wait_names_a_close_held_open_past_the_settle_deadline() {
+    use crate::discovery::engine::pressure_native_tests::{
+        RetirementWaits, wait_for_global_retirement,
+    };
+    let (mut case, _release) = held_open_retirement();
+    assert!(case.engine.pending_global_retirement.is_some());
+    let mut waits = RetirementWaits::default();
+    wait_for_global_retirement(&mut case.engine, &mut case.session, &mut waits, 3, "twin");
+}
+
+/// Healthy twins of the kill-leg wait: nothing pending waits nothing and
+/// records nothing; a close that finishes is waited out through the
+/// production poll and recorded, and the barrier clears.
+#[test]
+fn kill_leg_wait_records_only_actual_pending_closes() {
+    use crate::discovery::engine::pressure_native_tests::{
+        RetirementWaits, wait_for_global_retirement,
+    };
+    let (mut case, release) = held_open_retirement();
+    let mut idle = Engine::empty();
+    let mut waits = RetirementWaits::default();
+    let none = wait_for_global_retirement(&mut idle, &mut case.session, &mut waits, 0, "idle");
+    assert_eq!(none, Duration::ZERO);
+    assert_eq!(
+        waits,
+        RetirementWaits::default(),
+        "no pending close, no wait"
+    );
+    drop(release);
+    let waited =
+        wait_for_global_retirement(&mut case.engine, &mut case.session, &mut waits, 1, "held");
+    assert!(case.engine.pending_global_retirement.is_none());
+    assert!(waits.polls >= 1, "the pending close was polled: {waits:?}");
+    assert_eq!(waits.total, waited, "the one wait is the whole record");
+    let again = wait_for_global_retirement(
+        &mut case.engine,
+        &mut case.session,
+        &mut waits,
+        2,
+        "settled",
+    );
+    assert_eq!(again, Duration::ZERO);
+    assert_eq!(waits.total, waited, "a settled barrier adds no wait");
+}

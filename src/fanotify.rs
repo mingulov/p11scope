@@ -6289,6 +6289,7 @@ mod tests {
             prev_len: usize,
             attempted: usize,
             uncovered: usize,
+            proceeded: bool,
         }
         let dir = tempfile::tempdir().unwrap();
         let table = write_task_mountinfo(dir.path(), "mountinfo", 10, 0);
@@ -6310,9 +6311,21 @@ mod tests {
                   pending: &mut Option<std::sync::mpsc::Receiver<super::MarkPassOutcome>>,
                   job: super::BoxedRemarkJob|
                   -> bool {
+                // Faithful refusal like production: a pending pass
+                // starts nothing.
+                if pending.is_some() {
+                    recorder.lock().unwrap().push(RecordedJob {
+                        prev_len: prev.len(),
+                        attempted: 0,
+                        uncovered: 0,
+                        proceeded: false,
+                    });
+                    return false;
+                }
                 // The first spawn installs the async landing; later
-                // spawns run the real job synchronously and feed a
-                // clean outcome that can never send.
+                // spawns run the real job synchronously and feed
+                // nothing, so the only send in this twin is the
+                // landing gap from the pre-spawn adopt.
                 if !recorder.lock().unwrap().is_empty() {
                     let outcome = job(shared.clone(), prev.clone());
                     let mut recorded = recorder.lock().unwrap();
@@ -6320,24 +6333,15 @@ mod tests {
                         prev_len: prev.len(),
                         attempted: outcome.attempted,
                         uncovered: outcome.uncovered,
+                        proceeded: true,
                     });
-                    let clean = super::MarkPassOutcome {
-                        covered: prev.clone(),
-                        uncovered: 0,
-                        attempted: 0,
-                        spent: false,
-                        resume_after: None,
-                        table_gap: false,
-                    };
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    tx.send(clean).unwrap();
-                    *pending = Some(rx);
                     return true;
                 }
                 recorder.lock().unwrap().push(RecordedJob {
                     prev_len: prev.len(),
                     attempted: 0,
                     uncovered: 0,
+                    proceeded: true,
                 });
                 let (tx, rx) = std::sync::mpsc::channel();
                 *pending = Some(rx);
@@ -6397,6 +6401,14 @@ mod tests {
             assert!(Instant::now() < gate, "second spawn never captured");
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The spawn under test ran (its adopt consumed the landing, so
+        // no refusal blocks it); the assertions below pin what it ran
+        // with. A dropped adopt instead silently discards the consumed
+        // landing and its send never fires.
+        assert!(
+            recorded.lock().unwrap()[1].proceeded,
+            "adoption lets the spawn proceed"
+        );
         // The adoption send precedes its spawn in program order (same
         // tick, earlier lines), so it is already buffered here; if the
         // pre-spawn send were dropped, nothing arrives until a later

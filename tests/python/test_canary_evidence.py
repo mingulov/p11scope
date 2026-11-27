@@ -3429,42 +3429,59 @@ class RingLayoutTests(unittest.TestCase):
 
 class MatrixBuildFlagsTests(unittest.TestCase):
     # The checker's fixture transcription pins the fixture's own defaults;
-    # this pins the canary build invocations to privacy-only -D flags, so a
+    # this pins every version-matrix provider build consumed by the
+    # matrix/induced oracles to privacy-only -D flags, so a
     # shape-changing override (MATRIX/SINGLE/CAPACITY/BOUNDARY and friends)
-    # fails loudly instead of silently changing the provider under a stale
+    # fails loudly instead of silently changing a provider under a stale
     # expectation. Lives here, not in the checker: a staged script must not
-    # reference the build script (the staging closure would walk it
+    # reference a build script (the staging closure would walk it
     # transitively and demand it as a runner).
-    BUILD_SCRIPT = "scripts/verify-canaries.sh"
+    BUILD_SCRIPTS = (
+        "scripts/verify-canaries.sh",
+        "scripts/verify-induced-gaps.sh",
+    )
+    # The single source: every guarded build, keyed (script, provider).
+    # The discovery below must find exactly this set: a new unguarded
+    # build invocation fails the test until it is pinned here.
+    GUARDED_BUILDS = {
+        ("scripts/verify-canaries.sh", "matrix-provider"): {"-DPRIVACY_FIXTURE=1"},
+        ("scripts/verify-canaries.sh", "privacy-provider"): {
+            "-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1"},
+        ("scripts/verify-induced-gaps.sh", "freeze-provider"): {"-DPRIVACY_FIXTURE=1"},
+        ("scripts/verify-induced-gaps.sh", "g4_provider"): {
+            "-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1"},
+        ("scripts/verify-induced-gaps.sh", "g5_provider"): {"-DPRIVACY_FIXTURE=1"},
+    }
 
-    def script_text(self):
-        override = os.environ.get("MATRIX_BUILD_SCRIPT_OVERRIDE")
-        path = Path(override) if override else ROOT / self.BUILD_SCRIPT
-        return path.read_text(encoding="utf-8")
+    def script_text(self, script):
+        override = os.environ.get("MATRIX_REPO_OVERRIDE")
+        root = Path(override) if override else ROOT
+        return (root / script).read_text(encoding="utf-8")
 
-    def test_canary_builds_override_no_fixture_shape_default(self):
-        joined = re.sub(r"\\\n[ \t]*", " ", self.script_text())
-        builds = {}
-        for line in joined.splitlines():
-            if "crates/discover/tests/fixture/version_matrix.c" not in line:
-                continue
-            step = re.findall(r"canary_build_step (\S+) gcc ", line)
-            target = re.findall(
-                r'-o "\$WORK/(matrix|privacy)-provider\.so" '
-                r"crates/discover/tests/fixture/version_matrix\.c",
-                line,
-            )
-            self.assertEqual((len(step), len(target)), (1, 1), line.strip())
-            name = ("matrix-provider" if target[0] == "matrix"
-                    else "privacy-provider")
-            self.assertEqual(step[0], name, line.strip())
-            self.assertNotIn(name, builds)
-            builds[name] = set(
-                re.findall(r"-D[A-Za-z_][A-Za-z0-9_]*(?:=\S+)?", line))
-        self.assertEqual(builds, {
-            "matrix-provider": {"-DPRIVACY_FIXTURE=1"},
-            "privacy-provider": {"-DPRIVACY_FIXTURE=1", "-DPRIVACY_BLOCKS=1"},
-        })
+    def test_every_matrix_build_is_guarded(self):
+        discovered = {}
+        for script in self.BUILD_SCRIPTS:
+            joined = re.sub(r"\\\n[ \t]*", " ", self.script_text(script))
+            for line in joined.splitlines():
+                if "crates/discover/tests/fixture/version_matrix.c" not in line:
+                    continue
+                target = re.findall(
+                    r'-o "\$WORK/([A-Za-z0-9_-]+)\.so" '
+                    r"crates/discover/tests/fixture/version_matrix\.c",
+                    line,
+                )
+                self.assertEqual(len(target), 1, line.strip())
+                self.assertIn("gcc ", line, line.strip())
+                if script == "scripts/verify-canaries.sh":
+                    step = re.findall(r"canary_build_step (\S+) gcc ", line)
+                    self.assertEqual(len(step), 1, line.strip())
+                    self.assertEqual(step[0], target[0], line.strip())
+                key = (script, target[0])
+                self.assertNotIn(key, discovered, key)
+                discovered[key] = set(
+                    re.findall(r"-D[A-Za-z_][A-Za-z0-9_]*(?:=\S+)?", line))
+        self.assertEqual(set(discovered), set(self.GUARDED_BUILDS))
+        self.assertEqual(discovered, self.GUARDED_BUILDS)
 
 
 class VersionCanaryPrefixTests(unittest.TestCase):

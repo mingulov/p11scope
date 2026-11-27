@@ -11651,15 +11651,15 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         record.hook_ts_ns = hook_ts_ns;
         record
     };
-    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let child1 = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-    wait_sleep_child_settled(child.pid());
-    let view = ProcessView::open(ProcessViewId(18), child.pid()).unwrap();
+    wait_sleep_child_settled(child1.pid());
+    let view = ProcessView::open(ProcessViewId(18), child1.pid()).unwrap();
     let hook_ts_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    let pid = child.pid();
-    child.close();
+    let pid = child1.pid();
+    child1.close();
 
     let mut pending = PendingViewRetirements::new();
 
@@ -11689,14 +11689,14 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // the exit record is still in the ring while the pidfd is already
     // readable, and calling that proven exit a lost generation failed
     // `p11scope run` on every short-lived child.
-    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let child2 = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-    wait_sleep_child_settled(child.pid());
-    let view = ProcessView::open(ProcessViewId(19), child.pid()).unwrap();
-    let exec = record(DISCOVERY_KIND_EXEC, child.pid(), view.admitted_ns());
+    wait_sleep_child_settled(child2.pid());
+    let view = ProcessView::open(ProcessViewId(19), child2.pid()).unwrap();
+    let exec = record(DISCOVERY_KIND_EXEC, child2.pid(), view.admitted_ns());
     let mut engine = Engine::empty();
     engine.views.push(view);
-    child.close();
+    child2.close();
 
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
@@ -11719,15 +11719,15 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     // still running is declined — the pin re-reads Current, so there is no
     // positive evidence of change to record as loss. The deferral is marked
     // and the next pass re-checks.
-    let child = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
+    let child3 = ParkedSleep::spawn_unparked(std::process::Command::new("sleep").arg("600"));
 
-    wait_sleep_child_settled(child.pid());
-    let view = ProcessView::open(ProcessViewId(20), child.pid()).unwrap();
+    wait_sleep_child_settled(child3.pid());
+    let view = ProcessView::open(ProcessViewId(20), child3.pid()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
     let mut pending = PendingViewRetirements::new();
     engine.queue_stale_views(&[ProcessViewId(20)].into_iter().collect(), &mut pending);
-    child.close();
+    child3.close();
 
     assert!(
         pending.is_empty(),
@@ -98852,10 +98852,11 @@ fn needle_stmt_line(body: &str, stmt: &str) -> Option<usize> {
 /// `wait_sleep_exec_row` sites, the 6 bare settled stops, the shared
 /// `stopped_member_with_row` helper, the 8 parked pre-discover sites, the
 /// 7 spawn-anchored parked groups, the 28 constructor-ordered guard
-/// sites, the 19 quantum pins, the 6 `sh` tree-kill sites, the 51
-/// custody-presence rows, the seed READY handshake, the 12
-/// fixture-lifetime bans, the teardown freshness clause, and the alien
-/// census site; plus global bans on exe-link-only exe polls.
+/// sites, the 60 settle-before-open groups, the 19 quantum pins, the 6
+/// `sh` tree-kill sites, the 189 custody-presence rows, the seed READY
+/// handshake, the 12 fixture-lifetime bans, the teardown freshness
+/// clause, and the alien census site; plus global bans on exe-link-only
+/// exe polls.
 #[test]
 fn stop_then_read_sites_settle_before_sigstop() {
     let source = include_str!("engine_tests.rs");
@@ -99337,6 +99338,31 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "{helper}: no parking construction"
         );
     }
+    // Settling helpers keep their exact settle call: every caller
+    // inherits readiness from it, so deleting it unpins them all at
+    // once while each caller still looks guarded.
+    for helper in [
+        "spawn_execed_sleep",
+        "counted_leader_exit_loss",
+        "reuse_id_for_new_process",
+    ] {
+        let body = needle_fn_body(source, helper);
+        assert!(
+            needle_stmt_line(body, "wait_sleep_child_settled(child.pid());").is_some(),
+            "{helper}: no settle call"
+        );
+    }
+    // The nested two-view builder (an `impl` block, not addressable per
+    // test) keeps both custody transfers: globally unique lines.
+    for stmt in [
+        "let first_guard = SystemScopeChildGuard::new(child.into_inner());",
+        "_second: SystemScopeChildGuard::new(child.into_inner()),",
+    ] {
+        assert!(
+            needle_stmt_line(source, stmt).is_some(),
+            "two-view builder lost its custody line {stmt:?}"
+        );
+    }
     // Guard constructors stay proved through custody-first methods:
     // `spawn_inner`/`spawn_parked` construct, then call
     // `prove_tree`/`prove_parked`, which wait and record. Deleting a
@@ -99411,7 +99437,7 @@ fn stop_then_read_sites_settle_before_sigstop() {
     // Custody presence per converted site: (test, constructor marker,
     // exact occurrences). Reverting any site to a bare spawn deletes
     // its marker and fails here; multi-child tests pin every child.
-    let guard_ctors: [(&str, &str, usize); 51] = [
+    let guard_ctors: [(&str, &str, usize); 189] = [
         (
             "member_stop_clears_non_provider_files_and_resumes_at_once",
             "ParkedSleep::spawn_unparked",
@@ -99667,6 +99693,688 @@ fn stop_then_read_sites_settle_before_sigstop() {
             "ChildrenGuard",
             3,
         ),
+        (
+            "tick_does_not_remark_lingering_zombie_of_tracked_generation",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "tick_does_not_remark_unreadable_pid_with_pending_view",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "tick_does_not_remark_unreadable_pid_with_settled_view",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "tick_still_marks_reused_pid_with_pending_view",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "engine_retains_pid_reports_live_views_only",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "view_owns_provider_pins_the_exploration_predicate",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "owned_child_arm_priority_moves_the_scheduled_child_first",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "learn_owned_proofs_stages_a_scan_proven_file_once",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "learn_owned_proofs_records_whether_the_proving_view_was_retained",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "learn_owned_proofs_stages_the_proofs_stored_loader_naming",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "learned_staging_rescans_owned_members_and_views_promptly",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "owned_proof_loader_name_names_the_live_loader_through_its_pidfd",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "owned_proof_loader_name_is_unknown_once_the_loader_exits",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "publish_deferral_matches_full_publication_step_for_step",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "pid_target_exec_ignores_execs_against_a_dead_view",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "loader_exhaustion_names_once_and_watch_still_stages",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "loader_reserve_holds_contexts_for_the_owned_child",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "loader_reserve_refuses_member_arms_but_arms_the_child",
+            "ParkedSleep::spawn_unparked",
+            2,
+        ),
+        (
+            "idle_inventory_tick_at_view_capacity_rebuilds_no_candidates",
+            "ParkedSleep::spawn_unparked",
+            4,
+        ),
+        (
+            "admitted_pid_counts_match_views_after_admit_close_churn",
+            "ParkedSleep::spawn_unparked",
+            2,
+        ),
+        (
+            "a_view_retired_after_its_group_exited_is_not_a_link_loss",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_view_retired_while_its_group_lives_is_still_a_link_loss",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "terminal_drain_withdraws_a_counted_loss_whose_group_exited",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "terminal_drain_prunes_a_pending_assessment_whose_group_exited",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_counted_loss_whose_group_lives",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_pending_assessment_observed_after_the_exit",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_loss_whose_exit_order_is_unknown",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        ("counted_leader_exit_loss", "ParkedSleep::spawn_unparked", 1),
+        ("reuse_id_for_new_process", "ParkedSleep::spawn_unparked", 1),
+        (
+            "cgroup_exec_rejects_a_stale_retained_generation",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "batch_exit_dominates_exec_before_dead_pin_promotion",
+            "ParkedSleep::spawn_unparked",
+            3,
+        ),
+        (
+            "a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_candidate_naming_only_live_views_marks_no_generation_gap",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_candidate_stale_only_by_exited_views_marks_no_generation_gap",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_dead_stale_view_beside_a_live_newcomer_target_stays_loud",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "stale_views_all_dead_fails_closed_on_any_live_or_unknown_view",
+            "ParkedSleep::spawn_unparked",
+            3,
+        ),
+        (
+            "a_capture_refresh_ends_on_a_proven_exit_instead_of_failing",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "expected_exit_waits_for_the_original_process_pin",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "candidate_admission_keeps_exact_retained_and_local_stale_view_ids",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "pressure_service_pass_never_evicts_parked_head_view",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "collected_finish_pressure_head_disposes_without_refresh",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "owned_run_under_cgroup_scope_ignores_descendant_exec",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "named_pid_scan_failure_after_exit_gaps_instead_of_aborting",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "named_pid_with_live_view_still_discovers",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "late_holder_relief_preserves_protected_requests_and_bound",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "scan_refusal_on_a_group_ended_before_its_scan_files_no_gap",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "scan_child_with_forced_ending",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "mid_scan_exit_race_goes_silent_but_counted",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "mid_scan_exit_race_with_live_group_stays_loud",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "mid_scan_proven_exit_keeps_non_exit_refusals_loud",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "mid_scan_exit_proof_exhausted_budget_proves_nothing",
+            "ParkedSleep::spawn_unparked",
+            2,
+        ),
+        (
+            "mid_scan_exit_race_with_unreaped_exit_goes_silent_but_counted",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "ending_scan_that_set_a_capture_stop_excuses_nothing",
+            "ParkedSleep::spawn_unparked",
+            1,
+        ),
+        (
+            "a_closure_after_admission_requests_the_newcomer_it_left_unarmed",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "a_foreign_exit_retired_in_the_same_tick_does_not_strand_a_newcomer",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryable",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "a_generation_lost_before_replacement_leaves_the_detached_targets_inactive",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "handles_deferred_pid_attempted_first_in_window",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "library_handle_deferral_marks_handles_first_and_retries",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "named_target_exit_during_inventory_preflight_ends_the_capture_not_fails_it",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "refresh_releases_view_ids_at_the_post_retirement_preflight_exits",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "refresh_releases_view_ids_when_a_new_generation_ends_before_admission",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "refresh_releases_view_ids_when_the_target_preflight_refuses",
+            "spawn_execed_sleep()",
+            1,
+        ),
+        (
+            "tick_with_release_and_pending_handles_owes_frame",
+            "spawn_execed_sleep()",
+            2,
+        ),
+        (
+            "a_conservative_replay_closes_the_tick_only_on_ownership_uncertainty",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_conservative_replay_that_cannot_be_applied_closes_the_tick",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_conservative_replay_that_cannot_be_rebuilt_closes_the_tick",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_conservative_replay_whose_detach_fails_before_mutation_closes_the_tick",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_generation_lost_before_replacement_leaves_the_detached_targets_inactive",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_history_preparation_failure_never_enters_the_link_mutation",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_post_mutation_retirement_is_not_an_accepted_candidate",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_refused_conservative_replay_closes_the_tick",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_retired_conservative_replay_closes_the_tick",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_finish_pending_graph_retains_actual_view_and_id",
+            "engine_with_one_accepted_provider(",
+            2,
+        ),
+        (
+            "collected_finish_terminal_batch_respects_one_action",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_barrier_fences_records_and_assessments",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_empty_selection_finishes_without_copy",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_exec_refresh_is_disposed_once",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_native_error_is_contained",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_reclaim_refusal_retains_and_finishes",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_rejection_only_requests_graph",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_unready_intent_is_disposed_once_at_q",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_wedged_native_poll_reaches_finite_incomplete_stop",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_graph_wedged_owed_cancel_reaches_finite_incomplete_stop",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "collected_session_requires_original_q",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "ending_loader_arm_failure_naming_a_budget_stop_keeps_its_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "ending_loader_pin_skip_keeps_budget_stops_and_other_skips",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "engine_with_ready_graph_intent",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "export_attach_without_context_on_a_group_in_final_exit_files_no_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "export_attach_without_context_on_a_live_group_still_files_the_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "export_generation_change_is_silent_only_for_an_ending_group",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "facts_two_provider_engine",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "failed_attach_rebuild_report_reactivates_surviving_sibling",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "failed_replacement_with_detach_failure_still_records_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "generation_change_on_a_group_in_final_exit_files_no_loss",
+            "engine_with_one_accepted_provider(",
+            2,
+        ),
+        (
+            "generation_change_retirement_on_an_ending_group_files_no_generation_loss",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "generation_loss_cleanup_finishes_after_one_failed_detach",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "loader_arm_failure_on_a_group_in_final_exit_files_no_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "loader_arm_failure_on_a_live_group_still_files_the_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "loader_arm_gap_is_silent_only_for_an_ending_group",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "loader_pin_skip_is_silent_only_for_an_ending_group",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "lost_generation_after_a_failed_arm_records_nothing_only_for_an_ending_group",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "new_slot_cleanup_detach_failure_still_records_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "post_mutation_generation_loss_never_owns_the_cell_it_allocated",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "postponement_check_shares_one_final_exit_budget",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "queue_retirement_reports_the_real_enqueue_line",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "queued_retirement_postpones_only_ending_cleanup_exactly",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "replacement_detach_failure_still_records_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "retired_slot_rebuild_report_reactivates_surviving_sibling",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "scanned_module_copy_is_exact",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "selection_bindings_isolate_provider_attribution_and_refusal",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "sibling_closed_tick_still_defers_loader_arm_without_recording",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "sibling_loud_abort_still_records_the_loader_gap",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "sibling_silent_abort_defers_loader_arm_without_recording",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "slot_copy_is_exact",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "stale_batch_shares_one_final_exit_budget",
+            "engine_with_one_accepted_provider(",
+            1,
+        ),
+        (
+            "a_later_process_on_a_reused_id_cannot_withdraw_an_earlier_real_loss",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "a_pid_bound_session_under_system_scope_never_withdraws",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "a_reused_id_keeps_each_process_judged_on_its_own_proof",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "a_system_batch_record_after_removal_keeps_the_removed_loss",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "dropped_function_list_records_never_let_a_leader_exit_loss_be_withdrawn",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "lost_discovery_records_never_let_a_leader_exit_loss_be_withdrawn",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "pid_scope_never_withdraws_a_leader_exit_loss",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_loss_whose_view_was_removed_while_live",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "terminal_drain_keeps_a_removed_loss_whose_group_ran_after_the_exit",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "terminal_drain_withdraws_a_loss_whose_exited_view_was_removed",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit",
+            "counted_leader_exit_loss(",
+            1,
+        ),
+        (
+            "a_later_process_on_a_reused_id_cannot_withdraw_an_earlier_real_loss",
+            "reuse_id_for_new_process(",
+            1,
+        ),
+        (
+            "a_reused_id_keeps_each_process_judged_on_its_own_proof",
+            "reuse_id_for_new_process(",
+            1,
+        ),
+        (
+            "conservative_replays_under_churn_never_burn_capacity",
+            "ChildReaper",
+            1,
+        ),
+        (
+            "named_reserve_ignores_failed_attaches_across_conservative_replays",
+            "ChildReaper",
+            3,
+        ),
+        (
+            "multi_process_start_retires_views_that_went_stale_during_attach_live",
+            "ChildReaper",
+            1,
+        ),
     ];
     for (name, marker, expected) in guard_ctors {
         let body = needle_fn_body(source, name);
@@ -99682,6 +100390,569 @@ fn stop_then_read_sites_settle_before_sigstop() {
             found, expected,
             "{name}: custody marker {marker:?} occurs {found}x, want {expected}x"
         );
+    }
+    // Settle-before-open sites: (test, (settle statement, spawn
+    // marker) pairs). Each settle must sit strictly between its own
+    // spawn and the first `ProcessView::open` that can consume that
+    // child — the same spawn-anchored shape as the parked quads, for
+    // settled (not parked) fixtures. Custody is pinned separately
+    // in `guard_ctors`; order here pins readiness.
+    let settle_opens: [(&str, &[(&str, &str)], &str); 60] = [
+        (
+            "tick_does_not_remark_lingering_zombie_of_tracked_generation",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "tick_does_not_remark_unreadable_pid_with_pending_view",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "tick_does_not_remark_unreadable_pid_with_settled_view",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "tick_still_marks_reused_pid_with_pending_view",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "admitted_pid_counts_match_views_after_admit_close_churn",
+            &[
+                (
+                    "wait_sleep_child_settled(first.pid());",
+                    "first = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(second.pid());",
+                    "second = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "a_view_retired_after_its_group_exited_is_not_a_link_loss",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "a_view_retired_while_its_group_lives_is_still_a_link_loss",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "terminal_drain_withdraws_a_counted_loss_whose_group_exited",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "terminal_drain_prunes_a_pending_assessment_whose_group_exited",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "terminal_drain_keeps_a_counted_loss_whose_group_lives",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "counted_leader_exit_loss",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "terminal_drain_keeps_a_pending_assessment_observed_after_the_exit",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "terminal_drain_keeps_a_loss_whose_exit_order_is_unknown",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "reuse_id_for_new_process",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "cgroup_exec_rejects_a_stale_retained_generation",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "batch_exit_dominates_exec_before_dead_pin_promotion",
+            &[
+                (
+                    "wait_sleep_child_settled(child1.pid());",
+                    "child1 = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(child2.pid());",
+                    "child2 = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(child3.pid());",
+                    "child3 = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "a_named_target_that_provably_exited_ends_the_capture_rather_than_failing_it",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "a_generation_change_a_pin_proves_was_an_exit_is_not_a_loss",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "a_candidate_naming_only_live_views_marks_no_generation_gap",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "a_candidate_stale_only_by_exited_views_marks_no_generation_gap",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "a_dead_stale_view_beside_a_live_newcomer_target_stays_loud",
+            &[(
+                "wait_sleep_child_settled(dead.pid());",
+                "dead = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "stale_views_all_dead_fails_closed_on_any_live_or_unknown_view",
+            &[
+                (
+                    "wait_sleep_child_settled(live.pid());",
+                    "live = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(dead.pid());",
+                    "dead = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "a_capture_refresh_ends_on_a_proven_exit_instead_of_failing",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "expected_exit_waits_for_the_original_process_pin",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "engine_retains_pid_reports_live_views_only",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "view_owns_provider_pins_the_exploration_predicate",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "owned_child_arm_priority_moves_the_scheduled_child_first",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "learn_owned_proofs_stages_a_scan_proven_file_once",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "learn_owned_proofs_records_whether_the_proving_view_was_retained",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "learn_owned_proofs_stages_the_proofs_stored_loader_naming",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "learned_staging_rescans_owned_members_and_views_promptly",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "owned_proof_loader_name_names_the_live_loader_through_its_pidfd",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "owned_proof_loader_name_is_unknown_once_the_loader_exits",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "engine_with_one_accepted_provider",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "idle_inventory_tick_at_view_capacity_rebuilds_no_candidates",
+            &[
+                (
+                    "wait_sleep_child_settled(first.pid());",
+                    "first = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(second.pid());",
+                    "second = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "publish_deferral_matches_full_publication_step_for_step",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "candidate_admission_keeps_exact_retained_and_local_stale_view_ids",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "pressure_service_pass_never_evicts_parked_head_view",
+            &[(
+                "wait_sleep_child_settled(headpeer.pid());",
+                "headpeer = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "collected_finish_nonempty_rejection_keeps_actual_collision_until_disposition",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "collected_finish_pressure_head_disposes_without_refresh",
+            &[(
+                "wait_sleep_child_settled(headpeer.pid());",
+                "headpeer = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "owned_run_under_cgroup_scope_ignores_descendant_exec",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "pid_target_exec_ignores_execs_against_a_dead_view",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "named_pid_scan_failure_after_exit_gaps_instead_of_aborting",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "named_pid_with_live_view_still_discovers",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "late_holder_relief_preserves_protected_requests_and_bound",
+            &[(
+                "wait_sleep_child_settled(reaped.pid());",
+                "reaped = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "loader_exhaustion_names_once_and_watch_still_stages",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "loader_reserve_holds_contexts_for_the_owned_child",
+            &[(
+                "wait_sleep_child_settled(sleeper.pid());",
+                "sleeper = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "loader_reserve_refuses_member_arms_but_arms_the_child",
+            &[
+                (
+                    "wait_sleep_child_settled(first_sleeper.pid());",
+                    "first_sleeper = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(second_sleeper.pid());",
+                    "let second_sleeper =",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "scan_refusal_on_a_group_ended_before_its_scan_files_no_gap",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "scan_child_with_forced_ending",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "mid_scan_exit_race_goes_silent_but_counted",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "mid_scan_exit_race_with_live_group_stays_loud",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "mid_scan_proven_exit_keeps_non_exit_refusals_loud",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "mid_scan_exit_proof_exhausted_budget_proves_nothing",
+            &[
+                (
+                    "wait_sleep_child_settled(child.pid());",
+                    "child = ParkedSleep::spawn_unparked",
+                ),
+                (
+                    "wait_sleep_child_settled(live.pid());",
+                    "live = ParkedSleep::spawn_unparked",
+                ),
+            ],
+            "ProcessView::open",
+        ),
+        (
+            "mid_scan_exit_race_with_unreaped_exit_goes_silent_but_counted",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "stale_batch_shares_one_final_exit_budget",
+            &[(
+                "wait_sleep_child_settled(second.pid());",
+                "second = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "postponement_check_shares_one_final_exit_budget",
+            &[(
+                "wait_sleep_child_settled(second.pid());",
+                "second = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+        (
+            "ending_scan_that_set_a_capture_stop_excuses_nothing",
+            &[(
+                "wait_sleep_child_settled(child.pid());",
+                "child = ParkedSleep::spawn_unparked",
+            )],
+            "ProcessView::open",
+        ),
+    ];
+    for (name, pairs, anchor) in settle_opens {
+        let body = needle_fn_body(source, name);
+        for (stmt, spawn) in pairs {
+            let spawned: Vec<usize> = body
+                .lines()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    line.split_once("//")
+                        .map_or(line, |(code, _)| code)
+                        .contains(spawn)
+                        .then_some(idx)
+                })
+                .collect();
+            assert_eq!(
+                spawned.len(),
+                1,
+                "{name}: spawn marker {spawn:?} must occur exactly once"
+            );
+            let settle =
+                needle_stmt_line(body, stmt).unwrap_or_else(|| panic!("{name}: no {stmt}"));
+            let open = body
+                .lines()
+                .enumerate()
+                .position(|(idx, line)| {
+                    idx > spawned[0]
+                        && line
+                            .split_once("//")
+                            .map_or(line, |(code, _)| code)
+                            .contains(anchor)
+                })
+                .unwrap_or_else(|| panic!("{name}: no {anchor} call after the spawn"));
+            assert!(spawned[0] < settle, "{name}: spawn must precede the settle");
+            assert!(settle < open, "{name}: settle must precede the first open");
+        }
     }
     // Tests pinning exact per-tick outcomes pin the wall tick quantum, so
     // the pins measure logic, not scheduler wall time under parallel load.

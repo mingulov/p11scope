@@ -383,7 +383,7 @@ class CheckCellResultsTests(unittest.TestCase):
 
     def test_null_and_scalar_rows_are_rejected_typed(self):
         good = {"cell": "good", "pass": True, "qualification": "qualified", "detail": "d"}
-        for line in ("null", "0", "[]"):
+        for line in ("null", "0", "[]", "true"):
             with self.subTest(line=line):
                 result = run_checker([json.dumps(good), line], "--require", "good")
                 self.assertNotEqual(result.returncode, 0)
@@ -673,7 +673,7 @@ class TypedCellResultsTests(unittest.TestCase):
         self.assertIn("missing or invalid JSON", result.stderr)
 
     def test_null_and_scalar_sidecars_are_rejected_typed(self):
-        for content in ("null\n", '"s"\n'):
+        for content in ("null\n", '"s"\n', "true\n"):
             with self.subTest(content=content):
                 result, _document = run_typed_checker(
                     [row("a", False)], "--require", "a", sidecars={"a": content})
@@ -704,6 +704,7 @@ class TypedCellResultsTests(unittest.TestCase):
                                '{"file": "a.rs", "path": "X", "file": "b.rs"}]}\n'),
             "sites-null": ('{"schema": "p11scope/ignored-tests/v1", "sites": null}\n'),
             "sites-zero": ('{"schema": "p11scope/ignored-tests/v1", "sites": 0}\n'),
+            "boolean": "true\n",
         }
         for name, text in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:

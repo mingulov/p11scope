@@ -990,7 +990,7 @@ class StaticWiringTests(unittest.TestCase):
 
 
 class StrictNullAdmissionTests(unittest.TestCase):
-    SCALARS = ("null", "0", "[]")
+    SCALARS = ("null", "0", "[]", "true")
 
     def test_missing_static_registry_follows_row_policy(self):
         checker = load_script(CHECKER, "known_failing_checker_registry_absent")
@@ -1057,6 +1057,7 @@ class StrictNullAdmissionTests(unittest.TestCase):
             ("docs/known-limitations.md", b'# Known limitations\n\xff\n', [], "known-issue registry: cannot read"),
             ("results.json", b'{"results": [\xff]}\n', ["--results"], "cannot read"),
             (".github/workflows/main.yml", b'jobs:\n  test: \xff\n', [], "cannot parse workflow"),
+            (".github/workflows/bad.yml", b'jobs:\n  test: [unclosed\n', [], "cannot parse workflow"),
         )
         for name, content, flag, needle in cases:
             with self.subTest(name=name):
@@ -1480,7 +1481,7 @@ class FragmentAdmissionTests(unittest.TestCase):
         self.assertEqual(process["state"], "passed")
 
     def test_null_and_scalar_fragments_are_fragment_invalid(self):
-        for text in ("null", "0", "[]"):
+        for text in ("null", "0", "[]", "true", "{oops"):
             with self.subTest(text=text):
                 runner = load_script(ROOT / "scripts/run-python-suites.py",
                                      "python_suite_runner_null_doc")
@@ -1994,7 +1995,7 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertIn("missing or invalid JSON", result.stderr)
 
     def test_converter_rejects_null_and_scalar_sidecars_typed(self):
-        for content in ("null\n", '"s"\n'):
+        for content in ("null\n", '"s"\n', "true\n"):
             with self.subTest(content=content):
                 with tempfile.TemporaryDirectory() as temporary:
                     temp = Path(temporary)
@@ -2014,7 +2015,7 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
 
     def test_converter_rejects_null_and_scalar_registry_typed(self):
-        for content in ("null\n", "0\n", "[]\n", '"s"\n', "true\n"):
+        for content in ("null\n", "0\n", "[]\n", '"s"\n', "true\n", "{oops\n"):
             with self.subTest(content=content):
                 with tempfile.TemporaryDirectory() as temporary:
                     temp = Path(temporary)
@@ -2141,6 +2142,35 @@ class PrivilegedTypedBranchTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("selection is empty or duplicated", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_converter_rejects_verdict_shape_violations_typed(self):
+        converter = ROOT / "scripts/ci/privileged-lib-results.py"
+        name = "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64"
+        cases = (
+            ("bad-verdict", f"{name}\tMAYBE\n", "verdict outside the closed"),
+            ("sidecar-on-pass", f"{name}\tPASS\t/tmp/x.json\n", "passing verdict carries"),
+            ("unmapped", ("NoSuchTestXYZ123\tPASS\n", "NoSuchTestXYZ123\n"),
+             "no unambiguous Rust source path"),
+        )
+        for label, payload, needle in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    temp = Path(temporary)
+                    selection = temp / "selection.txt"
+                    verdicts = temp / "verdicts.tsv"
+                    output = temp / "out.json"
+                    if label == "unmapped":
+                        verdicts.write_text(payload[0])
+                        selection.write_text(payload[1])
+                    else:
+                        selection.write_text(name + "\n")
+                        verdicts.write_text(payload)
+                    result = subprocess.run([sys.executable, "-I", str(converter), str(selection),
+                                             str(verdicts), str(output), "github"],
+                                            capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(needle, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
 
     def test_converter_missing_selection_is_typed(self):
         converter = ROOT / "scripts/ci/privileged-lib-results.py"

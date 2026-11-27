@@ -47466,11 +47466,23 @@ int main(void) {
                 1,
                 "pid 9's hook queues past the spent pool"
             );
-            // Every holder folds while the hook queues: the visit
-            // finds no holders left.
+            // Folds pace by design (INV-2): drive passes until every
+            // holder has folded, then the visit finds no holders left.
             native.scene.coordinator.note_rendered_callers(&doomed);
-            let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
-            assert_eq!(receipt.retired, 1100, "every holder folds before the drain");
+            let mut retired_total = 0u64;
+            for _ in 0..8 {
+                let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
+                retired_total += receipt.retired;
+                if native.scene.coordinator.rendered_len_for_test() == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                native.scene.coordinator.rendered_len_for_test(),
+                0,
+                "every holder folds before the drain"
+            );
+            assert_eq!(retired_total, 1100, "all 1100 holders folded");
             assert_eq!(
                 native.scene.coordinator.adapter.proven_count(9),
                 0,
@@ -47487,6 +47499,60 @@ int main(void) {
                 1,
                 "the zero-holder visit costs exactly one unit"
             );
+        });
+    }
+
+    #[test]
+    fn a_system_scope_fold_remainder_stays_carried_for_the_next_pass() {
+        // Paced-fold twin: one pass retires only part of the 1100
+        // holders, and the remainder stays carried — retired plus
+        // carried still sums to every noted holder, and later passes
+        // complete the fold with nothing left behind.
+        agreeing(|| {
+            let mut scene = CaptureScene::new(2);
+            scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::System);
+            let mut native = NativeScene::over(scene, 0);
+            native.scene.attach_all(100, ScopeCustody::System);
+            let doomed = admit_hot_pid(&mut native.scene, 9, 1100);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.scene.coordinator.engine.scope = Scope::System;
+            native.scene.coordinator.exit_clocks_comparable = true;
+            native.scene.coordinator.note_rendered_callers(&doomed);
+            let first = native.scene.coordinator.retire_rendered_callers(600, None);
+            assert!(
+                first.retired > 0 && first.retired < 1100,
+                "one pass folds part of the holders, not all: {}",
+                first.retired
+            );
+            let carried = native.scene.coordinator.rendered_len_for_test();
+            assert!(carried > 0, "the unreached remainder stays carried");
+            assert_eq!(
+                first.retired as usize + carried,
+                1100,
+                "the remainder is carried, not lost"
+            );
+            assert!(
+                native.scene.coordinator.adapter.proven_count(9) > 0,
+                "carried holders still prove"
+            );
+            let mut retired_total = first.retired;
+            for _ in 0..8 {
+                if native.scene.coordinator.rendered_len_for_test() == 0 {
+                    break;
+                }
+                let receipt = native.scene.coordinator.retire_rendered_callers(600, None);
+                retired_total += receipt.retired;
+            }
+            assert_eq!(retired_total, 1100, "later passes complete the fold");
+            assert_eq!(
+                native.scene.coordinator.adapter.proven_count(9),
+                0,
+                "no holder survives the fold"
+            );
+            let quiet = native.scene.coordinator.retire_rendered_callers(600, None);
+            assert_eq!(quiet.retired, 0, "nothing left to fold");
         });
     }
 

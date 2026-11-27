@@ -5687,8 +5687,8 @@ mod tests {
 
     /// Production startup selects the live inputs: the observer's own
     /// mount table, and the real group opener — without the grant the
-    /// real `start()` fails closed with the exact fanotify_init
-    /// refusal (it only ever proceeds with privileges). Pointing
+    /// real `start()` fails closed with the stable fanotify_init
+    /// refusal prefix (it only ever proceeds with privileges). Pointing
     /// startup anywhere else, or swapping the opener, fails this twin.
     /// (Unprivileged in the named gate; root truthfully proceeds.)
     #[test]
@@ -5697,10 +5697,14 @@ mod tests {
             super::production_mountinfo_path(),
             std::path::PathBuf::from("/proc/self/mountinfo")
         );
+        // The refusal site and shape are stable (`fanotify_init`
+        // failed); only the trailing OS errno text varies by
+        // kernel/libc/seccomp, so the twin pins the prefix.
         match super::FileLearner::start() {
-            Err(absent) => assert_eq!(
-                absent.reason,
-                "fanotify_init failed: Operation not permitted (os error 1)"
+            Err(absent) => assert!(
+                absent.reason.starts_with("fanotify_init failed: "),
+                "missing grant fails closed at group open: {}",
+                absent.reason
             ),
             Ok(_) => {
                 // SAFETY: geteuid takes no arguments and always succeeds.
@@ -5708,6 +5712,52 @@ mod tests {
                 assert!(root, "startup proceeds only with the grant");
             }
         }
+    }
+
+    /// Static guard over the two thin production wrapper selections no
+    /// unprivileged test can execute: `FileLearner::start` must route
+    /// its mount-table path through `production_mountinfo_path()` (never
+    /// an inline literal), and `begin_drain` must run `drain_loop`
+    /// (never a substitute body). Swapping either selection fails this
+    /// twin; the privileged live cells plus the 4100-mount live run
+    /// execute both selections behaviorally. (Unprivileged: reads its
+    /// own production source like `resume_io_sites_admit_every_syscall`.)
+    #[test]
+    fn learn_production_wrappers_select_pinned_leaves() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(manifest.join("src/fanotify.rs"))
+            .expect("own source is readable");
+        let cut = source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("test module marker");
+        let production = &source[..cut];
+        let start_at = production
+            .find("pub(crate) fn start()")
+            .expect("FileLearner::start exists");
+        let begin_at = production
+            .find("pub(crate) fn begin_drain(&mut self)")
+            .expect("begin_drain exists");
+        let with_at = production
+            .find("fn begin_drain_with(")
+            .expect("begin_drain_with exists");
+        assert!(
+            start_at < begin_at && begin_at < with_at,
+            "impl order assumed by the guard"
+        );
+        let start_body = &production[start_at..begin_at];
+        let begin_body = &production[begin_at..with_at];
+        assert!(
+            start_body.contains("production_mountinfo_path()"),
+            "start routes its table path through the pinned leaf"
+        );
+        assert!(
+            !start_body.contains("/proc/self/mountinfo"),
+            "no inline table literal in start"
+        );
+        assert!(
+            begin_body.contains("begin_drain_with(drain_loop)"),
+            "begin_drain runs the real drain loop"
+        );
     }
 
     /// The driver stops between slices once cancelled, preserving the
@@ -6488,6 +6538,9 @@ mod tests {
                 let _ = done_tx.send(());
             })
             .unwrap();
+        // Six 50 ms ticks run with an hour period, so no due tick can
+        // occur (the margin is the whole hour); an unconditional spawn
+        // would already have fired several times.
         std::thread::sleep(Duration::from_millis(300));
         state
             .shutdown
@@ -6562,8 +6615,9 @@ mod tests {
             assert!(Instant::now() < gate, "refusals never happen");
             std::thread::sleep(Duration::from_millis(1));
         }
-        // Let the second refusal's tick settle, then stop and join.
-        std::thread::sleep(Duration::from_millis(100));
+        // Let the second refusal's tick settle (its send, if any, lands
+        // microseconds after the observed counter bump on the same tick;
+        // 100 ms is pure slack), then stop and join.
         state
             .shutdown
             .store(true, std::sync::atomic::Ordering::Release);

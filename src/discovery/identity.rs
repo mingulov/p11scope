@@ -4532,6 +4532,68 @@ impl PinnedObjects {
         self.raw_to_id.insert(prearm_raw, scan_id);
     }
 
+    /// Resolve a learned-note key to the planned same-file object
+    /// across a pre-6.8 overlay split, so the note folds onto the live
+    /// row instead of publishing a ghost `prearm`-only row for the same
+    /// file. The note is keyed by the fd-domain pin identity while the
+    /// plan adopts the maps-domain scan object; the join crosses that
+    /// split only on proof, mirroring
+    /// [`refile_split_prearm_alias`](Self::refile_split_prearm_alias):
+    /// a pin filed under the note key carries the pin-time
+    /// self-mapping proof (`Entry::probed_maps_key`) naming the maps
+    /// key, and the one planned object answering that maps key
+    /// ([`object_matches_key`](Self::object_matches_key), a selector)
+    /// is the same complete opened-file identity
+    /// ([`exactly_matches`](Self::exactly_matches), the authority).
+    /// Anything else fails closed to `None` and the note keeps its
+    /// own terminal record: a poisoned note key, an unproven or
+    /// collapsed pin, a collapsed target, ambiguity (never across a
+    /// heuristic collapse, never by key equality alone — inode
+    /// numbers repeat across btrfs subvolumes and overlay layers),
+    /// and genuinely distinct files.
+    pub(crate) fn resolve_split_note_target(
+        &self,
+        learned_key: ObjectKey,
+        planned: &[PinnedObjectId],
+    ) -> Option<PinnedObjectId> {
+        if self.rejected_keys.contains(&learned_key) {
+            return None;
+        }
+        let mut targets = BTreeSet::new();
+        for (id, entry) in &self.by_id {
+            if entry.raw.key != learned_key || entry.collapsed {
+                continue;
+            }
+            let Some(probed) = entry.probed_maps_key else {
+                continue;
+            };
+            for target in planned {
+                let Some(known) = self.by_id.get(target) else {
+                    continue;
+                };
+                if known.collapsed {
+                    continue;
+                }
+                if !self.object_matches_key(
+                    *target,
+                    probed.device.major,
+                    probed.device.minor,
+                    probed.inode,
+                ) {
+                    continue;
+                }
+                if !self.exactly_matches(*target, self, *id) {
+                    continue;
+                }
+                targets.insert(*target);
+            }
+        }
+        if targets.len() == 1 {
+            return targets.into_iter().next();
+        }
+        None
+    }
+
     /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed
     /// maps key, at pin time.
     ///
@@ -20221,6 +20283,273 @@ mod tests {
             kept.id_for_prearm(fd_key, PATH),
             Some(id),
             "the fd key still routes to the kept object"
+        );
+    }
+
+    /// The runtime post-rekey split shape without merging: the scan pin
+    /// files first, then the fd-keyed pre-arm pin files beside it (a
+    /// late learned staging after the live object re-keyed
+    /// maps-canonical). Returns the pins plus the scan object's id.
+    fn unmerged_split_pair(
+        fd_key: ObjectKey,
+        maps_key: ObjectKey,
+        prearm_file: &std::sync::Arc<std::fs::File>,
+        scan_file: &std::sync::Arc<std::fs::File>,
+    ) -> (PinnedObjects, PinnedObjectId) {
+        use super::test_fixture::{SHA, reback, split_prearm_pin, split_scan_pin};
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, scan_file);
+        let mut pins = PinnedObjects::empty();
+        assert!(pins.absorb(scan).is_empty());
+        let mut prearm = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut prearm, prearm_file);
+        assert!(pins.absorb(prearm).is_empty());
+        assert_eq!(pins.pinned().count(), 2, "the split files two objects");
+        let scan_id = pins
+            .pinned()
+            .find(|pin| pin.key == maps_key)
+            .expect("the scan object files under the maps key")
+            .id;
+        (pins, scan_id)
+    }
+
+    /// A learned note under the fd key joins its planned same-file scan
+    /// object across the overlay split (the pre-6.8 ghost row): the
+    /// pin-time self-mapping proof plus complete opened-file identity
+    /// resolve it to the planned object.
+    #[test]
+    fn split_note_resolves_to_planned_same_file_object() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            Some(scan_id),
+            "the fd-keyed note resolves to the planned scan object"
+        );
+    }
+
+    /// Characterization twin: a note for a genuinely different file
+    /// (own keys under both domains) never resolves to the planned
+    /// object — it keeps its own terminal row, in both directions.
+    #[test]
+    fn split_note_for_a_distinct_file_resolves_to_nothing() {
+        use super::test_fixture::{INODE, backing_file, overlay};
+        use p11scope_manifest::maps::ObjectKey;
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let (mut pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let other_inode = INODE + 1;
+        let other_fd_key = ObjectKey {
+            device: fd_key.device,
+            inode: other_inode,
+        };
+        let other_maps_key = ObjectKey {
+            device: maps_key.device,
+            inode: other_inode,
+        };
+        let (other_pins, _) = unmerged_split_pair(other_fd_key, other_maps_key, &other, &other);
+        assert!(pins.absorb(other_pins).is_empty());
+        assert_eq!(pins.pinned().count(), 4, "two files stay four objects");
+        let scan_id = pins
+            .pinned()
+            .find(|pin| pin.key == maps_key)
+            .expect("file A's scan object")
+            .id;
+        let other_scan_id = pins
+            .pinned()
+            .find(|pin| pin.key == other_maps_key)
+            .expect("file B's scan object")
+            .id;
+        assert_eq!(
+            pins.resolve_split_note_target(other_fd_key, &[scan_id]),
+            None,
+            "the other file's note never resolves to this plan"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[other_scan_id]),
+            None,
+            "this file's note never resolves to the other plan"
+        );
+    }
+
+    /// Guard twin (btrfs shape): same proved maps key, same inode
+    /// number and bytes, but a different held-fd device — the identity
+    /// conjuncts must refuse the join, so the note keeps its own row.
+    #[test]
+    fn split_note_with_same_maps_key_but_different_file_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, split_prearm_pin};
+        let fd_key = overlay(41);
+        let other_fd_key = overlay(42);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let mut foreign = split_prearm_pin(other_fd_key, maps_key, SHA, 1);
+        reback(&mut foreign, &other);
+        for entry in foreign.by_id.values_mut() {
+            entry.fd_dev = entry.fd_dev.wrapping_add(1);
+        }
+        assert!(pins.absorb(foreign).is_empty());
+        assert_eq!(
+            pins.resolve_split_note_target(other_fd_key, &[scan_id]),
+            None,
+            "a different file never resolves even under one proved maps key"
+        );
+    }
+
+    /// Without the pin-time self-mapping proof there is no split to
+    /// resolve: the note keeps its own row (fail closed).
+    #[test]
+    fn split_note_without_pintime_proof_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, prearm_pin, reback, split_scan_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, &file);
+        let mut pins = PinnedObjects::empty();
+        assert!(pins.absorb(scan).is_empty());
+        let mut prearm = prearm_pin(fd_key, SHA, 1);
+        reback(&mut prearm, &file);
+        assert!(pins.absorb(prearm).is_empty());
+        assert_eq!(pins.pinned().count(), 2, "the split files two objects");
+        let scan_id = pins
+            .pinned()
+            .find(|pin| pin.key == maps_key)
+            .expect("the scan object")
+            .id;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "an unproven note never resolves"
+        );
+    }
+
+    /// The identity delegation: same proved maps key and same file
+    /// shape, but a different digest — the digest conjunct must refuse
+    /// the join, so the note keeps its own row.
+    #[test]
+    fn split_note_with_digest_mismatch_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        pins.by_id.get_mut(&scan_id).expect("scan entry").sha256 = "deadbeef".into();
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a digest mismatch never resolves"
+        );
+    }
+
+    /// Ambiguity twin: two planned scan objects proving the same maps
+    /// key with the same identity (filed by hand — the absorb would
+    /// merge them) — the exactly-one-match arm must abstain (fail
+    /// closed). Unplanned twins never count: with one planned object
+    /// the same pins resolve.
+    #[test]
+    fn split_note_with_two_matching_targets_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, split_scan_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let mut twin = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut twin, &file);
+        let (_, entry) = twin.by_id.pop_first().unwrap();
+        let raw = entry.raw.clone();
+        let twin_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(twin_id, entry);
+        pins.raw_to_id.insert(raw, twin_id);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id, twin_id]),
+            None,
+            "ambiguous targets never resolve"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            Some(scan_id),
+            "one planned target resolves; the unplanned twin never counts"
+        );
+    }
+
+    /// A planned target across a heuristic collapse never resolves:
+    /// the collapse proves no physical identity, so the note keeps
+    /// its own row (fail closed).
+    #[test]
+    fn split_note_to_a_collapsed_target_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        pins.by_id.get_mut(&scan_id).expect("scan entry").collapsed = true;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a collapsed target never resolves"
+        );
+    }
+
+    /// A collapsed note pin never resolves either (same fail-closed
+    /// rule on the candidate side).
+    #[test]
+    fn split_note_from_a_collapsed_pin_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let fd_id = pins
+            .pinned()
+            .find(|pin| pin.key == fd_key)
+            .expect("the fd object")
+            .id;
+        pins.by_id.get_mut(&fd_id).expect("fd entry").collapsed = true;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a collapsed pin never resolves"
+        );
+    }
+
+    /// A note key under proven collision never resolves: the key is
+    /// poisoned (two proven entries contradicted under it), so the
+    /// note keeps its own row even beside a valid pin and target.
+    #[test]
+    fn split_note_under_proven_collision_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay, prearm_pin, reback};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let mut divergent = prearm_pin(fd_key, "deadbeef", 1);
+        reback(&mut divergent, &file);
+        let _ = pins.absorb(divergent);
+        assert!(
+            pins.rejected_keys.contains(&fd_key),
+            "setup: the divergent pin poisons the fd key"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a poisoned key never resolves"
         );
     }
 

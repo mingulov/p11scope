@@ -51,7 +51,6 @@ unicode-width = { version = "=0.2.2", default-features = false }
 [dev-dependencies]
 jsonschema = { version = "0.60", default-features = false }
 p11scope-discover = { version = "0.7.2", path = "crates/discover" }
-parking_lot = "=0.12.5"
 sha2 = "=0.11.0"
 tempfile = "3"
 

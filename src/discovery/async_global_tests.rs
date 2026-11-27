@@ -25,9 +25,9 @@ impl Case {
     fn with_close_failure(fail_return: bool) -> Self {
         let (child, mut engine, modules) = engine_with_one_accepted_provider();
         // The ParkedSleep stays intact through all fallible fixture
-        // setup below; the transfer happens inside the `Self`
-        // construction in one expression, so no panic can intervene
-        // before `Case::drop` owns kill+wait.
+        // setup below, then moves into the `Self` under construction
+        // (whose ParkedSleep field owns kill+wait on drop), so no
+        // panic can intervene before an owner exists.
         engine.scope = Scope::System;
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let gate = Arc::clone(&release);

@@ -16,10 +16,10 @@ use crate::fixture_guard::DieWithParent as _;
 use crate::semantics::ProcessKey;
 use crate::trace_identity::TraceIdentityStore;
 use p11scope_ebpf_common::{Event, ImageIdentity};
-use parking_lot::{Mutex, MutexGuard};
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 const FRAME_NS: u64 = 200_000_000;
 const ATTEMPT_WAIT_NS: u64 = 500_000_000;
@@ -28,6 +28,40 @@ const MAX_ATTEMPTS: usize = 20;
 const READINESS_NS: u64 = 15_000_000_000;
 const START_NS: u64 = 100_000_000;
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Poison-recovery retries for [`lock_with_poison_recovery`]. Not a
+/// timing bound (no sleep in the loop — each iteration blocks in
+/// `lock()` itself); exhaustion means pathological repeated
+/// poisoning and panics loudly. Value is margin, not load-bearing.
+const CAPTURE_POISON_RETRIES: u32 = 100;
+
+/// Locks a serial mutex, tolerating poison: on `Err`, clears the
+/// flag and re-locks (the guarded value is `()`, so no data
+/// invariant is at stake). Releases are reserved for custody
+/// transfers, so this deliberately avoids `into_inner`.
+fn lock_with_poison_recovery(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    for _ in 0..CAPTURE_POISON_RETRIES {
+        match mutex.lock() {
+            Ok(guard) => return guard,
+            Err(_) => mutex.clear_poison(),
+        }
+    }
+    panic!("serial lock poisoned {CAPTURE_POISON_RETRIES} times in a row");
+}
+
+#[test]
+fn serial_lock_recovers_from_poison() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let local = Mutex::new(());
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _held = local.lock().unwrap();
+        panic!("deliberate poison for lock_with_poison_recovery");
+    }));
+    assert!(local.is_poisoned(), "the probe must actually poison");
+    let guard = lock_with_poison_recovery(&local);
+    assert!(!local.is_poisoned(), "recovery clears the flag");
+    drop(guard);
+}
 
 struct ProviderFixture {
     _directory: tempfile::TempDir,
@@ -327,9 +361,7 @@ impl Capture {
     fn build(unrelated: usize, system: bool, provider_stage: ProviderStage) -> Self {
         // The fixture owns up to 132 processes and their original pidfds. Keep
         // these controls serial even when the unit-test harness is parallel.
-        // parking_lot has no poison state: a panicked holder just
-        // unlocks, which is exactly the old into_inner recovery.
-        let serial = CAPTURE_LOCK.lock();
+        let serial = lock_with_poison_recovery(&CAPTURE_LOCK);
         let provider =
             (!matches!(provider_stage, ProviderStage::Absent)).then(ProviderFixture::new);
         let mut children = Children(Vec::new());
@@ -579,7 +611,7 @@ impl Capture {
 fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
     use std::io::Write as _;
 
-    let _serial = CAPTURE_LOCK.lock();
+    let _serial = lock_with_poison_recovery(&CAPTURE_LOCK);
     let provider = ProviderFixture::new();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
         Command::new("sh")

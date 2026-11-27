@@ -58953,9 +58953,9 @@ impl LazyLoader {
                 .unwrap()
                 .success()
         );
-        // Custody before readiness: the transient guard owns the child
-        // across the pipe takes; into_inner hands exactly one owner to
-        // the loader (whose Drop kills and reaps).
+        // Custody before readiness: the guard owns the child across
+        // the pipe takes, then moves into the loader (whose ParkedSleep
+        // field owns kill+wait on drop).
         let mut guard = ParkedSleep::spawn_unparked(
             std::process::Command::new(&binary)
                 .arg(provider)
@@ -62809,9 +62809,9 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = fixture();
         let mut children = Children(Vec::new());
         for id in 1..=2 {
-            // Custody before readiness: the transient guard owns the
-            // child across the fallible open; into_inner hands exactly
-            // one owner to the fixture table.
+            // Custody before readiness: the guard owns the child
+            // across the fallible open, then moves into the fixture
+            // table (whose ParkedSleep elements own kill+wait on drop).
             let guard =
                 ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
@@ -62988,9 +62988,9 @@ pub(crate) mod detailed_proof_driver {
     #[test]
     fn detailed_proof_baseline_request_rechecks_capacity_before_health() {
         let (mut engine, mut io) = fixture();
-        // Custody before readiness: the transient guard owns the child
+        // Custody before readiness: the guard is constructed owned
         // from the spawn statement, so no fallible step can precede an
-        // owner; into_inner hands exactly one owner to the table.
+        // owner; the table holds ParkedSleep elements.
         let children = Children(vec![ParkedSleep::spawn_unparked(
             std::process::Command::new("/bin/sleep").arg("600"),
         )]);
@@ -63198,9 +63198,9 @@ pub(crate) mod detailed_proof_driver {
         assert!(!engine.frame_deferred);
     }
     fn add_child_view(engine: &mut Engine, id: u32) -> Children {
-        // Custody before readiness: the transient guard owns the child
-        // across the fallible open; into_inner hands exactly one owner
-        // to the returned table.
+        // Custody before readiness: the guard owns the child
+        // across the fallible open, then moves into the returned
+        // table (whose ParkedSleep elements own kill+wait on drop).
         let guard =
             ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
         engine
@@ -63703,9 +63703,9 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = cgroup_fixture();
         let mut children = Children(Vec::new());
         for id in 1..=9 {
-            // Custody before readiness: the transient guard owns the
-            // child across the fallible open; into_inner hands exactly
-            // one owner to the fixture table.
+            // Custody before readiness: the guard owns the child
+            // across the fallible open, then moves into the fixture
+            // table (whose ParkedSleep elements own kill+wait on drop).
             let guard =
                 ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
@@ -64206,9 +64206,9 @@ pub(crate) mod detailed_proof_driver {
         let (mut engine, mut io) = cgroup_fixture();
         let mut children = Children(Vec::new());
         for id in 1..=9 {
-            // Custody before readiness: the transient guard owns the
-            // child across the fallible open; into_inner hands exactly
-            // one owner to the fixture table.
+            // Custody before readiness: the guard owns the child
+            // across the fallible open, then moves into the fixture
+            // table (whose ParkedSleep elements own kill+wait on drop).
             let guard =
                 ParkedSleep::spawn_unparked(std::process::Command::new("/bin/sleep").arg("600"));
             engine
@@ -100710,7 +100710,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
-            348,
+            380,
             21,
             "Command::new(/bin/sleep)",
             "build",
@@ -100718,7 +100718,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
-            355,
+            387,
             17,
             "Command::new(/bin/sleep)",
             "build",
@@ -101024,9 +101024,9 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
             ("src/discovery/engine_tests.rs".to_string(), 22971),
             ("src/discovery/engine_tests.rs".to_string(), 22982),
             ("src/discovery/engine_tests.rs".to_string(), 23332),
-            ("src/discovery/trace_system_seed_tests.rs".to_string(), 70),
-            ("src/discovery/trace_system_seed_tests.rs".to_string(), 346),
-            ("src/discovery/trace_system_seed_tests.rs".to_string(), 846),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 104),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 378),
+            ("src/discovery/trace_system_seed_tests.rs".to_string(), 878),
             (
                 "src/discovery/inventory_workload_tests.rs".to_string(),
                 1985
@@ -101060,7 +101060,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
-            346,
+            378,
             "children.0.push(child);",
             25,
             &[
@@ -101071,7 +101071,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/trace_system_seed_tests.rs",
-            846,
+            878,
             "capture._children.0.push(child);",
             6,
             &["ProviderFixture::ready", "ProcessView::open"],
@@ -107978,9 +107978,10 @@ impl TeardownChild {
             .status()
             .unwrap();
         assert!(built.success(), "fixture build failed: {built}");
-        // Custody before readiness: the transient guard owns the 1 GiB
-        // child (it pauses forever) across the readiness poll below;
-        // into_inner hands exactly one owner to the returned fixture.
+        // Custody before readiness: the guard owns the 1 GiB child
+        // (it pauses forever) across the readiness poll below, then
+        // moves into the returned fixture (whose ParkedSleep field
+        // owns kill+wait on drop).
         let mut guard = ParkedSleep::spawn_unparked(
             std::process::Command::new(&executable)
                 .arg("1")

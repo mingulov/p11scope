@@ -605,7 +605,6 @@ dependencies = [
  "p11scope-discover",
  "p11scope-ebpf-common",
  "p11scope-manifest",
- "parking_lot",
  "pkcs11-module",
  "pkcs11-types",
  "serde",

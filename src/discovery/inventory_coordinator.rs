@@ -29732,6 +29732,7 @@ exit 0
             PairTarget::Dropped {
                 base: 10,
                 base_since: 0,
+                pid: 0,
             },
         );
         let mut dropped = PairRecovery::scripted(dropped_id, 0, ModuleId(3));
@@ -29892,6 +29893,7 @@ exit 0
             PairTarget::Dropped {
                 base: 10,
                 base_since: 100,
+                pid: 0,
             },
         );
         let mut recovery = PairRecovery::scripted(live, 0, ModuleId(3));
@@ -29937,7 +29939,8 @@ exit 0
                 native.scene.coordinator.pair_targets.get(&key),
                 Some(PairTarget::Dropped {
                     base: 10,
-                    base_since: 100
+                    base_since: 100,
+                    ..
                 })
             ),
             "the Dropped base stays untouched"
@@ -30072,6 +30075,7 @@ exit 0
             PairTarget::Dropped {
                 base: 10,
                 base_since: 0,
+                pid: 0,
             },
         );
         let mut recovery = PairRecovery::scripted(live, 0, ModuleId(3));
@@ -30080,10 +30084,11 @@ exit 0
         recovery.discarded_through = 10;
         native.scene.coordinator.recoveries.insert(key, recovery);
         native.scene.coordinator.recovery_order.push(key);
+        let mut gone_memo = std::collections::HashMap::new();
         native
             .scene
             .coordinator
-            .prune_dropped_pair_targets(EXEC_STATE_GRACE_NS + 1000);
+            .prune_dropped_pair_targets(EXEC_STATE_GRACE_NS + 1000, &mut gone_memo);
         assert!(
             !native.scene.coordinator.pair_targets.contains_key(&key),
             "the due Dropped row leaves the live map"

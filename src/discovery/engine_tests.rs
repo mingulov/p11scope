@@ -87552,6 +87552,7 @@ fn candidate_carry_with_pin_loss_refuses() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     let err = engine
         .preflight_candidate_publication(&stale)
@@ -87585,9 +87586,10 @@ fn candidate_build_with_retired_owner_files_fail_closed_gap() {
     let (mut engine, victim, _healthy, victim_reconciled) =
         committed_two_provider_engine_with_pin_loss();
     let victim_view = victim_reconciled.scanned.view;
-    engine
-        .pinned
-        .remove_view_except(victim_view, &BTreeSet::new());
+    engine.pinned.retire_view_only_if_proven_gone(
+        victim_view,
+        RetirementProof::OperatorRemoval,
+    );
     engine.views.retain(|view| view.id() != victim_view);
     let victim_key = engine
         .plan
@@ -87646,6 +87648,7 @@ fn preflight_passes_pinless_plan_module() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     assert!(candidate.pinned.summary(victim).is_none());
     assert!(candidate.pinned.summary(healthy).is_some());
@@ -87682,6 +87685,7 @@ fn fresh_module_without_pin_still_refuses_candidate() {
         exec_preservations: Vec::new(),
         exec_completions: Vec::new(),
         built_by_full_rebuild: false,
+        modules_unchanged: false,
     };
     assert!(candidate.pinned.summary(victim).is_none());
     let err = engine
@@ -91442,6 +91446,7 @@ fn learned_pin_lines_engine() -> (
             display_path: library.to_string_lossy().into_owned(),
             loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
             loader_unknown_reason: None,
+            loader_pid: None,
             run_learned: false,
             proving_retained: false,
         },

@@ -8059,6 +8059,7 @@ impl CallerRegistry {
             subject: REVIVED_FOLDED_COUNT.into(),
             reason: format!("the pair revived past a counted fold for absolute count range ({base}, {absolute}] ({} unattributed calls); the folded base stays in the class aggregate and no pre-revival use is recorded", absolute - base),
             budget: None,
+            units: None,
         });
     }
 

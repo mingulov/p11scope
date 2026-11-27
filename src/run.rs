@@ -14918,7 +14918,7 @@ mod tests {
         let mut seen: std::collections::BTreeSet<(usize, String)> =
             std::collections::BTreeSet::new();
         let mut seed_names: Vec<String> = Vec::new();
-        for (file, (_, lines, code_lines)) in sources.iter().enumerate() {
+        for (file, (_, _, code_lines)) in sources.iter().enumerate() {
             let bare_capture = sources[file].0 == "src/run.rs";
             for (number, code) in code_lines.iter().enumerate() {
                 if is_fn_def(code) {
@@ -14964,7 +14964,7 @@ mod tests {
                 .collect();
             seed_names.clear();
             for helper in &helpers_now {
-                for (file, (_, lines, code_lines)) in sources.iter().enumerate() {
+                for (file, (_, _, code_lines)) in sources.iter().enumerate() {
                     for (number, code) in code_lines.iter().enumerate() {
                         if is_fn_def(code) {
                             continue;

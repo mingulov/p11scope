@@ -116,6 +116,7 @@ fn validate(config: &Config) -> anyhow::Result<crate::cli::CaptureArgs> {
 #[test]
 #[ignore = "owned root first-use observer; frozen config, supervisor and exclusive BPF lane required"]
 fn system_capture_observer_facts() {
+    let _signal_guard = crate::run::ActualSignalTestGuard::hold();
     // SAFETY: geteuid has no arguments or memory effects.
     assert_eq!(
         unsafe { libc::geteuid() },

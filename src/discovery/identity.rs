@@ -2889,6 +2889,20 @@ impl PinnedObjects {
         }
     }
 
+    /// Test-only export witness: sets the pin's dynsym names so bound
+    /// modules carry agreeing exports through bind, like a real scan
+    /// pin's inspection. Panics when the pin is missing.
+    #[cfg(test)]
+    pub(crate) fn set_pin_exports_for_test(
+        &mut self,
+        id: PinnedObjectId,
+        exports: Vec<(String, u64)>,
+    ) {
+        let entry = self.by_id.get_mut(&id).expect("exports need their pin");
+        entry.exports = std::sync::Arc::from(exports);
+        self.bump_revision();
+    }
+
     /// Fault injection for the missing-pin tail twin: the pin is gone
     /// but the module stays planned. Mirrors production removal (raw
     /// filings dropped with index invalidation, proven targets

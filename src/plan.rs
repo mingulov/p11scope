@@ -2397,6 +2397,13 @@ impl AttachPlan {
             .unwrap_or_default()
     }
 
+    /// Test-only read of the standard-layout slot set, so carry twins
+    /// can assert the verified basis before driving the re-proof.
+    #[cfg(test)]
+    pub(crate) fn standard_layout_slots_for_test(&self) -> &BTreeSet<u32> {
+        &self.standard_layout_slots
+    }
+
     /// Test-only: drops every unnamed-reason entry, so counter-staging
     /// twins can compare the same plan with and without reasons.
     #[cfg(test)]

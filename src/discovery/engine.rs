@@ -14167,7 +14167,7 @@ struct LoaderLocator {
 /// degrade at merge with named gaps instead of refusing the
 /// candidate. Callers that mutate identity itself keep the strict
 /// check below.
-fn candidate_mutation_inputs_are_complete(
+pub(crate) fn candidate_mutation_inputs_are_complete(
     modules: &[ReconciledModule],
     delta: &plan::AttachDelta,
     pinned: &PinnedObjects,
@@ -14204,7 +14204,7 @@ fn omitted_key_has_live_owner(
         .any(|owner| !exited_views.contains(owner) && views.iter().any(|view| view.id() == *owner))
 }
 
-fn candidate_identity_is_complete(
+pub(crate) fn candidate_identity_is_complete(
     plan: &plan::AttachPlan,
     modules: &[ReconciledModule],
     pinned: &PinnedObjects,
@@ -20094,7 +20094,18 @@ impl Engine {
         let delta = candidate_plan
             .extend_exact_with_stable_module_ids(rebuilt)
             .map_err(anyhow::Error::msg)?;
-        if !candidate_mutation_inputs_are_complete(&modules, &delta, &pinned) {
+        // Strict whole-candidate identity here, not the narrowed
+        // mutation-input check: every rebuild source is pin-gated
+        // (strict bind; manifest lowering skips without a pin;
+        // prearm pieces resolve through pins), extend takes its
+        // modules verbatim from the rebuild, and pins are only read
+        // between the rebuild above and this guard — so a pinless
+        // committed row can only ever arrive already dropped, and the
+        // two predicates coincide on every reachable state. The
+        // narrowing lives at preflight, where post-build staleness
+        // genuinely diverges. The omission filing below is this
+        // site's degradation.
+        if !candidate_identity_is_complete(&candidate_plan, &modules, &pinned) {
             bail!("live candidate mutation inputs lack exact pinned identity");
         }
         // Committed-plan rows the rebuild omitted while pinless degrade

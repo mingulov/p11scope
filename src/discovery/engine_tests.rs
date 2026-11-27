@@ -87333,6 +87333,248 @@ fn candidate_build_with_dropped_owner_files_no_omission_gap() {
     );
 }
 
+/// Sole-complete-shaped reconciled module over an overlay pin: 68-entry
+/// own-object table with agreeing exports. A finished scan grants
+/// standard layout; an unfinished one only re-proves it (carry).
+fn sole_table_module(
+    key: ObjectKey,
+    view: ProcessViewId,
+    object: PinnedObjectId,
+    finished: bool,
+) -> ReconciledModule {
+    let names: Vec<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .map(|field| field.name)
+        .collect();
+    assert_eq!(names.len(), 68, "sole-complete shape needs 68 functions");
+    let entries: Vec<ScannedEntry> = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ScannedEntry {
+            name,
+            object: key,
+            object_path: OVERLAY_PATH.into(),
+            file_offset: 0x1000 + index as u64 * 8,
+        })
+        .collect();
+    let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+        entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect::<Vec<_>>(),
+    );
+    ReconciledModule {
+        exports,
+        getter_present: false,
+        witness_fault: false,
+        object,
+        entry_objects: vec![vec![object; entries.len()]],
+        forward_verified: vec![vec![false; entries.len()]],
+        scanned: ScannedModule {
+            key_is_identity: false,
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: None,
+            view,
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 1,
+                inode: key.device.minor,
+            },
+            key,
+            path: OVERLAY_PATH.into(),
+            tables_scan_finished: finished,
+            decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries,
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+                file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
+                extension_impossible: false,
+            }],
+            interfaces: vec![],
+        },
+    }
+}
+
+/// A carried module that loses its pin after the build refuses
+/// like all fresh input: the victim's verified sole-complete table
+/// re-proves unfinished across the rebuild (carry: no delta entry,
+/// module retained), but the freshly bound module without a pin
+/// fails both predicates, so preflight refuses and committed state
+/// is preserved. Fails while a carried pinless module slips past
+/// the guard.
+#[test]
+fn candidate_carry_with_pin_loss_refuses() {
+    let key_v = overlay_key(86);
+    let key_h = overlay_key(87);
+    let view_v = ProcessViewId(86);
+    let view_h = ProcessViewId(87);
+    let dir = tempfile::tempdir().expect("backing dir");
+    let mut pins = overlay_pins(&[(key_v, OVERLAY_SHA, 1)]);
+    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    let mut pins_h = overlay_pins(&[(key_h, OVERLAY_SHA, 2)]);
+    overlay_reback(&mut pins_h, &overlay_backing_file(&dir, "b.so"));
+    record_scan_ownership(&mut pins, view_v, key_v, OVERLAY_PATH);
+    record_scan_ownership(&mut pins_h, view_h, key_h, OVERLAY_PATH);
+    assert!(pins.absorb(pins_h).is_empty());
+    let id_v = pins
+        .pinned()
+        .find(|summary| summary.key == key_v)
+        .expect("victim pin")
+        .id;
+    let victim_finished = sole_table_module(key_v, view_v, id_v, true);
+    let victim_unfinished = sole_table_module(key_v, view_v, id_v, false);
+    let raw_h = overlay_module(key_h);
+    pins.set_pin_exports_for_test(id_v, victim_finished.exports.to_vec());
+    pins.prove_scanned_entries_for_test(&[
+        victim_finished.scanned.clone(),
+        victim_unfinished.scanned.clone(),
+        raw_h.clone(),
+    ]);
+    // Default-bind the victim once so the strict rebind at construction
+    // finds retained inputs; the committed plan below still uses the
+    // hand-built sole shape (default bind cannot mint agreeing exports).
+    let (setup_rec, skipped) =
+        bind_scanned_modules(&[victim_finished.scanned.clone(), raw_h.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(setup_rec.len(), 2, "setup binds victim and healthy");
+    let healthy_rec = vec![setup_rec[1].clone()];
+    let mut engine = Engine::empty();
+    engine
+        .views
+        .push(ProcessView::open(view_v, std::process::id()).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(view_h, std::process::id()).unwrap());
+    engine.plan = plan::build_from_reconciled_modules(&[victim_finished, healthy_rec[0].clone()]);
+    engine.pinned = pins;
+    engine.modules = healthy_rec.clone();
+    engine
+        .modules
+        .insert(0, sole_table_module(key_v, view_v, id_v, true));
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    let victim_module = engine
+        .plan
+        .modules
+        .iter()
+        .find(|m| m.object == id_v)
+        .expect("the victim is planned")
+        .clone();
+    let victim_slots: Vec<_> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| slot.module_ids == vec![victim_module.id])
+        .collect();
+    assert_eq!(victim_slots.len(), 68, "the victim plans 68 sole slots");
+    assert!(
+        victim_slots.iter().all(|slot| slot.semantic_authorized),
+        "the finished scan grants semantics"
+    );
+    assert!(
+        victim_slots.iter().all(|slot| {
+            engine
+                .plan
+                .standard_layout_slots_for_test()
+                .contains(&slot.index)
+        }),
+        "the victim slots carry standard layout"
+    );
+    // The rescan re-proves the verified table unfinished: extend
+    // carries all 68 slots with no delta entry while the module stays
+    // planned. A pinless rescan could never bind, so carry plus a
+    // missing pin is reachable only as post-build staleness — and the
+    // carried module was freshly bound, so both predicates refuse it.
+    engine.modules.clear();
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            vec![victim_unfinished.scanned.clone(), raw_h],
+            Vec::new(),
+        )
+        .expect("construction admits the carried candidate");
+    for op in candidate
+        .delta
+        .new
+        .iter()
+        .chain(candidate.delta.replace.iter())
+        .chain(candidate.delta.retire.iter())
+    {
+        assert_ne!(op.object, id_v, "the carried victim takes no delta entry");
+    }
+    assert!(
+        candidate.plan.modules.iter().any(|m| m.object == id_v),
+        "the carried victim stays in the candidate plan"
+    );
+    engine.pinned.remove_pin_for_test(id_v);
+    assert!(
+        !candidate_identity_is_complete(&candidate.plan, &candidate.modules, &engine.pinned),
+        "the whole-candidate predicate refuses the carried pinless module"
+    );
+    assert!(
+        !candidate_mutation_inputs_are_complete(
+            &candidate.modules,
+            &candidate.delta,
+            &engine.pinned
+        ),
+        "the mutation-input predicate refuses the freshly bound pinless module"
+    );
+    let stale = LiveCandidate {
+        pinned: engine.pinned.clone(),
+        modules: candidate.modules.clone(),
+        plan: candidate.plan.clone(),
+        delta: plan::AttachDelta {
+            new: candidate.delta.new.clone(),
+            replace: candidate.delta.replace.clone(),
+            retire: candidate.delta.retire.clone(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    };
+    let err = engine
+        .preflight_candidate_publication(&stale)
+        .expect_err("preflight refuses the carried pinless module");
+    assert!(
+        format!("{err:#}").contains("pinned identity"),
+        "the refusal names identity: {err:#}"
+    );
+    let kept: Vec<_> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.module_ids == vec![victim_module.id] && engine.plan.is_active(slot.index)
+        })
+        .collect();
+    assert_eq!(kept.len(), 68, "refusal preserves the committed slots");
+    assert!(
+        kept.iter().all(|slot| slot.descriptor_index != 0),
+        "refusal preserves the committed descriptors"
+    );
+}
+
 /// Candidate preflight with a pinless committed-plan module passes
 /// instead of bailing: only fresh mutation inputs need exact pins.
 /// Fails while preflight refuses the whole candidate on staleness.

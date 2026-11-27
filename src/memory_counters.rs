@@ -134,7 +134,8 @@ pub(crate) struct NativeRetentionLens {
     pub pair_totals: CounterRow,
     pub pair_folded: CounterRow,
     pub pair_fold_lost: CounterRow,
-    pub pair_fold_lost_classes: CounterRow,
+    pub pair_fold_lost_overflow: CounterRow,
+    pub pair_fold_lost_poisoned: CounterRow,
     pub preadmission: CounterRow,
     pub pending_ids: CounterRow,
     pub placement_generations: CounterRow,
@@ -394,7 +395,8 @@ pub(crate) struct MemorySnapshot {
     r1_native_pair_totals: Option<CounterRow>,
     r1_native_pair_folded: Option<CounterRow>,
     r1_native_pair_fold_lost: Option<CounterRow>,
-    r1_native_pair_fold_lost_classes: Option<CounterRow>,
+    r1_native_pair_fold_lost_overflow: Option<CounterRow>,
+    r1_native_pair_fold_lost_poisoned: Option<CounterRow>,
     r1_native_preadmission: Option<CounterRow>,
     r1_native_pending_ids: Option<CounterRow>,
     r1_native_placement_generations: Option<CounterRow>,
@@ -581,7 +583,8 @@ impl MemorySnapshot {
             r1_native_pair_totals: None,
             r1_native_pair_folded: None,
             r1_native_pair_fold_lost: None,
-            r1_native_pair_fold_lost_classes: None,
+            r1_native_pair_fold_lost_overflow: None,
+            r1_native_pair_fold_lost_poisoned: None,
             r1_native_preadmission: None,
             r1_native_pending_ids: None,
             r1_native_placement_generations: None,
@@ -696,7 +699,8 @@ impl MemorySnapshot {
             r1_native_pair_totals: Some(lens.native.pair_totals),
             r1_native_pair_folded: Some(lens.native.pair_folded),
             r1_native_pair_fold_lost: Some(lens.native.pair_fold_lost),
-            r1_native_pair_fold_lost_classes: Some(lens.native.pair_fold_lost_classes),
+            r1_native_pair_fold_lost_overflow: Some(lens.native.pair_fold_lost_overflow),
+            r1_native_pair_fold_lost_poisoned: Some(lens.native.pair_fold_lost_poisoned),
             r1_native_preadmission: Some(lens.native.preadmission),
             r1_native_pending_ids: Some(lens.native.pending_ids),
             r1_native_placement_generations: Some(lens.native.placement_generations),
@@ -1077,7 +1081,8 @@ mod tests {
                 pair_totals: row(27),
                 pair_folded: row(40),
                 pair_fold_lost: row(41),
-                pair_fold_lost_classes: row(42),
+                pair_fold_lost_overflow: row(42),
+                pair_fold_lost_poisoned: row(44),
                 preadmission: row(32),
                 pending_ids: row(28),
                 placement_generations: row(29),
@@ -1252,10 +1257,17 @@ mod tests {
         assert_eq!(inventory.r1_native_pair_fold_lost.expect("native").len, 41);
         assert_eq!(
             inventory
-                .r1_native_pair_fold_lost_classes
+                .r1_native_pair_fold_lost_overflow
                 .expect("native")
                 .len,
             42
+        );
+        assert_eq!(
+            inventory
+                .r1_native_pair_fold_lost_poisoned
+                .expect("native")
+                .len,
+            44
         );
         assert_eq!(inventory.r1_native_preadmission.expect("native").len, 32);
         assert_eq!(
@@ -1296,7 +1308,8 @@ mod tests {
         assert!(trace.r1_native_pair_targets.is_none());
         assert!(profile.r1_native_pair_folded.is_none());
         assert!(trace.r1_native_pair_fold_lost.is_none());
-        assert!(profile.r1_native_pair_fold_lost_classes.is_none());
+        assert!(profile.r1_native_pair_fold_lost_overflow.is_none());
+        assert!(trace.r1_native_pair_fold_lost_poisoned.is_none());
         assert_eq!(inventory.r1_native_binder.expect("binder").len, 39);
         assert_eq!(inventory.r1_ownership.expect("ownership").len, 43);
         assert_eq!(inventory.caller_metadata_table.expect("metadata").len, 47);
@@ -1470,7 +1483,8 @@ mod tests {
                 pair_totals: cap(1024, 64),
                 pair_folded: cap(65_536, 48),
                 pair_fold_lost: cap(65_536, 48),
-                pair_fold_lost_classes: cap(1024, 64),
+                pair_fold_lost_overflow: cap(65_536, 48),
+                pair_fold_lost_poisoned: cap(1024, 64),
                 preadmission: cap(4096, 112),
                 pending_ids: cap(65_536, 128),
                 placement_generations: cap(65_536, 64),

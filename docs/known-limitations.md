@@ -2973,8 +2973,10 @@ The old bounds are measurements, not a product startup SLA.
   only that pair's own revival-shaped staging with no fold memory
   files the same gap over the outer-bound window instead of
   re-crediting, then consumes the latch so later growth stages. Past
-  the prune bound the latch set stops growing and further evictions
-  count on a bounded per-class fallback instead, one gap per unit.
+  the prune bound a second exact tier covers further evictions the
+  same way; past both tiers the class is poisoned instead, so every
+  revival-shaped first staging there gaps without consuming and
+  uncertain pre-loss calls can never become positive attribution.
   Room for a pass's folds is pre-evicted once per pass with a single
   window of probes; the due loop then only inserts. Both victim
   sweeps rotate oldest-first with a resume cursor, like the age drain,

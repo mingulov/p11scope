@@ -7223,24 +7223,37 @@ def self_test():
             "wrong ia32 future-minor surface count",
             lambda d: d["evidence"]["surfaces"][-1].update(functions=92),
         ),
-        (
-            "ia32 scan table attributed to another object",
-            lambda d: d["evidence"]["surfaces"][-1].update(
-                source="/evil/not-the-observed-provider.so table 3.9"
-            ),
-        ),
-        (
-            "ia32 future-minor surface relabeled to another version",
-            lambda d: d["evidence"]["surfaces"][-1].update(
-                source="/opt/p11.so table 3.8"
-            ),
-        ),
     ):
         bad = copy.deepcopy(safe32)
         mutate(bad)
         settle_fixture_verdict(bad)
         rejected(lambda bad=bad: validate_canary("default-safe-profile", bad, 32))
     print("canary ABI-specific scan shapes and cross-width refusals: OK")
+    # IA32 typed-layer kills: counter-neutral source mutations the backstop
+    # cannot see (walk/functions unchanged), so only the exact typed
+    # partition rejects — asserted by message, as on LP64.
+    for label, source in (
+        ("wrong-object", "/evil/not-the-observed-provider.so table 3.9"),
+        ("wrong-version", "/opt/p11.so table 3.8"),
+    ):
+        bad = copy.deepcopy(safe32)
+        bad["evidence"]["surfaces"][-1]["source"] = source
+        require(
+            surface_signature(bad["evidence"])
+            == surface_signature(safe32["evidence"]),
+            f"ia32 typed-check mutation is not counter-neutral: {label}",
+        )
+        settle_fixture_verdict(bad)
+        try:
+            validate_canary("default-safe-profile", bad, 32)
+        except AssertionError as error:
+            require(
+                str(error).startswith("canary scan table "),
+                f"ia32 mutation rejected by another layer: {label}: {error}",
+            )
+        else:
+            raise AssertionError(f"ia32 typed check missed: {label}")
+    print("canary ia32 typed partition rejects counter-neutral mislabels: OK")
 
     for mutate in (
         lambda d: d["evidence"].pop("interface_selection"),

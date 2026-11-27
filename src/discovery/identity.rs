@@ -3605,6 +3605,18 @@ impl PinnedObjects {
         self.ownership.get(&view)
     }
 
+    /// Views whose raw ownership still names `key`. Pin loss keeps the
+    /// raw view link (the pin is gone but the viewing process is not),
+    /// while view retirement drops it with the view — so this tells a
+    /// live view's unattributed rows from a dead view's retirement.
+    pub fn raw_owner_views(&self, key: &ObjectKey) -> Vec<ProcessViewId> {
+        self.raw_ownership
+            .iter()
+            .filter(|(_, raws)| raws.iter().any(|raw| raw.key == *key))
+            .map(|(view, _)| *view)
+            .collect()
+    }
+
     /// Test-only read of every view holding an ownership entry, so
     /// discarded-candidate oracles pin the absence of phantom owners.
     #[cfg(test)]

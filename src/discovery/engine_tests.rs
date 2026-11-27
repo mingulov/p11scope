@@ -87185,10 +87185,14 @@ fn committed_two_provider_engine_with_pin_loss()
     let view_a = raw_a.view;
     let view_b = raw_b.view;
     let dir = tempfile::tempdir().expect("backing dir");
+    let backing_a = overlay_backing_file(&dir, "a.so");
+    let backing_b = overlay_backing_file(&dir, "b.so");
     let mut pins = overlay_pins(&[(raw_a.key, OVERLAY_SHA, 1)]);
-    overlay_reback(&mut pins, &overlay_backing_file(&dir, "a.so"));
+    overlay_reback(&mut pins, &backing_a);
     let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
-    overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
+    overlay_reback(&mut pins_b, &backing_b);
+    record_scan_ownership(&mut pins, view_a, raw_a.key, OVERLAY_PATH);
+    record_scan_ownership(&mut pins_b, view_b, raw_b.key, OVERLAY_PATH);
     assert!(pins.absorb(pins_b).is_empty());
     pins.prove_scanned_entries_for_test(&[raw_a.clone(), raw_b.clone()]);
     let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
@@ -87260,6 +87264,19 @@ fn candidate_build_succeeds_with_pinless_plan_module() {
             "every mutation op carries an exact pin"
         );
     }
+    let victim_module = engine
+        .plan
+        .modules
+        .iter()
+        .find(|m| m.object == victim)
+        .expect("the victim stays planned");
+    assert!(
+        !candidate
+            .pinned
+            .raw_owner_views(&victim_module.key)
+            .is_empty(),
+        "pin loss keeps the raw view link for the live owner"
+    );
     let victim_path = engine.plan.modules[0].path.clone();
     let expected = format!(
         "planned object '{}' lost its comparable pin before evidence rendered; its calls are unattributed",
@@ -87277,6 +87294,42 @@ fn candidate_build_succeeds_with_pinless_plan_module() {
         gaps,
         vec![("planned provider object", expected.as_str())],
         "one exact gap names the omitted victim"
+    );
+}
+
+/// Omission gaps stay silent when the omitted object has no live
+/// claimant left: the victim's view is fully retired and dropped, so
+/// its rows are retirement, not unattributed use. Fails while
+/// construction files pin-loss gaps for unclaimed rows.
+#[test]
+fn candidate_build_with_dropped_owner_files_no_omission_gap() {
+    let (mut engine, victim, _healthy, victim_reconciled) =
+        committed_two_provider_engine_with_pin_loss();
+    let victim_view = victim_reconciled.scanned.view;
+    engine.views.retain(|view| view.id() != victim_view);
+    assert!(
+        engine.views.iter().all(|view| view.id() != victim_view),
+        "the victim's view is gone"
+    );
+    let raw_b = overlay_module(overlay_key(87));
+    let candidate = engine
+        .live_candidate(engine.pinned.clone(), vec![raw_b], Vec::new())
+        .expect("construction admits the degraded candidate");
+    assert!(
+        candidate.pinned.summary(victim).is_none(),
+        "the victim stays pinless in the candidate"
+    );
+    let gaps: Vec<&str> = engine
+        .capture_facts
+        .history
+        .losses
+        .values()
+        .filter(|loss| loss.reason.contains("lost its comparable pin"))
+        .map(|loss| loss.reason.as_str())
+        .collect();
+    assert!(
+        gaps.is_empty(),
+        "a dropped owner's rows retire silently: {gaps:?}"
     );
 }
 

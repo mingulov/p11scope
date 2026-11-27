@@ -14182,6 +14182,28 @@ fn candidate_mutation_inputs_are_complete(
             .all(|slot| pinned.summary(slot.object).is_some())
 }
 
+/// Whether `key` is still raw-owned by a live view: omission gaps
+/// file unless every owner is proven-exited or dropped. Pin loss keeps
+/// the raw view link, so a live view's unattributed rows file; view
+/// retirement drops it, so a dead view's rows retire silently. An
+/// object with no recorded owner at all files while any view is
+/// alive (fail closed: an unknown owner may be live), and stays
+/// silent only when no live view exists — then no live owner can.
+fn omitted_key_has_live_owner(
+    views: &[ProcessView],
+    pinned: &PinnedObjects,
+    exited_views: &BTreeSet<ProcessViewId>,
+    key: &ObjectKey,
+) -> bool {
+    let owners = pinned.raw_owner_views(key);
+    if owners.is_empty() {
+        return views.iter().any(|view| !exited_views.contains(&view.id()));
+    }
+    owners
+        .iter()
+        .any(|owner| !exited_views.contains(owner) && views.iter().any(|view| view.id() == *owner))
+}
+
 fn candidate_identity_is_complete(
     plan: &plan::AttachPlan,
     modules: &[ReconciledModule],
@@ -20080,7 +20102,15 @@ impl Engine {
         // module into history losses, plus one per orphan pinless slot
         // of a kept module. Keyed insertion deduplicates across
         // batches; healthy dropped rows stay silent (normal
-        // retention, nothing lost).
+        // retention, nothing lost), as do rows owned only by
+        // proven-exited views (an exited view makes no calls, so its
+        // dropped rows are retirement, not unattributed use).
+        let exited_views: BTreeSet<ProcessViewId> = self
+            .views
+            .iter()
+            .filter(|view| self.original_exited(view.id()))
+            .map(|view| view.id())
+            .collect();
         let mut omission_gaps = Vec::new();
         for module in &self.plan.modules {
             if candidate_plan
@@ -20091,6 +20121,9 @@ impl Engine {
                 continue;
             }
             if pinned.summary(module.object).is_some() {
+                continue;
+            }
+            if !omitted_key_has_live_owner(&self.views, &pinned, &exited_views, &module.key) {
                 continue;
             }
             omission_gaps.push(Skipped {
@@ -20117,11 +20150,14 @@ impl Engine {
             if pinned.summary(slot.object).is_some() {
                 continue;
             }
-            let module_kept = slot
+            let publisher = slot
                 .module_ids
                 .iter()
-                .any(|id| candidate_plan.modules.iter().any(|kept| kept.id == *id));
-            if !module_kept {
+                .find_map(|id| candidate_plan.modules.iter().find(|kept| kept.id == *id));
+            let Some(publisher) = publisher else {
+                continue;
+            };
+            if !omitted_key_has_live_owner(&self.views, &pinned, &exited_views, &publisher.key) {
                 continue;
             }
             omission_gaps.push(Skipped {

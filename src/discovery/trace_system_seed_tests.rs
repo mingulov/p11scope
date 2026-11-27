@@ -16,10 +16,10 @@ use crate::fixture_guard::DieWithParent as _;
 use crate::semantics::ProcessKey;
 use crate::trace_identity::TraceIdentityStore;
 use p11scope_ebpf_common::{Event, ImageIdentity};
+use parking_lot::{Mutex, MutexGuard};
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
 
 const FRAME_NS: u64 = 200_000_000;
 const ATTEMPT_WAIT_NS: u64 = 500_000_000;
@@ -327,9 +327,9 @@ impl Capture {
     fn build(unrelated: usize, system: bool, provider_stage: ProviderStage) -> Self {
         // The fixture owns up to 132 processes and their original pidfds. Keep
         // these controls serial even when the unit-test harness is parallel.
-        let serial = CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        // parking_lot has no poison state: a panicked holder just
+        // unlocks, which is exactly the old into_inner recovery.
+        let serial = CAPTURE_LOCK.lock();
         let provider =
             (!matches!(provider_stage, ProviderStage::Absent)).then(ProviderFixture::new);
         let mut children = Children(Vec::new());
@@ -579,9 +579,7 @@ impl Capture {
 fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
     use std::io::Write as _;
 
-    let _serial = CAPTURE_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _serial = CAPTURE_LOCK.lock();
     let provider = ProviderFixture::new();
     let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
         Command::new("sh")

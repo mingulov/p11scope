@@ -8,7 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 struct Case {
-    child: std::process::Child,
+    // ParkedSleep owns kill+wait on drop; push the guard, never release.
+    child: ParkedSleep,
     engine: Engine,
     session: ScriptedSession,
     modules: Vec<ScannedModule>,
@@ -59,7 +60,7 @@ impl Case {
         let mut session = ScriptedSession::default();
         session.global_retirement = Some(RefCell::new(fixture));
         Self {
-            child: child.into_inner(),
+            child,
             engine,
             session,
             modules,
@@ -97,7 +98,7 @@ impl Case {
     }
 
     fn bounded_scope(&mut self) -> tempfile::TempDir {
-        let (bounded, directory) = engine_over_cgroup_naming(&[self.child.id()]);
+        let (bounded, directory) = engine_over_cgroup_naming(&[self.child.pid()]);
         self.engine.scope = bounded.scope;
         self.engine.frame_work_budget_ns = u64::MAX;
         directory
@@ -105,7 +106,7 @@ impl Case {
 
     fn full_requests(&mut self) {
         self.engine
-            .request_refresh_consumed(self.child.id(), Some(11));
+            .request_refresh_consumed(self.child.pid(), Some(11));
         for offset in 0..MAX_PENDING_REFRESH - 1 {
             assert!(
                 self.engine
@@ -147,8 +148,7 @@ impl Case {
 impl Drop for Case {
     fn drop(&mut self) {
         self.release();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // child field drops itself (kill+wait) after release.
     }
 }
 
@@ -273,7 +273,7 @@ fn async_global_owned_only_retire_detaches_synchronously_without_ticket() {
     // capture always did) instead of parking an async global ticket, so
     // the refresh tick completes inside the pause deadline.
     let mut case = Case::new();
-    case.engine.owned_run_pid = Some(case.child.id());
+    case.engine.owned_run_pid = Some(case.child.pid());
     let candidate = case.candidate();
     let outcome = case
         .engine
@@ -316,7 +316,7 @@ fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
     // parking an async global ticket (on 6.6 the ticket parked the tick
     // incomplete, the pause went partial, and first-burst calls raced).
     let mut case = Case::new();
-    case.engine.owned_run_pid = Some(case.child.id());
+    case.engine.owned_run_pid = Some(case.child.pid());
     let slot_object = case.engine.plan.slots[0].object;
     let summary = case.engine.pinned.summary(slot_object).unwrap();
     let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
@@ -393,7 +393,7 @@ fn async_global_owned_only_retire_covers_module_first_seen_in_candidate() {
     // retire parks an async global ticket, the pause tick stays
     // incomplete and the owned child is released before attach.
     let mut case = Case::new();
-    case.engine.owned_run_pid = Some(case.child.id());
+    case.engine.owned_run_pid = Some(case.child.pid());
     let candidate = case.candidate();
     assert!(
         candidate.modules.iter().any(|module| {
@@ -439,7 +439,7 @@ fn async_global_owned_only_retire_covers_candidate_module_without_entry_objects(
     // table entry objects bound yet, so only the module's own object ties
     // the retiring static slot (on that same file) to the owned child.
     let mut case = Case::new();
-    case.engine.owned_run_pid = Some(case.child.id());
+    case.engine.owned_run_pid = Some(case.child.pid());
     let mut candidate = case.candidate();
     let retiring = candidate.delta.retire[0].object;
     assert!(
@@ -487,7 +487,7 @@ fn async_global_candidate_module_of_unowned_view_keeps_async_ticket() {
     // the owned run child, so the same module-first-seen retire keeps
     // the ordinary async global path.
     let mut case = Case::new();
-    case.engine.owned_run_pid = Some(case.child.id().wrapping_add(1_000_000));
+    case.engine.owned_run_pid = Some(case.child.pid().wrapping_add(1_000_000));
     let candidate = case.candidate();
     case.engine.modules.clear();
     let outcome = case
@@ -666,7 +666,7 @@ fn async_global_empty_queue_poll_keeps_pending_without_progress_or_scan() {
 #[test]
 fn async_global_settlement_requests_one_fresh_frame_and_keeps_original_intent() {
     let mut case = Case::new();
-    let pid = case.child.id();
+    let pid = case.child.pid();
     case.engine.request_refresh(pid, Some(123));
     let original = case.engine.refresh_queue[&pid].clone();
     case.hold_pending();
@@ -701,7 +701,7 @@ fn async_global_settlement_requests_one_fresh_frame_and_keeps_original_intent() 
 fn async_global_deferred_apply_does_not_settle_original_exec_markers() {
     let mut case = Case::new();
     let view = case.engine.views[0].id();
-    let pid = case.child.id();
+    let pid = case.child.pid();
     case.engine.request_refresh(pid, Some(456));
     let serial = case.engine.refresh_queue[&pid].serial;
     case.engine.exec_rearm_views.insert(view, Some(serial));
@@ -803,7 +803,7 @@ fn async_global_mid_batch_handoff_preserves_due_fallback_instead_of_scanning() {
 fn async_global_pending_frames_preserve_scope_and_all_original_ages() {
     let mut case = Case::new();
     let scope = case.bounded_scope();
-    let pid = case.child.id();
+    let pid = case.child.pid();
     case.engine.request_refresh_consumed(pid, Some(123));
     case.engine.newcomer_first_seen.insert(9_000_000, Some(321));
     let requests = case.engine.refresh_queue.snapshot_map_for_test();
@@ -894,7 +894,7 @@ fn async_global_settled_frame_rechecks_current_scope_instead_of_old_candidate() 
     let mut case = Case::new();
     let scope = case.bounded_scope();
     case.engine
-        .request_refresh_consumed(case.child.id(), Some(101));
+        .request_refresh_consumed(case.child.pid(), Some(101));
     let candidate = case.candidate();
     let outcome = case
         .engine
@@ -937,10 +937,10 @@ fn async_global_settled_frame_rechecks_current_scope_instead_of_old_candidate() 
 fn async_global_pending_records_keep_newer_exec_order_and_transport_loss() {
     let mut case = Case::new();
     case.engine
-        .request_refresh_consumed(case.child.id(), Some(31));
+        .request_refresh_consumed(case.child.pid(), Some(31));
     let original = case.engine.refresh_queue.snapshot_map_for_test();
     case.hold_pending();
-    let first = refresh_exec(case.child.id());
+    let first = refresh_exec(case.child.pid());
     let second = refresh_exec(9_000_000);
     case.engine
         .apply_discovery_batch(&mut case.session, vec![first.record, second.record], 1)
@@ -953,7 +953,7 @@ fn async_global_pending_records_keep_newer_exec_order_and_transport_loss() {
     assert_eq!(case.engine.pending_discovery_records.len(), 2);
     assert_eq!(
         case.engine.pending_discovery_records[0].record.pid_tgid >> 32,
-        u64::from(case.child.id())
+        u64::from(case.child.pid())
     );
     assert_eq!(
         case.engine.pending_discovery_records[1].record.pid_tgid >> 32,
@@ -1189,7 +1189,7 @@ fn async_global_fix_round_nonpressure_backlog_handoff_keeps_fifo_over_one_quantu
         .clone();
     let address = mapping.start + 1;
     let context = case.scan_context(case.engine.views[0].id(), Some(mapping));
-    let mut loader = loader_record_for(context.context, case.child.id());
+    let mut loader = loader_record_for(context.context, case.child.pid());
     loader.table_ptr = address;
     loader.hook_ts_ns = case.engine.views[0].admitted_ns() + 1;
     case.session.counters.loader_hits = 1;

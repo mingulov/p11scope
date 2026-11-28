@@ -26,8 +26,8 @@ import tempfile
 import time
 
 CHILD_COUNT = 10
-FIRST_CHILD_DELAY_S = 3.0
-CHILD_INTERVAL_S = 2.0
+FIRST_CHILD_DELAY_S = 8.0
+CHILD_INTERVAL_S = 1.2
 
 CKF_SERIAL_SESSION = 1 << 1
 CKF_RW_SESSION = 1 << 2
@@ -159,8 +159,11 @@ def parent(module: str, interval: float, child_python: str) -> int:
         raise RuntimeError(f"churn child probe failed: {probe.stderr[:200]}")
     print("ready", flush=True)
     deadline = time.monotonic() + 60
-    # First spawn waits out cgroup setup and observer attach so the child is
-    # inside the capture from birth; after CHILD_COUNT the parent idles.
+    # First spawn waits out cgroup setup and observer attach (first pass
+    # lands ~5s in; a child born earlier can exit unseen and break exact
+    # closure). With delay 8.0 + 10 children at 1.2s cadence every child is
+    # born inside the capture after attach settled and lives across several
+    # passes; after CHILD_COUNT the parent idles.
     next_child = time.monotonic() + FIRST_CHILD_DELAY_S
     spawned = 0
     children: list[subprocess.Popen] = []

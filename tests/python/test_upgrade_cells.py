@@ -121,6 +121,133 @@ def parity_doc(n_callers, child_entries=0, folded_callers=0, folded_entries=0):
             "modules": [{"departed_use": departed}]}
 
 
+LEDGER_CALLS_PER_DIGEST = [
+    "C_GetSlotList",
+    "C_GetSlotList",
+    "C_OpenSession",
+    "C_DigestInit",
+    "C_Digest",
+    "C_CloseSession",
+]
+LEDGER_CHILD_COUNT = 10
+
+
+def ledger_child_record(index, pid, start_mono, start_wall=1700000000.0,
+                        digests=8, exit_code=0):
+    """One typed workload ledger child record (mirrors the producer)."""
+    return {
+        "ledger_version": 1,
+        "index": index,
+        "pid": pid,
+        "start_mono": start_mono,
+        "start_wall": start_wall,
+        "digests_completed": digests,
+        "calls_per_digest": list(LEDGER_CALLS_PER_DIGEST),
+        "exit_code": exit_code,
+    }
+
+
+def write_ledger_dir(base, *, n=LEDGER_CHILD_COUNT, first_pid=4242,
+                     attach_mono=1000.0, birth_offset=10.0, spacing=1.2,
+                     crashed=(), missing=(), no_final=False, no_attach=False,
+                     final_overrides=None, pids=None):
+    """Write a workload ledger dir: child-NN.json records + final + attach.
+
+    crashed indexes land in final.crashed (exit 1, completed excludes
+    them); missing indexes are claimed by final but have no record file.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    pids = list(pids) if pids is not None else [first_pid + i for i in range(n)]
+    children = [i for i in range(n) if i not in crashed]
+    for i in children:
+        if i in missing:
+            continue
+        record = ledger_child_record(
+            i, pids[i], attach_mono + birth_offset + i * spacing)
+        (base / f"child-{i:02d}.json").write_text(json.dumps(record))
+    for i in crashed:
+        record = ledger_child_record(
+            i, pids[i], attach_mono + birth_offset + i * spacing,
+            digests=None, exit_code=1)
+        (base / f"child-{i:02d}.json").write_text(json.dumps(record))
+    if not no_final:
+        final = {
+            "ledger_version": 1,
+            "child_count": n,
+            "spawned": n,
+            "completed": len(children),
+            "children": children,
+            "crashed": [
+                {"index": i, "pid": pids[i], "exit_code": 1}
+                for i in crashed
+            ],
+            "workload_pid": 4241,
+        }
+        if final_overrides:
+            final.update(final_overrides)
+        (base / "final.json").write_text(json.dumps(final))
+    if not no_attach:
+        (base / "attach.json").write_text(json.dumps({
+            "attach_mono": attach_mono,
+            "capture_started_wall": 1700000000.0,
+        }))
+    return base
+
+
+def ledgered_doc(*, n_rows=LEDGER_CHILD_COUNT, first_pid=4242, measured=True,
+                 edge_count=48, folded_pids=(), departed_measured=True,
+                 departed_count=0, gap_pids=(),
+                 gap_reason="use_before_admission"):
+    """Minimal inventory doc whose caller/edge/folded/gap pids are known."""
+    callers = []
+    edges = []
+    for i in range(n_rows):
+        callers.append({
+            "id": f"c{i}", "pid": first_pid + i,
+            "first_seen_ns": 0, "last_seen_ns": 100 if i == 0 else 10,
+        })
+        edges.append({
+            "caller": f"c{i}",
+            "entries": {
+                "count": edge_count,
+                "observation": (
+                    "observed" if measured
+                    else "unknown (usage observation unavailable)"
+                ),
+            },
+        })
+    departed = None
+    if folded_pids:
+        departed = {
+            "callers": len(folded_pids),
+            "edges": len(folded_pids),
+            "entries": {
+                "count": departed_count,
+                "coverage": {
+                    "counted": 1 if departed_measured else 0,
+                    "witnessed": 0,
+                    "watched_no_use": 0,
+                },
+            },
+            "identities": [
+                {"caller": f"fold{pos}", "pid": pid}
+                for pos, pid in enumerate(folded_pids)
+            ],
+        }
+    gaps = [
+        {
+            "budget": None, "caller": None, "module": None, "pid": pid,
+            "reason": gap_reason, "repeats": 1,
+            "subject": "short-lived caller shed before admission",
+        }
+        for pid in gap_pids
+    ]
+    return {
+        "callers": callers, "edges": edges,
+        "modules": [{"departed_use": departed}], "gaps": gaps,
+    }
+
+
 def substantive_inventory(schema="p11scope/inventory/v1"):
     """One small but fully typed inventory document used by typed doubles.
 
@@ -747,13 +874,35 @@ class UpgradeGate6Harness:
     def base_inventory():
         return substantive_inventory()
 
+    @staticmethod
+    def ten_ledgered_rows(doc, edge_count=48):
+        """Grow the fixture's single caller row into ten measured rows.
+
+        Row pids 4242..4251 match the harness default ledger, so admission
+        passes by default and every scenario exercises its own check.
+        """
+        template_caller = copy.deepcopy(doc["callers"][0])
+        template_edge = copy.deepcopy(doc["edges"][0])
+        for index in range(1, LEDGER_CHILD_COUNT):
+            caller = copy.deepcopy(template_caller)
+            caller["id"] = f"c{index}"
+            caller["pid"] = template_caller["pid"] + index
+            doc["callers"].append(caller)
+            edge = copy.deepcopy(template_edge)
+            edge["caller"] = f"c{index}"
+            doc["edges"].append(edge)
+        for edge in doc["edges"]:
+            edge["entries"]["observation"] = "observed"
+            edge["entries"]["count"] = edge_count
+        return doc
+
     @classmethod
     def good_old_doc(cls):
-        return cls.base_inventory()
+        return cls.ten_ledgered_rows(cls.base_inventory())
 
     @classmethod
     def good_new_doc(cls):
-        doc = cls.base_inventory()
+        doc = cls.ten_ledgered_rows(cls.base_inventory())
         budgets = doc["budgets"]
         budgets["callers"].update(
             {"late_refused": 0, "retired": 0, "retired_with_calls": 0}
@@ -1121,6 +1270,8 @@ class UpgradeGate6Harness:
         profile_fixture_shape_valid=True,
         verify_pins=False,
         tamper_fixture=False,
+        old_ledger_spec=None,
+        new_ledger_spec=None,
     ):
         gate6 = self.gate6
         old_doc = copy.deepcopy(old_doc) if old_doc is not None else self.good_old_doc()
@@ -1147,8 +1298,24 @@ class UpgradeGate6Harness:
                 del module
                 if generate_error:
                     return generate_error
-                document = old_doc if binary == old_binary else new_doc
+                is_old = binary == old_binary
+                document = old_doc if is_old else new_doc
                 output.write_text(json.dumps(document))
+                spec = old_ledger_spec if is_old else new_ledger_spec
+                if spec is None:
+                    spec = {
+                        "pids": [
+                            row.get("pid")
+                            for row in document.get("callers", [])
+                            if isinstance(row, dict)
+                        ]
+                    }
+                spec = dict(spec)
+                if not spec.pop("absent", False):
+                    pids = spec.pop("pids", [])
+                    write_ledger_dir(
+                        gate6.ledger_dir_for(output), n=len(pids),
+                        pids=pids, **spec)
                 return ""
 
             fixture_path = gate6.PROFILE_FIXTURE
@@ -2564,47 +2731,35 @@ class UpgradeGate6PureTests(unittest.TestCase):
         for prefix, labels in committed["v072"].items():
             self.assertEqual(sorted(labels), sorted(committed["v071"][prefix]))
 
-    def test_admission_parity_folded_counts_close(self):
-        old = parity_doc(n_callers=11, child_entries=0)
-        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9)
-        for doc in (old, new):
-            for edge in doc["edges"]:
-                edge["entries"]["observation"] = "observed"
-        ok, detail = self.gate6.admission_parity(old, new)
-        self.assertTrue(ok, detail)
-
-    def test_admission_parity_shortfall_names_missing(self):
-        old = parity_doc(n_callers=11, child_entries=0)
-        new = parity_doc(n_callers=2, child_entries=0, folded_callers=8)
-        ok, detail = self.gate6.admission_parity(old, new)
-        self.assertFalse(ok)
-        self.assertIn("missing=1", detail)
-
     def test_admission_parity_entries_shortfall_fails(self):
-        old = parity_doc(n_callers=11, child_entries=10)
-        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
-                         folded_entries=5)
-        for doc in (old, new):
-            for edge in doc["edges"]:
-                edge["entries"]["observation"] = "observed"
-        ok, detail = self.gate6.admission_parity(old, new)
+        old = ledgered_doc(edge_count=48)
+        new = ledgered_doc(edge_count=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = write_ledger_dir(Path(tmp) / "old")
+            new_dir = write_ledger_dir(Path(tmp) / "new")
+            _, old_payload, _ = self.gate6.validate_ledger(old_dir, "old")
+            _, new_payload, _ = self.gate6.validate_ledger(new_dir, "new")
+            ok, detail = self.gate6.admission_parity(
+                old, new, old_payload, new_payload)
         self.assertFalse(ok)
         self.assertIn("entry shortfall", detail)
 
-    def test_admission_parity_entries_up_passes(self):
-        old = parity_doc(n_callers=11, child_entries=0)
-        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
-                         folded_entries=64)
-        for doc in (old, new):
-            for edge in doc["edges"]:
-                edge["entries"]["observation"] = "observed"
-        ok, detail = self.gate6.admission_parity(old, new)
-        self.assertTrue(ok, detail)
-
     def test_admission_parity_unmeasured_oracle_refuses(self):
-        old = parity_doc(n_callers=11, child_entries=0)
-        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9)
-        ok, detail = self.gate6.admission_parity(old, new)
+        # All ledger children accounted (one row, nine gaps) but the old
+        # entries oracle is unmeasured: non-ledger folded content with an
+        # unmeasured aggregate defeats the vacuous rule.
+        pids = [4242 + i for i in range(10)]
+        old = ledgered_doc(
+            n_rows=1, gap_pids=tuple(pids[1:]), folded_pids=(9999,),
+            departed_measured=False)
+        new = ledgered_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = write_ledger_dir(Path(tmp) / "old")
+            new_dir = write_ledger_dir(Path(tmp) / "new")
+            _, old_payload, _ = self.gate6.validate_ledger(old_dir, "old")
+            _, new_payload, _ = self.gate6.validate_ledger(new_dir, "new")
+            ok, detail = self.gate6.admission_parity(
+                old, new, old_payload, new_payload)
         self.assertFalse(ok)
         self.assertIn("entry oracle not measured", detail)
 
@@ -2790,6 +2945,211 @@ class UpgradeGate6PureTests(unittest.TestCase):
         self.assertFalse(self.gate6.cbom_profile_markers_present(changed))
 
 
+class UpgradeGate6LedgerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.gate6 = load_gate6()
+
+    def test_ledger_missing_dir_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, _, detail = self.gate6.validate_ledger(
+                Path(tmp) / "absent", "old")
+        self.assertFalse(ok)
+        self.assertIn("ledger missing:", detail)
+        self.assertIn("old", detail)
+
+    def test_ledger_missing_final_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger", no_final=True)
+            ok, _, detail = self.gate6.validate_ledger(ledger, "new")
+        self.assertFalse(ok)
+        self.assertIn("final", detail)
+
+    def test_ledger_missing_attach_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger", no_attach=True)
+            ok, _, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertFalse(ok)
+        self.assertIn("attach", detail)
+
+    def test_ledger_scale_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger", n=9)
+            ok, _, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertFalse(ok)
+        self.assertIn("child_count", detail)
+
+    def test_ledger_shortfall_refuses_naming_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger", crashed=(3,))
+            ok, _, detail = self.gate6.validate_ledger(ledger, "new")
+        self.assertFalse(ok)
+        self.assertIn("completed=9", detail)
+        self.assertIn("#3", detail)
+
+    def test_ledger_incomplete_child_file_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger", missing=(5,))
+            ok, _, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertFalse(ok)
+        self.assertIn("child-05", detail)
+
+    def test_ledger_record_untyped_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(Path(tmp) / "ledger")
+            record = json.loads((ledger / "child-02.json").read_text())
+            del record["pid"]
+            (ledger / "child-02.json").write_text(json.dumps(record))
+            ok, _, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertFalse(ok)
+        self.assertIn("child-02", detail)
+
+    def test_ledger_completed_crosscheck_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(
+                Path(tmp) / "ledger", crashed=(3,),
+                final_overrides={"completed": 10})
+            ok, _, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertFalse(ok)
+        self.assertIn("completed", detail)
+
+    def test_ledger_valid_passes_with_children_and_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = write_ledger_dir(
+                Path(tmp) / "ledger", attach_mono=1000.0)
+            ok, payload, detail = self.gate6.validate_ledger(ledger, "old")
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(payload["children"]), LEDGER_CHILD_COUNT)
+        self.assertEqual(payload["children"][0]["pid"], 4242)
+        self.assertEqual(payload["attach_mono"], 1000.0)
+
+    def test_before_admission_window_classifies_from_timing(self):
+        children = [
+            ledger_child_record(0, 4242, 1001.0),
+            ledger_child_record(1, 4243, 1010.0),
+        ]
+        early = self.gate6.before_admission_set(children, 1000.0)
+        self.assertEqual(early, {0})
+
+    def test_account_ledger_child_tiers(self):
+        doc = ledgered_doc(
+            n_rows=2, folded_pids=(4244,), gap_pids=(4245,))
+        row = ledger_child_record(0, 4242, 1010.0)
+        folded = ledger_child_record(1, 4244, 1011.0)
+        gap = ledger_child_record(2, 4245, 1012.0)
+        absent = ledger_child_record(3, 4999, 1013.0)
+        self.assertEqual(
+            self.gate6.account_ledger_child(doc, row)[0], "row")
+        self.assertEqual(
+            self.gate6.account_ledger_child(doc, folded)[0], "folded")
+        self.assertEqual(
+            self.gate6.account_ledger_child(doc, gap)[0], "gap")
+        tier, detail = self.gate6.account_ledger_child(doc, absent)
+        self.assertEqual(tier, "unaccounted")
+        self.assertIn("4999", detail)
+
+    def _validated_pair(self, tmp, old_kwargs=None, new_kwargs=None):
+        old_kwargs = old_kwargs or {}
+        new_kwargs = new_kwargs or {}
+        old_dir = write_ledger_dir(Path(tmp) / "old", **old_kwargs)
+        new_dir = write_ledger_dir(Path(tmp) / "new", **new_kwargs)
+        old_ok, old_payload, old_detail = self.gate6.validate_ledger(
+            old_dir, "old")
+        new_ok, new_payload, new_detail = self.gate6.validate_ledger(
+            new_dir, "new")
+        self.assertTrue(old_ok, old_detail)
+        self.assertTrue(new_ok, new_detail)
+        return old_payload, new_payload
+
+    def _parity(self, old, new, old_payload, new_payload):
+        return self.gate6.admission_parity(
+            old, new, old_payload, new_payload)
+
+    def test_admission_old_baseline_unaccounted_refuses(self):
+        old = ledgered_doc(n_rows=9)
+        new = ledgered_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(tmp)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertFalse(ok)
+        self.assertIn("old baseline unaccounted", detail)
+        self.assertIn("#9", detail)
+
+    def test_admission_regression_of_one_child_refuses(self):
+        old = ledgered_doc()
+        new = ledgered_doc(n_rows=9)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(tmp)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertFalse(ok)
+        self.assertIn("regression", detail)
+        self.assertIn("#9", detail)
+
+    def test_admission_row_usage_unknown_refuses(self):
+        old = ledgered_doc()
+        new = ledgered_doc(measured=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(tmp)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertFalse(ok)
+        self.assertIn("usage", detail)
+
+    def test_admission_folded_unmeasured_refuses(self):
+        old = ledgered_doc()
+        new = ledgered_doc(
+            n_rows=0, folded_pids=tuple(4242 + i for i in range(10)),
+            departed_measured=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(tmp)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertFalse(ok)
+        self.assertIn("folded", detail)
+
+    def test_admission_before_admission_sets_must_match(self):
+        old = ledgered_doc()
+        new = ledgered_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(
+                tmp, old_kwargs={"birth_offset": 1.0})
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertFalse(ok)
+        self.assertIn("before-admission", detail)
+
+    def test_admission_before_admission_gap_pair_passes(self):
+        pids = [4242 + i for i in range(10)]
+        old = ledgered_doc(n_rows=5, gap_pids=tuple(pids[5:]))
+        new = ledgered_doc(n_rows=5, gap_pids=tuple(pids[5:]))
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = write_ledger_dir(Path(tmp) / "old")
+            new_dir = write_ledger_dir(Path(tmp) / "new")
+            for ledger in (old_dir, new_dir):
+                for i in range(5, 10):
+                    record = json.loads(
+                        (ledger / f"child-{i:02d}.json").read_text())
+                    record["start_mono"] = 1001.0 + i * 0.1
+                    (ledger / f"child-{i:02d}.json").write_text(
+                        json.dumps(record))
+            old_ok, old_payload, _ = self.gate6.validate_ledger(
+                old_dir, "old")
+            new_ok, new_payload, _ = self.gate6.validate_ledger(
+                new_dir, "new")
+            self.assertTrue(old_ok)
+            self.assertTrue(new_ok)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertTrue(ok, detail)
+
+    def test_admission_parity_ledgered_close_passes(self):
+        pids = [4242 + i for i in range(10)]
+        old = ledgered_doc()
+        new = ledgered_doc(
+            n_rows=6, folded_pids=tuple(pids[6:8]),
+            gap_pids=tuple(pids[8:]), edge_count=96)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_payload, new_payload = self._validated_pair(tmp)
+            ok, detail = self._parity(old, new, old_payload, new_payload)
+        self.assertTrue(ok, detail)
+
+
 class UpgradeGate6ActivationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2815,6 +3175,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "inputs_present",
                 "reports_generated",
                 "inventory_reports_typed",
+                "ledgers_typed",
                 "admission_parity",
                 "cbom_reads_old",
                 "cbom_old_typed",
@@ -2849,26 +3210,20 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             {"path": "/x.so", "dev": 1, "ino": 2, "processes": 3}
         ]
         removed = self.harness.good_new_doc()
-        del removed["callers"][0]["app_hint"]
+        for row in removed["callers"]:
+            del row["app_hint"]
         old_departed = self.harness.good_old_doc()
         old_departed["modules"][0]["departed_use"] = None
-        thin_admission_old = self.harness.good_old_doc()
-        template_caller = copy.deepcopy(thin_admission_old["callers"][0])
-        template_edge = copy.deepcopy(thin_admission_old["edges"][0])
-        for index in (1, 2):
-            caller = copy.deepcopy(template_caller)
-            caller["id"] = f"c{index}"
-            caller["pid"] = template_caller["pid"] + index
-            thin_admission_old["callers"].append(caller)
-            edge = copy.deepcopy(template_edge)
-            edge["caller"] = f"c{index}"
-            thin_admission_old["edges"].append(edge)
-        for edge in thin_admission_old["edges"]:
-            edge["entries"]["observation"] = "observed"
-            edge["entries"]["count"] = 0
+        # Known-bad control: v0.7.1 accounts all ten ledger children while
+        # the regressed build's report keeps one row; both sides ran the
+        # same workload, so both ledgers carry the same ten pids.
+        good_pids = [
+            row["pid"] for row in self.harness.good_old_doc()["callers"]
+        ]
         thin_admission_new = self.harness.good_new_doc()
-        thin_admission_new["edges"][0]["entries"]["observation"] = "observed"
-        thin_admission_new["edges"][0]["entries"]["count"] = 0
+        del thin_admission_new["callers"][1:]
+        del thin_admission_new["edges"][1:]
+        thin_admission_ledger = {"pids": list(good_pids)}
 
         def then_missing(old, new):
             required = new["allOf"][0]["then"]["properties"]["evidence"]["required"]
@@ -2881,8 +3236,11 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             return old, new
 
         scenarios = [
-            ("admission_parity", {"old_doc": thin_admission_old,
-                                  "new_doc": thin_admission_new}),
+            ("admission_parity", {"new_doc": thin_admission_new,
+                                  "new_ledger_spec": thin_admission_ledger}),
+            ("ledgers_typed", {"old_ledger_spec": {"absent": True}}),
+            ("ledgers_typed", {"new_ledger_spec": dict(
+                thin_admission_ledger, crashed=(2,))}),
             ("inputs_present", {"missing_old_binary": True}),
             ("reports_generated", {"generate_error": "injected generation failure"}),
             ("reports_generated", {"module_present": False}),
@@ -3219,11 +3577,114 @@ class UpgradeWorkloadLoopTests(unittest.TestCase):
             [(workload.CHILD_DIGEST_INTERVAL_S,)] * workload.CHILD_DIGESTS,
         )
 
+    def run_parent_with_fake_children(self, workload, ledger_dir,
+                                      child_python, exit_codes):
+        pids = iter(range(5000, 5000 + len(exit_codes)))
+        spawned = []
+
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                self.pid = next(pids)
+                spawned.append(self.pid)
+                self.returncode = exit_codes[len(spawned) - 1]
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                del timeout
+                return self.returncode
+
+        ticks = {"t": 0.0}
+
+        def fake_monotonic():
+            ticks["t"] += 0.5
+            return ticks["t"]
+
+        probe = types.SimpleNamespace(returncode=0, stderr="")
+        with (
+            mock.patch.object(workload, "prepare_token"),
+            mock.patch.object(
+                workload, "open_provider", return_value=mock.Mock()),
+            mock.patch.object(workload, "digest_once"),
+            mock.patch("subprocess.Popen", FakePopen),
+            mock.patch("subprocess.run", return_value=probe),
+            mock.patch("time.monotonic", side_effect=fake_monotonic),
+            mock.patch("time.sleep"),
+            mock.patch("shutil.copyfile"),
+            mock.patch("os.chmod"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = workload.parent(
+                "fake.so", 0.2, str(child_python), str(ledger_dir))
+        return code, spawned
+
+    def test_parent_emits_typed_ledger_for_all_children(self):
+        workload = load_workload()
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            code, spawned = self.run_parent_with_fake_children(
+                workload, ledger_dir, Path(tmp) / "child-python",
+                [0] * workload.CHILD_COUNT)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(spawned), workload.CHILD_COUNT)
+            records = sorted(ledger_dir.glob("child-*.json"))
+            self.assertEqual(len(records), workload.CHILD_COUNT)
+            for index in range(workload.CHILD_COUNT):
+                record = json.loads(
+                    (ledger_dir / f"child-{index:02d}.json").read_text())
+                self.assertEqual(record["ledger_version"], 1)
+                self.assertEqual(record["index"], index)
+                self.assertEqual(record["pid"], spawned[index])
+                self.assertIsInstance(record["start_mono"], float)
+                self.assertIsInstance(record["start_wall"], float)
+                self.assertEqual(
+                    record["digests_completed"], workload.CHILD_DIGESTS)
+                self.assertEqual(
+                    record["calls_per_digest"], workload.CALLS_PER_DIGEST)
+                self.assertEqual(record["exit_code"], 0)
+            final = json.loads((ledger_dir / "final.json").read_text())
+            self.assertEqual(final["child_count"], workload.CHILD_COUNT)
+            self.assertEqual(final["spawned"], workload.CHILD_COUNT)
+            self.assertEqual(final["completed"], workload.CHILD_COUNT)
+            self.assertEqual(
+                final["children"], list(range(workload.CHILD_COUNT)))
+            self.assertEqual(final["crashed"], [])
+            self.assertEqual(final["workload_pid"], os.getpid())
+            leftovers = list(ledger_dir.glob("*.tmp"))
+            self.assertEqual(leftovers, [])
+            self.assertFalse((ledger_dir / "attach.json").exists())
+
+    def test_parent_ledger_records_crashed_child(self):
+        workload = load_workload()
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            code, spawned = self.run_parent_with_fake_children(
+                workload, ledger_dir, Path(tmp) / "child-python",
+                [0] * (workload.CHILD_COUNT - 1) + [1])
+            self.assertEqual(code, 0)
+            final = json.loads((ledger_dir / "final.json").read_text())
+            self.assertEqual(final["spawned"], workload.CHILD_COUNT)
+            self.assertEqual(final["completed"], workload.CHILD_COUNT - 1)
+            last = workload.CHILD_COUNT - 1
+            self.assertEqual(
+                final["crashed"],
+                [{"index": last, "pid": spawned[last], "exit_code": 1}])
+            record = json.loads(
+                (ledger_dir / f"child-{last:02d}.json").read_text())
+            self.assertEqual(record["exit_code"], 1)
+            self.assertIsNone(record["digests_completed"])
+
 
 class UpgradeSweepControlTests(unittest.TestCase):
     def test_control_covers_pure_killers(self):
         sweep = load_sweep()
         self.assertIn("UpgradeGate6PureTests", sweep.CONTROL_TESTS)
+
+    def test_control_covers_ledger_killers(self):
+        sweep = load_sweep()
+        self.assertIn("UpgradeGate6LedgerTests", sweep.CONTROL_TESTS)
 
     def test_control_test_count_parses(self):
         sweep = load_sweep()

@@ -30,8 +30,16 @@ Typed checks (exit 0 only if all pass):
      additive set (all optional, all ignored by readers), with no removed
      keys. Reason-map leaves compare by vocabulary membership (derived
      label sets per era), never by occurrence; dynamic reason leaves are
-     not compared. Admission parity (callers[] + folded + measured
-     entries) runs first so shape comparison never masks a shortfall.
+     not compared. Admission parity runs first so shape comparison never
+     masks a shortfall: the churn workload emits a typed ground-truth
+     ledger per side (one record per child plus a final record), and
+     every ledger child must be accounted for in that build's report as
+     a callers[] row, a departed_use folded entry, or a typed gap naming
+     it. Unknown usage is never a comparison value; the new build must
+     account for every child the old build accounted for, with
+     attributed calls >= the old build's for the same ledger. Children
+     born before the observer could admit them classify from ledger
+     timing the same way in both builds.
   4. B2: v0.7.1 object-observations schemas v1-v5 (from tag v0.7.1) do not
      list live_joint_feed_absent in their reason enums; this tree's do;
      new cbom accepts a report carrying that reason and renders it through.
@@ -49,12 +57,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import select
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -64,6 +74,19 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import upgrade_artifact_validation as artifact_validation
+
+
+def _load_workload():
+    spec = importlib.util.spec_from_file_location(
+        "upgrade_softhsm_workload",
+        SCRIPT_DIR / "upgrade-softhsm-workload.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+workload = _load_workload()
 
 # B1: exact new-only inventory keys the current binary always emits.
 # Fold budgets plus the per-module departed_use key itself (its populated
@@ -410,6 +433,28 @@ def folded_caller_count(document: dict) -> int:
 
 OBSERVED_LABEL = "observed"
 
+BEFORE_ADMISSION_WINDOW_S = 5.0
+
+
+def edge_entries_measured(edge: dict) -> bool:
+    """True when a usage edge carries observed (measured) usage."""
+    entries = (edge or {}).get("entries") or {}
+    return entries.get("observation") == OBSERVED_LABEL
+
+
+def departed_entries_measured(document: dict) -> bool:
+    """True when any module folded aggregate carries counted, witnessed
+    or watched content."""
+    for module in document.get("modules", []):
+        departed = (module or {}).get("departed_use") or {}
+        entries = departed.get("entries") or {}
+        coverage = entries.get("coverage") or {}
+        if coverage.get("counted", 0) + coverage.get("witnessed", 0) + coverage.get(
+            "watched_no_use", 0
+        ) > 0:
+            return True
+    return False
+
 
 def measured_child_entries(document: dict) -> tuple:
     """Child-attributed entries backed by observation, plus validity.
@@ -432,47 +477,291 @@ def measured_child_entries(document: dict) -> tuple:
     for edge in document.get("edges", []):
         if edge.get("caller") == parent:
             continue
-        entries = edge.get("entries") or {}
-        if entries.get("observation") == OBSERVED_LABEL:
-            total += entries.get("count", 0)
+        if edge_entries_measured(edge):
+            total += (edge.get("entries") or {}).get("count", 0)
             measured = True
     for module in document.get("modules", []):
         departed = (module or {}).get("departed_use") or {}
         entries = departed.get("entries") or {}
-        coverage = entries.get("coverage") or {}
-        if coverage.get("counted", 0) + coverage.get("witnessed", 0) + coverage.get(
-            "watched_no_use", 0
-        ) > 0:
-            measured = True
         total += entries.get("count", 0)
+    if departed_entries_measured(document):
+        measured = True
     if not short_lived_rows and folded_caller_count(document) == 0:
         return 0, True
     return total, measured
 
 
-def admission_parity(old: dict, new: dict) -> tuple:
-    """Fold-aware admission parity: every old caller is a new row or folded,
-    and measured attributed child entries did not drop.
+def ledger_dir_for(output: Path) -> Path:
+    """Ledger directory paired with one churn capture report."""
+    return output.parent / f"churn-ledger-{output.stem}"
 
-    v0.7.2 folds exited callers into departed_use by design, so the new
-    caller ROW count legitimately trails the old one; what must close
-    exactly is rows + folded (the churn workload spawns a fixed count).
-    A caller in neither is a real shortfall and stays red, naming the
-    missing count. Entry totals compare only when measured on both sides;
-    an unmeasured oracle refuses with a typed reason instead of passing
-    on zeros. Returns (ok, detail).
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_num(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _ledger_record_error(path: Path, record, expected_index: int,
+                         crashed: bool) -> str:
+    name = path.name
+    if not isinstance(record, dict):
+        return f"{name} is not an object"
+    if record.get("ledger_version") != workload.LEDGER_VERSION:
+        return f"{name} has wrong ledger_version"
+    if record.get("index") != expected_index:
+        return f"{name} carries index {record.get('index')}"
+    pid = record.get("pid")
+    if not _is_int(pid) or pid <= 0:
+        return f"{name} has untyped pid"
+    if not _is_num(record.get("start_mono")):
+        return f"{name} has untyped start_mono"
+    if not _is_num(record.get("start_wall")):
+        return f"{name} has untyped start_wall"
+    if crashed:
+        if record.get("digests_completed") is not None:
+            return f"{name} crashed yet claims digests"
+        if not _is_int(record.get("exit_code")) or record.get("exit_code") == 0:
+            return f"{name} crashed yet claims exit 0"
+    else:
+        if record.get("digests_completed") != workload.CHILD_DIGESTS:
+            return f"{name} has wrong digests_completed"
+        if record.get("exit_code") != 0:
+            return f"{name} completed yet claims a nonzero exit"
+    if record.get("calls_per_digest") != workload.CALLS_PER_DIGEST:
+        return f"{name} has wrong calls_per_digest"
+    return ""
+
+
+def validate_ledger(ledger_dir, side: str) -> tuple:
+    """Validate one workload ground-truth ledger; fail closed.
+
+    The ledger is missing, incomplete, or short unless every check
+    passes: final + attach records present and typed, workload scale
+    (child_count == CHILD_COUNT), every spawned child completed or
+    crashed, every claimed record file present and typed, and
+    completed == CHILD_COUNT. Returns (ok, payload, detail) where the
+    payload carries the completed children and the capture attach time.
     """
-    old_rows = len(old.get("callers", []))
-    new_rows = len(new.get("callers", []))
-    folded = folded_caller_count(new)
-    shortfall = old_rows - (new_rows + folded)
+    ledger_dir = Path(ledger_dir)
+    if not ledger_dir.is_dir():
+        return False, {}, f"{side} ledger missing: {ledger_dir}"
+    try:
+        final = json.loads((ledger_dir / "final.json").read_text())
+    except (OSError, ValueError) as exc:
+        return False, {}, f"{side} ledger final record missing: {exc}"
+    if not isinstance(final, dict):
+        return False, {}, f"{side} ledger final record is not an object"
+    if final.get("ledger_version") != workload.LEDGER_VERSION:
+        return False, {}, f"{side} ledger final record has wrong version"
+    child_count = final.get("child_count")
+    if child_count != workload.CHILD_COUNT:
+        return False, {}, (
+            f"{side} ledger scale: child_count={child_count} "
+            f"expected={workload.CHILD_COUNT}"
+        )
+    if final.get("spawned") != child_count:
+        return False, {}, (
+            f"{side} ledger spawned/final cross-check: "
+            f"spawned={final.get('spawned')} child_count={child_count}"
+        )
+    children = final.get("children")
+    if (
+        not isinstance(children, list)
+        or any(not _is_int(index) for index in children)
+        or len(set(children)) != len(children)
+    ):
+        return False, {}, f"{side} ledger final children are untyped"
+    crashed = final.get("crashed")
+    if not isinstance(crashed, list) or any(
+        not isinstance(row, dict)
+        or not _is_int(row.get("index"))
+        or not _is_int(row.get("pid"))
+        or not _is_int(row.get("exit_code"))
+        or row.get("exit_code") == 0
+        for row in crashed
+    ):
+        return False, {}, f"{side} ledger final crashed list is untyped"
+    crashed_indexes = {row["index"] for row in crashed}
+    if set(children) & crashed_indexes:
+        return False, {}, f"{side} ledger completed/crashed overlap"
+    if final.get("completed") != len(children):
+        return False, {}, (
+            f"{side} ledger completed cross-check: "
+            f"completed={final.get('completed')} files={len(children)}"
+        )
+    if len(children) + len(crashed) != child_count:
+        unrecorded = sorted(
+            set(range(child_count)) - set(children) - crashed_indexes
+        )
+        return False, {}, (
+            f"{side} ledger shortfall: completed={len(children)} "
+            f"expected={child_count} unrecorded={unrecorded}"
+        )
+    for index in children:
+        path = ledger_dir / f"child-{index:02d}.json"
+        if not path.is_file():
+            return False, {}, f"{side} ledger incomplete: {path.name} absent"
+        try:
+            record = json.loads(path.read_text())
+        except ValueError as exc:
+            return False, {}, f"{side} ledger {path.name} unreadable: {exc}"
+        error = _ledger_record_error(path, record, index, crashed=False)
+        if error:
+            return False, {}, f"{side} ledger {error}"
+    for row in crashed:
+        path = ledger_dir / f"child-{row['index']:02d}.json"
+        if not path.is_file():
+            return False, {}, f"{side} ledger incomplete: {path.name} absent"
+        try:
+            record = json.loads(path.read_text())
+        except ValueError as exc:
+            return False, {}, f"{side} ledger {path.name} unreadable: {exc}"
+        error = _ledger_record_error(path, record, row["index"], crashed=True)
+        if error:
+            return False, {}, f"{side} ledger {error}"
+        if record.get("exit_code") != row["exit_code"]:
+            return False, {}, (
+                f"{side} ledger {path.name} exit/final cross-check"
+            )
+    try:
+        attach = json.loads((ledger_dir / "attach.json").read_text())
+    except (OSError, ValueError) as exc:
+        return False, {}, f"{side} ledger capture attach missing: {exc}"
+    if not isinstance(attach, dict) or not _is_num(attach.get("attach_mono")):
+        return False, {}, f"{side} ledger capture attach is untyped"
+    if crashed:
+        names = " ".join(
+            f"#{row['index']} pid={row['pid']} exit={row['exit_code']}"
+            for row in sorted(crashed, key=lambda row: row["index"])
+        )
+        return False, {}, (
+            f"{side} ledger shortfall: completed={len(children)} "
+            f"expected={child_count} crashed={names}"
+        )
+    records = [
+        json.loads((ledger_dir / f"child-{index:02d}.json").read_text())
+        for index in children
+    ]
+    return True, {
+        "children": sorted(records, key=lambda record: record["index"]),
+        "attach_mono": attach["attach_mono"],
+    }, (
+        f"{side} ledger: {len(children)}/{child_count} children, "
+        f"attach_mono={attach['attach_mono']}"
+    )
+
+
+def before_admission_set(children: list, attach_mono: float) -> set:
+    """Ledger indexes born before the observer could admit them.
+
+    RULE: a child born less than BEFORE_ADMISSION_WINDOW_S (5.0s) after
+    observer attach is classified 'before admission'. Both builds apply
+    this same rule to their own ledger; the index sets must match, so a
+    pre-admission child is never counted as loss in one build and noise
+    in the other. The churn workload spaces births after attach + 5s,
+    so the live set is empty by construction.
+    """
+    return {
+        child["index"]
+        for child in children
+        if child["start_mono"] - attach_mono < BEFORE_ADMISSION_WINDOW_S
+    }
+
+
+def account_ledger_child(document: dict, child: dict) -> tuple:
+    """Account one ledger child in a build report; tiers row > folded > gap.
+
+    A row accounts only with measured edge usage, and a folded identity
+    only with a measured departed aggregate: asserted-but-unknown usage
+    is hollow, so that child is unaccounted and the leg fails. A typed
+    gap naming the pid accounts without usage (gaps explain absence,
+    they assert no counts). Returns (tier, detail).
+    """
+    pid = child["pid"]
+    row_id = None
+    for caller in document.get("callers", []):
+        if isinstance(caller, dict) and caller.get("pid") == pid:
+            row_id = caller.get("id")
+            break
+    if row_id is not None:
+        edge = next(
+            (
+                item for item in document.get("edges", [])
+                if isinstance(item, dict) and item.get("caller") == row_id
+            ),
+            None,
+        )
+        if edge is not None and edge_entries_measured(edge):
+            count = (edge.get("entries") or {}).get("count")
+            return "row", f"pid={pid} row usage={count}"
+        return "unaccounted", f"pid={pid} row-usage-unknown"
+    folded = False
+    for module in document.get("modules", []):
+        departed = (module or {}).get("departed_use") or {}
+        for identity in departed.get("identities", []) or []:
+            if isinstance(identity, dict) and identity.get("pid") == pid:
+                folded = True
+                break
+    if folded:
+        if departed_entries_measured(document):
+            return "folded", f"pid={pid} folded"
+        return "unaccounted", f"pid={pid} folded-usage-unmeasured"
+    for gap in document.get("gaps", []):
+        if isinstance(gap, dict) and gap.get("pid") == pid:
+            return "gap", f"pid={pid} gap reason={gap.get('reason')}"
+    return "unaccounted", f"pid={pid} absent"
+
+
+def admission_parity(old: dict, new: dict, old_ledger: dict,
+                     new_ledger: dict) -> tuple:
+    """Ledger-grounded admission parity: no regression, no unknown values.
+
+    Both builds ran the same workload, so each ledger child must be
+    accounted for in its build's report. The old baseline must account
+    every child before the new side is judged; a new-side miss is a
+    regression. Before-admission index sets must match. Attributed
+    entry totals compare only when measured on both sides; an
+    unmeasured oracle refuses instead of passing on zeros. Returns
+    (ok, detail).
+    """
+    old_children = old_ledger["children"]
+    new_children = new_ledger["children"]
+    old_before = before_admission_set(old_children, old_ledger["attach_mono"])
+    new_before = before_admission_set(new_children, new_ledger["attach_mono"])
+    if old_before != new_before:
+        return False, (
+            f"before-admission sets differ: "
+            f"old_only={sorted(old_before - new_before)} "
+            f"new_only={sorted(new_before - old_before)}"
+        )
+    old_tiers: dict = {}
+    old_unaccounted = []
+    for child in old_children:
+        tier, detail = account_ledger_child(old, child)
+        old_tiers[tier] = old_tiers.get(tier, 0) + 1
+        if tier == "unaccounted":
+            old_unaccounted.append(f"#{child['index']} {detail}")
+    if old_unaccounted:
+        return False, (
+            f"old baseline unaccounted: {'; '.join(old_unaccounted)}"
+        )
+    new_tiers: dict = {}
+    new_unaccounted = []
+    for child in new_children:
+        tier, detail = account_ledger_child(new, child)
+        new_tiers[tier] = new_tiers.get(tier, 0) + 1
+        if tier == "unaccounted":
+            new_unaccounted.append(f"#{child['index']} {detail}")
+    if new_unaccounted:
+        return False, (
+            "new unaccounted (regression vs old): "
+            f"{'; '.join(new_unaccounted)}"
+        )
     old_entries, old_measured = measured_child_entries(old)
     new_entries, new_measured = measured_child_entries(new)
-    if shortfall > 0:
-        return False, (
-            f"caller shortfall: old={old_rows} rows={new_rows} "
-            f"folded={folded} missing={shortfall}"
-        )
     if not old_measured or not new_measured:
         return False, (
             f"entry oracle not measured: old_measured={old_measured} "
@@ -484,7 +773,8 @@ def admission_parity(old: dict, new: dict) -> tuple:
             f"new child entries={new_entries}"
         )
     return True, (
-        f"old={old_rows} rows={new_rows} folded={folded} "
+        f"old tiers={old_tiers} new tiers={new_tiers} "
+        f"before_admission={sorted(old_before)} "
         f"entries old={old_entries} new={new_entries}"
     )
 
@@ -711,11 +1001,17 @@ def output_owner_arguments(output: Path) -> list[str]:
 
 def generate_scan_report(binary: Path, output: Path, module: str) -> str:
     """Generate one churn-workload native inventory; empty string means success."""
-    workload = SCRIPT_DIR / "upgrade-softhsm-workload.py"
+    workload_path = SCRIPT_DIR / "upgrade-softhsm-workload.py"
     child_python = output.parent / "churn-child-python"
+    ledger_dir = ledger_dir_for(output)
+    try:
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"ledger dir setup failed for {binary}: {exc}"
     try:
         target = subprocess.Popen(
-            [sys.executable, str(workload), "--module", module, "--child-python", str(child_python)],
+            [sys.executable, str(workload_path), "--module", module, "--child-python", str(child_python),
+             "--ledger-dir", str(ledger_dir)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -740,6 +1036,13 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
             return f"cgroup setup failed for {binary}: {exc}"
         if str(target.pid) not in members:
             return f"cgroup membership unverified for {binary} pid={target.pid}"
+        try:
+            (ledger_dir / "attach.json").write_text(json.dumps({
+                "attach_mono": time.monotonic(),
+                "capture_started_wall": time.time(),
+            }))
+        except OSError as exc:
+            return f"ledger attach record failed for {binary}: {exc}"
         completed = run(
             [
                 str(binary),
@@ -850,9 +1153,21 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         else "old/new inventory reports carry typed root, observation, budget, row and gap content",
     )
 
-    # 1b. Admission parity runs before B1: comparing key shapes across an
-    # admission-divergent pair is noise; the shortfall gets one signature.
-    parity_ok, parity_detail = admission_parity(old, new)
+    # 1b. Ledger validation, then admission parity before B1:
+    # comparing key shapes across an admission-divergent pair is noise;
+    # the shortfall gets one signature.
+    old_ledger_ok, old_ledger, old_ledger_detail = validate_ledger(
+        ledger_dir_for(old_report), "old")
+    new_ledger_ok, new_ledger, new_ledger_detail = validate_ledger(
+        ledger_dir_for(new_report), "new")
+    check(
+        result,
+        "ledgers_typed",
+        old_ledger_ok and new_ledger_ok,
+        f"old: {old_ledger_detail}; new: {new_ledger_detail}",
+    )
+    parity_ok, parity_detail = admission_parity(
+        old, new, old_ledger, new_ledger)
     check(result, "admission_parity", parity_ok, parity_detail)
 
     # 2. B1: departed_use delta is exactly B1+additive, nothing else, and

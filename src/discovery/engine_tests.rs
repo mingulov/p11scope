@@ -93801,7 +93801,7 @@ fn terminal_learned_note_folds_through_a_refiled_alias() {
 #[test]
 fn terminal_unjoined_note_publishes_a_named_gap() {
     use crate::discovery::identity::test_fixture::{
-        INODE, SHA, backing_file, overlay, reback, split_prearm_pin,
+        INODE, PATH, SHA, backing_file, overlay, reback, split_prearm_pin,
     };
     use p11scope_manifest::maps::ObjectKey;
     let (mut engine, _, _, maps_key) = split_terminal_state();
@@ -93829,6 +93829,15 @@ fn terminal_unjoined_note_publishes_a_named_gap() {
     );
     let ghost = &engine.discovery.modules[1];
     assert!(ghost.first_loaded_by.is_some(), "the row carries the note");
+    assert_eq!(
+        ghost.path, PATH,
+        "the unjoined row names the live pin's file"
+    );
+    assert_eq!(
+        ghost.sha256.as_deref(),
+        Some(SHA),
+        "the unjoined row shows the live pin's digest"
+    );
     assert!(
         ghost.skipped.iter().any(|skip| {
             skip.name == crate::render::LEARNED_SKIP_SUBJECT

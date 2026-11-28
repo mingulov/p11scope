@@ -37,7 +37,7 @@ The following limits are new in v0.7.2. Limits from
 apply unless a subsection here says otherwise.
 
 <!-- p11scope-known-issues-v1
-{"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-25","test":true},{"id":"KI-26","test":true}]}
+{"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-25","test":true},{"id":"KI-26","test":false}]}
 -->
 
 ### KI-25: a no-module Firefox run sometimes reports a first-use gap for an exited child
@@ -61,9 +61,11 @@ memory unreadable (the typed `scan_unavailable` reason), and the
 observer honestly files a loud `scan_unavailable` gap the run cells
 do not allowlist (`src/discovery/scan.rs` mem-open class). Measured 1
 of 6 on Fedora; the owed signs were fully observed. Whether the
-unreadable child had exited is not recorded; recording victim exit
-for unreadable scans is a v0.8.0 follow-up so a future row can narrow
-to the exit race.
+unreadable child had exited is not recorded, and per-view reasons
+merge first-wins, so no typed row can yet prove the exact reason set:
+there is no typed row until v0.8.0 records victim exit and reason
+multiplicity for unreadable scans, and the cell stays strict (any
+failure is red).
 
 ## Known limitations in 0.7.0
 

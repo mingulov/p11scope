@@ -1231,16 +1231,16 @@ class FallbackBranchTests(unittest.TestCase):
 
 
 class ProductionBrowserLedgerTests(unittest.TestCase):
-    """The production browser rows judge exactly their typed signatures.
+    """The production browser row judges exactly its typed signature.
 
-    These tests read the live ledger rows (never a copy of the
-    signatures): deleting, widening or weakening a row fails them, and
-    any other failure of the same cells stays red by exact equality.
+    These tests read the live ledger row (never a copy of the
+    signature): deleting, widening or weakening the row fails them, and
+    any other failure of the same cell stays red by exact equality.
+    (KI-26 is prose-only and has no row: CR-RUN-NODELAY stays strict.)
     """
 
     CELLS = (
         "BrowserCells.test_ff_nomod_observes_nothing",
-        "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
     )
     GENERIC_BRANCHES = frozenset({
         "failed", "error", "skipped", "unexpected_success", "not_run",
@@ -1250,7 +1250,7 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
     def production_rows(self):
         ledger = json.loads((ROOT / "tests/known-failing.json").read_text())
         rows = [row for row in ledger["rows"] if row["test"] in self.CELLS]
-        self.assertEqual(len(rows), 2, "both production browser rows must exist")
+        self.assertEqual(len(rows), 1, "the production browser row must exist")
         for row in rows:
             self.assertEqual(row["path"], "tests/python/test_browser_cells.py")
             self.assertEqual(row["runner"], "python-suite-strict-browser")
@@ -1279,13 +1279,13 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
             for test, signature in signatures.items()
         ], runner=runner)
 
-    def test_matching_browser_failures_are_covered(self):
+    def test_matching_browser_failure_is_covered(self):
         f, signatures = self.browser_fixture()
         result = f.run_checker("--results", str(f.results_file(self.browser_doc(signatures))))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("2 expected failures", result.stdout)
+        self.assertIn("1 expected failures", result.stdout)
 
-    def test_passing_browser_cells_stay_green(self):
+    def test_passing_browser_cell_stays_green(self):
         f, signatures = self.browser_fixture()
         entries = [{"path": "tests/python/test_browser_cells.py", "test": test,
                     "state": "passed", "signature": None}
@@ -1293,7 +1293,7 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         doc = result_doc(entries, runner="python-suite-strict-browser")
         result = f.run_checker("--results", str(f.results_file(doc)))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("2 intermittent passes", result.stdout)
+        self.assertIn("1 intermittent passes", result.stdout)
 
     def test_row_signature_from_another_cell_stays_red(self):
         f, signatures = self.browser_fixture()
@@ -1303,12 +1303,9 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
              "state": "passed", "signature": None},
             {"path": "tests/python/test_browser_cells.py",
              "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
-             "state": "passed", "signature": None},
-            {"path": "tests/python/test_browser_cells.py",
-             "test": "BrowserCells.test_cr_run_sign_observes_client_cert_signs",
              "state": "failed",
              "signature": signatures[
-                 "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"]},
+                 "BrowserCells.test_ff_nomod_observes_nothing"]},
         ]
         doc = result_doc(entries, runner="python-suite-strict-browser")
         result = f.run_checker("--results", str(f.results_file(doc)))
@@ -1320,12 +1317,7 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         entries = [{"path": "tests/python/test_browser_cells.py",
                     "test": "BrowserCells.test_ff_nomod_observes_nothing",
                     "state": "skipped",
-                    "signature": {"branch": "skipped", "oracle": "unittest"}},
-                   {"path": "tests/python/test_browser_cells.py",
-                    "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
-                    "state": "failed",
-                    "signature": signatures[
-                        "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"]}]
+                    "signature": {"branch": "skipped", "oracle": "unittest"}}]
         doc = result_doc(entries, runner="python-suite-strict-browser")
         result = f.run_checker("--results", str(f.results_file(doc)))
         self.assertNotEqual(result.returncode, 0, result.stderr)
@@ -1348,7 +1340,8 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         self.assertTrue(recorded["complete"])
         self.assertEqual(recorded["process_exit"], 0)
         states = {item["test"]: item["state"] for item in recorded["results"]}
-        for test in self.CELLS:
+        for test in ("BrowserCells.test_ff_nomod_observes_nothing",
+                     "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"):
             self.assertEqual(states.get(test), "skipped",
                              f"recorded fragment must skip {test}")
         f, _signatures = self.browser_fixture()
@@ -1378,12 +1371,6 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         "        helper = prod.BrowserCells('test_ff_nomod_other_skip_stays_generic')\n"
         "        helper.work = work\n"
         "__FF_BODY__\n"
-        "    def test_cr_run_nodelay_observes_client_cert_signs(self):\n"
-        "        work = Path(tempfile.mkdtemp(prefix='strict-e2e-'))\n"
-        "        self.addCleanup(shutil.rmtree, work, True)\n"
-        "        helper = prod.BrowserCells('test_cr_run_nodelay_other_gap_stays_generic')\n"
-        "        helper.work = work\n"
-        "__NODELAY_BODY__\n"
         "if __name__ == '__main__': unittest.main()\n"
     )
     FF_MATCH = (
@@ -1415,41 +1402,13 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         "        result = helper._twin_nomod_result('FF-NOMOD', [], evidence)\n"
         "        helper._check_nomod_cell(result, store, sha)\n"
     )
-    NODELAY_MATCH = (
-        "        sha = '0' * 64\n"
-        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
-        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
-        "        result, sha = helper._twin_nodelay_result(\n"
-        "            'CR-RUN-NODELAY', rows,\n"
-        "            sorted(prod._GAPS_ATTACHED_RUN) + ['scan_unavailable'],\n"
-        "            'unreadable')\n"
-        "        helper._check_nodelay_cell(result, sha)\n"
-    )
-    NODELAY_NONMATCH = (
-        "        sha = '0' * 64\n"
-        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
-        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
-        "        result, sha = helper._twin_nodelay_result(\n"
-        "            'CR-RUN-NODELAY', rows,\n"
-        "            sorted(prod._GAPS_ATTACHED_RUN) + ['in_flight_at_end'],\n"
-        "            None)\n"
-        "        helper._check_nodelay_cell(result, sha)\n"
-    )
-    NODELAY_PASS = (
-        "        sha = '0' * 64\n"
-        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
-        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
-        "        result, sha = helper._twin_nodelay_result(\n"
-        "            'CR-RUN-NODELAY', rows, sorted(prod._GAPS_ATTACHED_RUN), None)\n"
-        "        helper._check_nodelay_cell(result, sha)\n"
-    )
 
-    def strict_end_to_end(self, ff_body, nodelay_body):
-        """One two-cell suite through producer, merge and strict judgment.
+    def strict_end_to_end(self, ff_body):
+        """One single-cell suite through producer, merge and strict judgment.
 
         The synthetic suite replays the production check_report oracle
         calls with live-exact kwargs and twin report shapes, so the
-        recorded signatures are the actual failing artifact shapes. The
+        recorded signature is the actual failing artifact shape. The
         producer, merge (strict-browser runner, as the browser-cells CI
         job runs it) and judgment are the real committed code paths.
         """
@@ -1457,7 +1416,6 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         body = self.STRICT_SUITE_TEMPLATE.replace(
             "__PRODUCTION__", json.dumps(str(ROOT / "tests" / "python")))
         body = body.replace("__FF_BODY__", ff_body.rstrip("\n"))
-        body = body.replace("__NODELAY_BODY__", nodelay_body.rstrip("\n"))
         suite = f.root / "tests/python/test_browser_cells.py"
         suite.write_text(body, encoding="utf-8")
         fragment = f.root / "fragment.json"
@@ -1475,25 +1433,20 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         self.assertEqual(problems, [])
         return f.run_checker("--results", str(merged))
 
-    def test_strict_stream_matching_failures_are_known_failing(self):
-        judged = self.strict_end_to_end(self.FF_MATCH, self.NODELAY_MATCH)
+    def test_strict_stream_matching_failure_is_known_failing(self):
+        judged = self.strict_end_to_end(self.FF_MATCH)
         self.assertEqual(judged.returncode, 0, judged.stderr)
-        self.assertIn("2 expected failures", judged.stdout)
+        self.assertIn("1 expected failures", judged.stdout)
 
     def test_strict_stream_nonmatching_ff_stays_red(self):
-        judged = self.strict_end_to_end(self.FF_NONMATCH, self.NODELAY_MATCH)
+        judged = self.strict_end_to_end(self.FF_NONMATCH)
         self.assertNotEqual(judged.returncode, 0)
         self.assertIn("failure signature mismatch", judged.stderr)
 
-    def test_strict_stream_nonmatching_nodelay_stays_red(self):
-        judged = self.strict_end_to_end(self.FF_MATCH, self.NODELAY_NONMATCH)
-        self.assertNotEqual(judged.returncode, 0)
-        self.assertIn("failure signature mismatch", judged.stderr)
-
-    def test_strict_stream_passes_stay_green(self):
-        judged = self.strict_end_to_end(self.FF_PASS, self.NODELAY_PASS)
+    def test_strict_stream_pass_stays_green(self):
+        judged = self.strict_end_to_end(self.FF_PASS)
         self.assertEqual(judged.returncode, 0, judged.stderr)
-        self.assertIn("2 intermittent passes", judged.stdout)
+        self.assertIn("1 intermittent passes", judged.stdout)
 
     def test_ff_nomod_nonmatching_failure_stays_red(self):
         f, signatures = self.browser_fixture()
@@ -1512,28 +1465,6 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, label)
                 self.assertIn("failure signature mismatch", result.stderr)
 
-    def test_cr_run_nodelay_nonmatching_failure_stays_red(self):
-        f, signatures = self.browser_fixture()
-        variants = {
-            "generic_fallback": {"branch": "failed", "exception": "AssertionError",
-                                 "oracle": "unittest"},
-            "wrong_typed_branch": {"cell": "CR-RUN-NODELAY",
-                                   "branch": "unproven_resume_intake"},
-            "wrong_scan_reason": {"cell": "CR-RUN-NODELAY",
-                                  "branch": "scan_unavailable",
-                                  "scan_reason": "ptrace"},
-            "missing_scan_reason": {"cell": "CR-RUN-NODELAY",
-                                    "branch": "scan_unavailable"},
-        }
-        for label, signature in variants.items():
-            with self.subTest(label):
-                doc = self.browser_doc({
-                    **signatures,
-                    "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs": signature,
-                })
-                result = f.run_checker("--results", str(f.results_file(doc)))
-                self.assertNotEqual(result.returncode, 0, label)
-                self.assertIn("failure signature mismatch", result.stderr)
 
 
 class StaticWiringTests(unittest.TestCase):

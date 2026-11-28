@@ -176,13 +176,13 @@ _SHA256_MECHANISM_ID = 0x00000250
 _SOFTOKN_BASENAME = "libsoftokn3.so"
 
 #: Typed known-failure signatures the ledger rows match by exact
-#: equality (tests/known-failing.json; KI-25/KI-26 in
+#: equality (tests/known-failing.json; KI-25 in
 #: docs/known-limitations.md). Only the named report shapes raise
 #: them; every other failure keeps the generic unittest signature and
 #: stays red. The ledger twins pin these constants against the rows.
+#: (KI-26 has prose but deliberately no row: the record cannot prove
+#: the exact scan-reason set, so CR-RUN-NODELAY stays strict.)
 FF_NOMOD_KNOWN_SIGNATURE = {"cell": "FF-NOMOD", "branch": "unproven_resume_intake"}
-CR_RUN_NODELAY_KNOWN_SIGNATURE = {"cell": "CR-RUN-NODELAY", "branch": "scan_unavailable",
-                                  "scan_reason": "unreadable"}
 
 #: Skip records the member-stop unproven-resume intake race files on
 #: FF-NOMOD (KI-25): a stopped child exits before the proving read, so
@@ -193,44 +193,6 @@ FF_NOMOD_KNOWN_SKIPS = frozenset({
     ("discovery subject", oracle.MID_FLIGHT_REASON),
     ("learned provider file", oracle.LEARNED_FIRST_USE_REASON),
 })
-
-#: The one gap cause the CR-RUN-NODELAY unreadable-scan race discloses
-#: (KI-26): a post-scan of a run-tree child intermittently cannot read
-#: its memory (typed reason "unreadable"), and the engine latches
-#: scan_unavailable loud. The row claims only the unreadable scan, not
-#: victim exit, which the product does not record for this class;
-#: "ptrace", "gone" and a missing detail stay generic (see
-#: mem_unavailable in src/discovery/scan.rs for the vocabulary).
-CR_RUN_NODELAY_KNOWN_GAP = "scan_unavailable"
-
-#: The only complete scan-reason set the KI-26 row accepts: exactly one
-#: unreadable scan and nothing else. Set equality (never membership):
-#: any second reason, known or unknown, stays red.
-CR_RUN_NODELAY_KNOWN_SCAN_REASONS = frozenset({"unreadable"})
-
-
-def scan_unavailable_reasons(report):
-    """The complete set of typed scan_unavailable reasons in the record.
-
-    The scalar ``evidence.scan_unavailable`` is the only typed site that
-    carries a mem-open reason (rendered at
-    src/discovery/engine.rs:11234; schema string/null): per-view reasons
-    merge first-wins (src/discovery/engine.rs:12091-12094) and per-object
-    scan losses project to the generic discovery-unavailable vocabulary
-    (src/render.rs:2448-2457), so no per-object or per-pass reason
-    survives in the typed record. Returns the singleton {reason} when
-    the scalar is present, else the empty set.
-    """
-    reason = oracle.evidence(report).get("scan_unavailable")
-    if reason is None:
-        return set()
-    return {reason}
-
-
-def scan_reason_set_matches(reasons):
-    """Whether a reason set is exactly the row's known singleton."""
-    return set(reasons) == CR_RUN_NODELAY_KNOWN_SCAN_REASONS
-
 
 class KnownFailure(AssertionError):
     """A failure the typed known-failing ledger covers.
@@ -249,12 +211,12 @@ def known_failure_signature(cell, report, failures, allowed_gaps):
     """The ledger signature for a known report shape, else None.
 
     Pure classifier over the parsed report plus the assembled failure
-    list: a shape matches only when the cell property holds (zero rows
-    and zero probes for FF-NOMOD; exact signs for CR-RUN-NODELAY,
-    implied by the absence of any other failure) and EVERY failure is
-    the named disclosure. Any additional failure, however small,
-    returns None so the cell stays red. Unknown oracle wording also
-    fails closed (None) instead of guessing.
+    list: the FF-NOMOD shape matches only when zero rows and zero probes
+    hold and EVERY failure is the named intake disclosure. Any
+    additional failure, however small, returns None so the cell stays
+    red. Unknown oracle wording also fails closed (None) instead of
+    guessing. CR-RUN-NODELAY has no branch: KI-26 is prose-only until
+    v0.8.0 records the exact scan-reason set.
     """
     if cell == "FF-NOMOD":
         if (oracle.evidence(report).get("attached_probes", 0) or 0) != 0:
@@ -276,23 +238,6 @@ def known_failure_signature(cell, report, failures, allowed_gaps):
         if sorted(failures) != expected:
             return None
         return dict(FF_NOMOD_KNOWN_SIGNATURE)
-    if cell == "CR-RUN-NODELAY":
-        if len(failures) != 1:
-            return None
-        if not scan_reason_set_matches(scan_unavailable_reasons(report)):
-            return None
-        classes = oracle.evidence(report).get("gap_classes") or {}
-        observation = (classes.get("observation") or {}) if isinstance(classes, dict) else {}
-        causes = observation.get("causes") or []
-        allowed = set(allowed_gaps)
-        extra = [cause for cause in causes if cause not in allowed]
-        if extra != [CR_RUN_NODELAY_KNOWN_GAP]:
-            return None
-        want = (f"observation gap cause {CR_RUN_NODELAY_KNOWN_GAP!r} "
-                f"not allowed for this cell (allowed: {sorted(allowed)})")
-        if failures != [want]:
-            return None
-        return dict(CR_RUN_NODELAY_KNOWN_SIGNATURE)
     return None
 
 
@@ -2197,99 +2142,28 @@ class BrowserCells(unittest.TestCase):
                                     "min_calls": 1,
                                     "exact_calls": 2}})
 
-    def test_cr_run_nodelay_scan_unavailable_raises_ledger_signature(self):
-        """KI-26 twin: the lone unreadable post-scan gap carries the row signature."""
+
+
+
+
+
+
+    def test_cr_run_nodelay_malformed_scan_detail_stays_generic(self):
+        """KI-26 prose-only: a malformed scan detail fails generic, never crashes."""
         sha = "0" * 64
         rows = [self._twin_row(["C_SignInit"], 1, sha),
                 self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-            "unreadable")
-        with self.assertRaises(KnownFailure) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertEqual(raised.exception.p11scope_signature,
-                         self._ledger_row_signature(
-                             "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"))
-        self.assertEqual(raised.exception.p11scope_signature,
-                         CR_RUN_NODELAY_KNOWN_SIGNATURE)
+        for detail in (["unreadable"], {"reason": "unreadable"}):
+            with self.subTest(detail=repr(detail)):
+                result, sha = self._twin_nodelay_result(
+                    "CR-RUN-NODELAY", rows,
+                    sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                    detail)
+                with self.assertRaises(AssertionError) as raised:
+                    self._check_nodelay_cell(result, sha)
+                self.assertIs(type(raised.exception), AssertionError)
+                self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
 
-    def test_cr_run_nodelay_other_gap_stays_generic(self):
-        """KI-26 twin: a different lone gap cause keeps the generic signature."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha),
-                self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["in_flight_at_end"],
-            None)
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
-
-    def test_cr_run_nodelay_scan_gap_plus_lost_sign_stays_generic(self):
-        """KI-26 twin: the known gap plus a lost sign stays generic."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-            "unreadable")
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
-
-    def test_cr_run_nodelay_ptrace_scan_stays_generic(self):
-        """KI-26 twin: a ptrace-refused scan is not the granted race."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha),
-                self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-            "ptrace")
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
-
-    def test_cr_run_nodelay_gone_scan_stays_generic(self):
-        """KI-26 twin: a gone scan is not the granted race."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha),
-                self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-            "gone")
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
-
-    def test_cr_run_nodelay_scan_gap_plus_extra_cause_stays_generic(self):
-        """KI-26 twin: the known gap plus another cause stays generic."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha),
-                self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows,
-            sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable", "in_flight_at_end"],
-            "unreadable")
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
-
-    def test_cr_run_nodelay_missing_scan_detail_stays_generic(self):
-        """KI-26 twin: a scan gap with no typed detail stays generic."""
-        sha = "0" * 64
-        rows = [self._twin_row(["C_SignInit"], 1, sha),
-                self._twin_row(["C_Sign"], 1, sha)]
-        result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-            None)
-        with self.assertRaises(AssertionError) as raised:
-            self._check_nodelay_cell(result, sha)
-        self.assertIs(type(raised.exception), AssertionError)
-        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
     def test_oracle_rejects_halted_capture(self):
         """P2-3 twin: a halted capture fails even when floors are met."""
         sha = "0" * 64
@@ -5360,30 +5234,13 @@ class ClassifierMutationTests(unittest.TestCase):
         self.assertIn(old, source)
         namespace = {
             "FF_NOMOD_KNOWN_SIGNATURE": FF_NOMOD_KNOWN_SIGNATURE,
-            "CR_RUN_NODELAY_KNOWN_SIGNATURE": CR_RUN_NODELAY_KNOWN_SIGNATURE,
             "FF_NOMOD_KNOWN_SKIPS": FF_NOMOD_KNOWN_SKIPS,
-            "CR_RUN_NODELAY_KNOWN_GAP": CR_RUN_NODELAY_KNOWN_GAP,
-            "CR_RUN_NODELAY_KNOWN_SCAN_REASONS": CR_RUN_NODELAY_KNOWN_SCAN_REASONS,
-            "scan_unavailable_reasons": scan_unavailable_reasons,
-            "scan_reason_set_matches": scan_reason_set_matches,
             "oracle": oracle,
         }
         exec(source.replace(old, new, 1), namespace)
         return namespace["known_failure_signature"]
 
-    def mutate_predicate(self, old, new):
-        source = inspect.getsource(scan_reason_set_matches)
-        self.assertIn(old, source)
-        namespace = {"CR_RUN_NODELAY_KNOWN_SCAN_REASONS": CR_RUN_NODELAY_KNOWN_SCAN_REASONS}
-        exec(source.replace(old, new, 1), namespace)
-        return namespace["scan_reason_set_matches"]
 
-    def mutate_gatherer(self, old, new):
-        source = inspect.getsource(scan_unavailable_reasons)
-        self.assertIn(old, source)
-        namespace: dict = {"oracle": oracle}
-        exec(source.replace(old, new, 1), namespace)
-        return namespace["scan_unavailable_reasons"]
 
     def ff_report(self, probes=0, rows=(), skipped=()):
         return {"functions": list(rows),
@@ -5393,17 +5250,7 @@ class ClassifierMutationTests(unittest.TestCase):
         return (f"skipped record {name!r} reason {reason!r}: "
                 f"possible coverage gap, want structural only")
 
-    def nodelay_report(self, causes, detail):
-        return {"functions": [],
-                "evidence": {"attached_probes": 2,
-                             "gap_classes": {"observation": {"status": "lossy",
-                                                             "causes": list(causes)}},
-                             "scan_unavailable": detail}}
 
-    def nodelay_gap_failure(self):
-        allowed = sorted(set(_GAPS_ATTACHED_RUN))
-        return (f"observation gap cause 'scan_unavailable' not allowed for this cell "
-                f"(allowed: {allowed})")
 
     def test_ff_probes_guard_kills(self):
         mutant = self.mutate('if (oracle.evidence(report).get("attached_probes", 0) or 0) != 0:',
@@ -5464,125 +5311,36 @@ class ClassifierMutationTests(unittest.TestCase):
         self.assertEqual(mutant("CR-RUN-SIGN", report, failures, ()),
                          FF_NOMOD_KNOWN_SIGNATURE)
 
-    def test_nodelay_detail_guard_kills(self):
-        mutant = self.mutate(
-            "if not scan_reason_set_matches(scan_unavailable_reasons(report)):",
-            "if False:")
-        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-                                     "ptrace")
-        failures = [self.nodelay_gap_failure()]
-        self.assertIsNone(
-            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
-        self.assertEqual(
-            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
-            CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
-    def test_scan_reason_set_exact_equality(self):
-        self.assertTrue(scan_reason_set_matches({"unreadable"}))
-        for reasons in (set(), {"gone"}, {"ptrace"}, {"denied"},
-                        {"unreadable", "gone"}, {"unreadable", "denied"},
-                        {"unreadable", "unreadable", "gone"}):
-            with self.subTest(reasons=sorted(reasons)):
-                self.assertFalse(scan_reason_set_matches(reasons))
 
-    def test_scan_unavailable_reasons_gathers_scalar(self):
-        self.assertEqual(
-            scan_unavailable_reasons(self.nodelay_report([], "unreadable")),
-            {"unreadable"})
-        self.assertEqual(
-            scan_unavailable_reasons(self.nodelay_report([], "gone")), {"gone"})
-        self.assertEqual(scan_unavailable_reasons(self.nodelay_report([], None)), set())
-        self.assertEqual(scan_unavailable_reasons({"functions": []}), set())
 
-    def test_scan_reason_singleton_matches_signature(self):
-        self.assertEqual(len(CR_RUN_NODELAY_KNOWN_SCAN_REASONS), 1)
-        self.assertIn(CR_RUN_NODELAY_KNOWN_SIGNATURE["scan_reason"],
-                      CR_RUN_NODELAY_KNOWN_SCAN_REASONS)
 
-    def test_predicate_equality_direction_kills(self):
-        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
-                                       "!= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
-        self.assertTrue(scan_reason_set_matches({"unreadable"}))
-        self.assertFalse(mutant({"unreadable"}))
-        self.assertFalse(scan_reason_set_matches({"gone"}))
-        self.assertTrue(mutant({"gone"}))
 
-    def test_predicate_subset_mutant_kills(self):
-        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
-                                       "<= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
-        self.assertFalse(scan_reason_set_matches(set()))
-        self.assertTrue(mutant(set()))
 
-    def test_predicate_superset_mutant_kills(self):
-        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
-                                       ">= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
-        self.assertFalse(scan_reason_set_matches({"unreadable", "gone"}))
-        self.assertTrue(mutant({"unreadable", "gone"}))
-        self.assertFalse(scan_reason_set_matches({"unreadable", "denied"}))
-        self.assertTrue(mutant({"unreadable", "denied"}))
 
-    def test_gatherer_scalar_mutant_kills(self):
-        mutant = self.mutate_gatherer("    return {reason}", "    return set()")
-        report = self.nodelay_report([], "unreadable")
-        self.assertEqual(scan_unavailable_reasons(report), {"unreadable"})
-        self.assertEqual(mutant(report), set())
 
-    def test_nodelay_causes_guard_kills(self):
-        mutant = self.mutate("if extra != [CR_RUN_NODELAY_KNOWN_GAP]:", "if False:")
-        report = self.nodelay_report(
-            sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable", "in_flight_at_end"],
-            "unreadable")
-        failures = [self.nodelay_gap_failure()]
-        self.assertIsNone(
-            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
-        self.assertEqual(
-            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
-            CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
-    def test_nodelay_failure_exactness_guard_kills(self):
-        mutant = self.mutate("if failures != [want]:", "if False:")
-        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-                                     "unreadable")
-        self.assertIsNone(
-            known_failure_signature("CR-RUN-NODELAY", report, ["unrelated failure"],
-                                    _GAPS_ATTACHED_RUN))
-        self.assertEqual(
-            mutant("CR-RUN-NODELAY", report, ["unrelated failure"], _GAPS_ATTACHED_RUN),
-            CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
-    def test_nodelay_classes_robustness_guard_kills(self):
-        mutant = self.mutate("if isinstance(classes, dict) else {}", "if True else {}")
-        report = {"functions": [],
-                  "evidence": {"attached_probes": 2, "gap_classes": "bogus",
-                               "scan_unavailable": "unreadable"}}
-        failures = [self.nodelay_gap_failure()]
-        self.assertIsNone(
-            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
-        with self.assertRaises(AttributeError):
-            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN)
 
-    def test_nodelay_dispatch_guard_kills(self):
-        mutant = self.mutate('if cell == "CR-RUN-NODELAY":', "if True:")
-        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-                                     "unreadable")
-        failures = [self.nodelay_gap_failure()]
-        self.assertIsNone(known_failure_signature("CR-RUN-SIGN", report, failures,
-                                                  _GAPS_ATTACHED_RUN))
-        self.assertEqual(mutant("CR-RUN-SIGN", report, failures, _GAPS_ATTACHED_RUN),
-                         CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
-    def test_nodelay_length_gate_is_redundant(self):
-        # Equivalent survivor, kept as a cheap early-out: any failure list
-        # passing the exact [want] match below necessarily has length 1,
-        # so dropping the length gate changes no verdict. Pinned here so
-        # the redundancy is reviewed, not accidental.
-        mutant = self.mutate("if len(failures) != 1:", "if False:")
-        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-                                     "unreadable")
-        failures = [self.nodelay_gap_failure(), "second failure"]
-        self.assertIsNone(
-            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
-        self.assertIsNone(mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+
+    def test_sweep_count_is_mechanical(self):
+        source = inspect.getsource(ClassifierMutationTests)
+        tree = ast.parse(source)
+        self.assertEqual(len(tree.body), 1)
+        methods = [node for node in tree.body[0].body
+                   if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+                   and node.name != "test_sweep_count_is_mechanical"]
+        counts = {}
+        for method in methods:
+            calls = sum(1 for sub in ast.walk(method)
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == "mutate")
+            counts[method.name] = calls
+        for name, calls in counts.items():
+            self.assertEqual(calls, 1, f"{name} must invoke exactly one source mutant")
+        # Bump the pinned mutant count when adding sweep mutants.
+        self.assertEqual(sum(counts.values()), 6)
 
 
 if __name__ == "__main__":

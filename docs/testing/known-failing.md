@@ -194,5 +194,7 @@ crash after the fragment write cannot pass as green.
   `typed-python-suite.py` via `scripts/run-python-suites.py
   test_browser_cells.py` with the strict-browser runner identity, and
   the judgment absorbs matching `KnownFailure`s as expected failures.
-  The post-tag FF-NOMOD row and its CR-RUN-NODELAY sibling are the
-  first stream-scoped rows (KI-25, KI-26).
+  The post-tag FF-NOMOD row (KI-25) is the first stream-scoped row.
+  CR-RUN-NODELAY (KI-26) is prose-only: the record cannot yet prove
+  the exact scan-reason set (per-view reasons merge first-wins), so
+  the cell stays strict until v0.8.0 records reason multiplicity.

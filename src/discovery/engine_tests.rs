@@ -101297,7 +101297,7 @@ const CUSTODY_RECEIVING_CTORS: [(&str, &str, usize, &str); 2] = [
     (
         "SystemScopeChildGuard::new",
         "src/discovery/engine_tests.rs",
-        53231,
+        53358,
         "fn new(child: std::process::Child)",
     ),
     (
@@ -101591,7 +101591,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     const EXEMPT: [(&str, usize, usize, &str, &str, &str); 28] = [
         (
             "src/discovery/engine_tests.rs",
-            13294,
+            13437,
             25,
             "std::process::Command::new(sh)",
             "spawn",
@@ -101599,7 +101599,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            44972,
+            45099,
             17,
             "std::process::Command::new(sleep)",
             "parked_sleep_has_a_stable_full_census",
@@ -101607,7 +101607,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            107179,
+            108177,
             22,
             "std::process::Command::new(sh)",
             "owned_tree_watch_exec_restarts_the_backoff_streak",
@@ -101631,7 +101631,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            20734,
+            20877,
             21,
             "std::process::Command::new(&runner)",
             "spawn_peer",
@@ -101639,7 +101639,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            21025,
+            21168,
             17,
             "std::process::Command::new(&runner)",
             "loaded_seed_provider_with_seed_table",
@@ -101647,7 +101647,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            31190,
+            31333,
             17,
             "std::process::Command::new(&runner)",
             "exit_loader_subject",
@@ -101655,7 +101655,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            26975,
+            27118,
             21,
             "std::process::Command::new(self.dir.path().join(\"tabled-runner\"))",
             "spawn_peer_library",
@@ -101663,7 +101663,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            27047,
+            27190,
             17,
             "std::process::Command::new(&runner)",
             "loaded_tabled_provider",
@@ -101671,7 +101671,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            11172,
+            11315,
             28,
             "std::process::Command::new(&fixtures.mapper)",
             "run_capture",
@@ -101679,7 +101679,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            11179,
+            11322,
             27,
             "std::process::Command::new(&fixtures.plain)",
             "run_capture",
@@ -101687,7 +101687,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            11185,
+            11328,
             30,
             "std::process::Command::new(&fixtures.threaded)",
             "run_capture",
@@ -101719,7 +101719,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            10379,
+            10522,
             21,
             "std::process::Command::new(sleep)",
             "exit_mapping_spawn_guards_reap_dropped_children",
@@ -101727,7 +101727,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            10441,
+            10584,
             21,
             "std::process::Command::new(sleep)",
             "exit_mapping_children_guard_reaps_remainder_after_mid_reap_panic",
@@ -101735,7 +101735,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            15920,
+            16063,
             17,
             "std::process::Command::new(sleep)",
             "initial_scan_zombie_member_is_silent_like_a_reaped_exit",
@@ -101743,7 +101743,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            16018,
+            16161,
             17,
             "std::process::Command::new(sleep)",
             "max_scan_pids_bounds_initial_scan_and_refresh",
@@ -101751,7 +101751,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            16263,
+            16406,
             17,
             "std::process::Command::new(sleep)",
             "zero_cap_refresh_short_circuits_the_sweep_to_empty",
@@ -101759,7 +101759,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            16364,
+            16507,
             17,
             "std::process::Command::new(sleep)",
             "ordinary_over_cap_refresh_performs_no_maps_sweep",
@@ -101767,7 +101767,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            17046,
+            17189,
             17,
             "std::process::Command::new(sleep)",
             "reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor",
@@ -101775,7 +101775,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            17436,
+            17579,
             17,
             "std::process::Command::new(sleep)",
             "reconcile_waiter_outside_slice_settles_within_one_sweep",
@@ -101783,7 +101783,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            17548,
+            17691,
             17,
             "std::process::Command::new(sleep)",
             "reconcile_quantum_zero_defers_the_whole_slice",
@@ -101791,7 +101791,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            17681,
+            17824,
             17,
             "std::process::Command::new(sleep)",
             "refresh_newcomer_zombie_is_silent_like_a_reaped_exit",
@@ -101799,7 +101799,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            17775,
+            17918,
             17,
             "std::process::Command::new(sleep)",
             "refresh_requests_survive_allocation_exhaustion",
@@ -101807,7 +101807,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            66108,
+            66235,
             9,
             "std::process::Command::new(sleep)",
             "peer_census_alignment_respawns_a_mismatched_peer",
@@ -101822,7 +101822,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     const TRANSFER: [(&str, usize, usize, &str, &str, &str); 7] = [
         (
             "src/discovery/engine_tests.rs",
-            23736,
+            23879,
             19,
             "forget:self",
             "into_inner",
@@ -101830,7 +101830,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            34491,
+            34634,
             19,
             "forget:child",
             "fd_inheritor_dies_with_spawning_thread",
@@ -101838,7 +101838,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            39315,
+            39458,
             27,
             "replace:&mut engine.pinned",
             "an_ended_pid_retirement_keeping_a_grouped_slot_deactivates_it",
@@ -101846,7 +101846,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            39420,
+            39563,
             27,
             "replace:&mut engine.pinned",
             "an_ended_pid_retirement_closes_over_the_disturbed_group_only",
@@ -101854,7 +101854,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            39509,
+            39652,
             27,
             "replace:&mut engine.pinned",
             "an_ended_pid_retirement_retiring_nothing_keeps_every_grouped_slot",
@@ -101862,7 +101862,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            46075,
+            46202,
             19,
             "swap:&mut survivor",
             "a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed",
@@ -101870,7 +101870,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
         ),
         (
             "src/discovery/engine_tests.rs",
-            56571,
+            56698,
             23,
             "manuallydrop:first",
             "review_metadata_unmap_releases_omitted_provider_pins_after_memory_rescan",
@@ -101957,40 +101957,40 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     // conversion (bare→guarded moves one unit from the exemption list
     // to the guarded count).
     assert_eq!(guarded_total, 213, "guarded constructor occurrences");
-    assert_eq!(other, 52, "Other (allowlisted literal) occurrences");
+    assert_eq!(other, 53, "Other (allowlisted literal) occurrences");
     assert_eq!(waited, 4, "inline-waited occurrences");
     assert_eq!(
         received,
         [
-            ("src/discovery/engine_tests.rs".to_string(), 23879),
-            ("src/discovery/engine_tests.rs".to_string(), 33903),
-            ("src/discovery/engine_tests.rs".to_string(), 33921),
-            ("src/discovery/engine_tests.rs".to_string(), 76404),
-            ("src/discovery/engine_tests.rs".to_string(), 76877),
-            ("src/discovery/engine_tests.rs".to_string(), 76968),
-            ("src/discovery/engine_tests.rs".to_string(), 77148),
-            ("src/discovery/engine_tests.rs".to_string(), 77471),
-            ("src/discovery/engine_tests.rs".to_string(), 77505),
-            ("src/discovery/engine_tests.rs".to_string(), 77860),
-            ("src/discovery/engine_tests.rs".to_string(), 78172),
-            ("src/discovery/engine_tests.rs".to_string(), 78258),
-            ("src/discovery/engine_tests.rs".to_string(), 78332),
-            ("src/discovery/engine_tests.rs".to_string(), 78366),
-            ("src/discovery/engine_tests.rs".to_string(), 78497),
-            ("src/discovery/engine_tests.rs".to_string(), 79191),
-            ("src/discovery/engine_tests.rs".to_string(), 79545),
-            ("src/discovery/engine_tests.rs".to_string(), 80084),
-            ("src/discovery/engine_tests.rs".to_string(), 80340),
-            ("src/discovery/engine_tests.rs".to_string(), 80892),
-            ("src/discovery/engine_tests.rs".to_string(), 81583),
-            ("src/discovery/engine_tests.rs".to_string(), 82737),
+            ("src/discovery/engine_tests.rs".to_string(), 24022),
+            ("src/discovery/engine_tests.rs".to_string(), 34046),
+            ("src/discovery/engine_tests.rs".to_string(), 34064),
+            ("src/discovery/engine_tests.rs".to_string(), 76531),
+            ("src/discovery/engine_tests.rs".to_string(), 77004),
+            ("src/discovery/engine_tests.rs".to_string(), 77095),
+            ("src/discovery/engine_tests.rs".to_string(), 77275),
+            ("src/discovery/engine_tests.rs".to_string(), 77598),
+            ("src/discovery/engine_tests.rs".to_string(), 77632),
+            ("src/discovery/engine_tests.rs".to_string(), 77987),
+            ("src/discovery/engine_tests.rs".to_string(), 78299),
+            ("src/discovery/engine_tests.rs".to_string(), 78385),
+            ("src/discovery/engine_tests.rs".to_string(), 78459),
+            ("src/discovery/engine_tests.rs".to_string(), 78493),
+            ("src/discovery/engine_tests.rs".to_string(), 78624),
+            ("src/discovery/engine_tests.rs".to_string(), 79318),
+            ("src/discovery/engine_tests.rs".to_string(), 79672),
+            ("src/discovery/engine_tests.rs".to_string(), 80211),
+            ("src/discovery/engine_tests.rs".to_string(), 80467),
+            ("src/discovery/engine_tests.rs".to_string(), 81019),
+            ("src/discovery/engine_tests.rs".to_string(), 81710),
+            ("src/discovery/engine_tests.rs".to_string(), 82864),
         ],
         "unexpected received-transfer set: {received:?}"
     );
     // Exactly one release definition exists, at its pinned site.
     assert_eq!(
         transfer_defs,
-        [("src/discovery/engine_tests.rs".to_string(), 23731)],
+        [("src/discovery/engine_tests.rs".to_string(), 23874)],
         "unexpected release-definition set: {transfer_defs:?}"
     );
     // Each allowlisted constructor is defined where its entry says.
@@ -102014,9 +102014,9 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     assert_eq!(
         splits,
         [
-            ("src/discovery/engine_tests.rs".to_string(), 23350),
-            ("src/discovery/engine_tests.rs".to_string(), 23361),
-            ("src/discovery/engine_tests.rs".to_string(), 23711),
+            ("src/discovery/engine_tests.rs".to_string(), 23493),
+            ("src/discovery/engine_tests.rs".to_string(), 23504),
+            ("src/discovery/engine_tests.rs".to_string(), 23854),
             ("src/discovery/trace_system_seed_tests.rs".to_string(), 104),
             ("src/discovery/trace_system_seed_tests.rs".to_string(), 378),
             ("src/discovery/trace_system_seed_tests.rs".to_string(), 878),
@@ -102039,14 +102039,14 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     const SPLIT_GUARDS: [(&str, usize, &str, usize, &[&str]); 5] = [
         (
             "src/discovery/engine_tests.rs",
-            23361,
+            23504,
             "child: Some(child),",
             12,
             &[],
         ),
         (
             "src/discovery/engine_tests.rs",
-            23711,
+            23854,
             "child: Some(child),",
             6,
             &[],

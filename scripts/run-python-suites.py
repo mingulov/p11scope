@@ -15,7 +15,8 @@ of three ways:
   which must drive it through an invocation-shaped reference: the suite
   path as an argument of a python/pytest/unittest call or of the runner's
   own suite list. The driver is a cargo integration test, a self-test the
-  hosted pipeline already runs, or a scheduled workflow.
+  hosted pipeline already runs, or a scheduled workflow whose `run:` line
+  is exactly `python3 -I scripts/run-python-suites.py <file>`.
 - EXCLUDED: a suite that cannot run anywhere today, with the reason.
 
 The registry is checked against the directory both ways before anything
@@ -28,6 +29,7 @@ Usage:
   python3 -I scripts/run-python-suites.py --check    # registry check only
   python3 -I scripts/run-python-suites.py --list     # print the registry
   python3 -I scripts/run-python-suites.py SUITE...   # check, run only these
+  # (a bare run covers RUN; SUITE... may also name DRIVEN suites)
 """
 
 import fnmatch
@@ -347,23 +349,15 @@ def _strip_driver_comments(text, driver):
     return "".join(out)
 
 
-def _invocation_shaped(stripped, needle, driver=""):
+def _invocation_shaped(stripped, needle):
     """True when some occurrence is passed as an invocation argument.
 
     An occurrence counts when it sits in argument position (after `(`, `,`
     or `[`, closed by `,`, `)` or `]` or whitespace) with an invocation
-    marker within two lines; a bare mention has neither and fails. In a
-    scheduled workflow (YAML `run:` shell lines have no call punctuation),
-    a quoted path on the same line as a python/pytest/unittest invocation
-    counts instead. Comments are blanked before either rule runs.
+    marker within two lines; a bare mention has neither and fails.
+    (Workflow drivers take the exact run-line rule instead.)
     """
     lines = stripped.splitlines()
-    if driver.endswith((".yml", ".yaml")):
-        return any(
-            needle in line
-            and any(marker in line for marker in ("python", "pytest", "unittest"))
-            for line in lines
-        )
     start = 0
     while True:
         at = stripped.find(needle, start)
@@ -382,13 +376,42 @@ def _invocation_shaped(stripped, needle, driver=""):
     return False
 
 
+WORKFLOW_RUNNER_INVOCATION = "python3 -I scripts/run-python-suites.py"
+
+
+def workflow_drives_suite(text, name):
+    """A workflow step drives a suite only for the exact registered
+    runner invocation. Echoes, env vars, comments and multiline blocks
+    never count: the `run:` line must equal the invocation exactly."""
+    want = f"{WORKFLOW_RUNNER_INVOCATION} {name}"
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("- run:"):
+            command = stripped[len("- run:"):].strip()
+        elif stripped.startswith("run:"):
+            command = stripped[len("run:"):].strip()
+        else:
+            continue
+        if command == want:
+            return True
+    return False
+
+
 def driven_state(text, name, driver):
     """How a driver references a suite: "driven", "named" or "missing"."""
+    if driver.endswith((".yml", ".yaml")):
+        if workflow_drives_suite(text, name):
+            return "driven"
+        uncommented = "\n".join(
+            line.split("#", 1)[0] for line in text.splitlines())
+        if name in uncommented:
+            return "named"
+        return "missing"
     stripped = _strip_driver_comments(text, driver)
     needles = (f'"{SUITE_DIR}/{name}"', f'"{name}"')
     if not any(needle in stripped for needle in needles):
         return "missing"
-    if any(_invocation_shaped(stripped, needle, driver) for needle in needles):
+    if any(_invocation_shaped(stripped, needle) for needle in needles):
         return "driven"
     return "named"
 
@@ -644,8 +667,11 @@ def run_suites(selected):
     typed_host = os.environ.get("P11SCOPE_KNOWN_FAILING_HOST")
     typed = bool(typed_output or typed_host)
     fragments = []
+    entries = list(RUN) + [
+        (name, []) for name in sorted(DRIVEN) if name in selected
+    ]
     with tempfile.TemporaryDirectory(prefix="python-suite-fragments-") as temporary:
-        for index, (name, args) in enumerate(RUN):
+        for index, (name, args) in enumerate(entries):
             if selected and name not in selected:
                 continue
             label = " ".join([name, *args])
@@ -706,9 +732,10 @@ def main(argv):
     if argv[:1] == ["--check"]:
         return 0
     selected = set(argv)
-    unknown = selected - {name for name, _ in RUN}
+    runnable = {name for name, _ in RUN} | set(DRIVEN)
+    unknown = selected - runnable
     if unknown:
-        print(f"run-python-suites: not a RUN suite: {', '.join(sorted(unknown))}", file=sys.stderr)
+        print(f"run-python-suites: not a runnable suite: {', '.join(sorted(unknown))}", file=sys.stderr)
         return 2
     failed = run_suites(selected)
     if failed:

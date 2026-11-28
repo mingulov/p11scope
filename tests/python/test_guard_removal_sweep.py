@@ -7,37 +7,36 @@ Parses scripts/check-capture-evidence.py with ast, derives the swept
 function scope MECHANICALLY as the call-graph closure from the lane
 entry points (validate_canary, validate_induced) plus the functions
 called by unconditional module-level statements (import-time
-derivation), enumerates EVERY guard statement (assert,
-require/uint/guard-helper bare calls, raise) in that scope, removes
-each one in turn in a temp copy (replaced by `pass`, so the mutant is
-exactly "this guard is gone"), and runs the committed canary suite:
-the checker self-test plus the three checker-touching test classes at
-both widths. Each removal must make some test fail. A surviving removal
-fails the sweep and names the line. There is no hand-named function
-list: a validator the entries can reach is swept, whatever its name.
+derivation) and the fixture-oracle family by naming convention, then
+collects EVERY guard statement (assert, require/uint/guard-helper
+bare calls, raise) in that scope — including other lanes' branches
+of validate_induced. Each collected guard is removed in turn in a
+temp copy (replaced by `pass`, so the mutant is exactly "this guard
+is gone") and run against the committed canary suite: the checker
+self-test plus the three checker-touching test classes at both
+widths. There is no hand-named function list and no silent
+exemption: a validator the entries can reach is collected, whatever
+its name.
 
-Scope boundary (mechanical, keep in sync with the code below):
-- Roots: the lane entries, functions called by unconditional
-  module-level statements (import-time derivation; main() is excluded
-  by construction, called only under `if __name__`), and the
-  fixture-oracle family by naming convention.
-- Closure members under the lane-domain naming convention get
-  per-guard removal checks (this lane owns their diagnostic
-  precision). Every other closure member is a platform validator this
-  lane uses but does not own: allowlisted with external callers
-  printed as supporting evidence. Their internals belong to owning
-  lanes (own tests, own staging, own messages); this lane pins their
-  behavior on its paths instead: every platform stage called from a
-  swept function is itself a swept call-site guard (it cannot be
-  dropped silently), and the lane's black-box negatives prove refusal
-  of invalid lane inputs through them.
-- validate_induced's own statements keep the shared head/tail plus the
-  lane branches that reach exact_matrix_observation (the matrix-oracle
-  seam); other lane branches are other gates. The kept/dropped
-  partition is printed by --list for audit.
-- NOT swept here: test assertions, fixture builders, CLI handling, and
-  data (constant/set/tuple changes stay in the hand data sweep: AST
-  guard removal cannot express them).
+Verdict per collected guard, all machine-checked every run:
+- KILLED: some test fails on removal. Required for lane-domain
+  guards (this lane owns their diagnostic precision).
+- DISPOSITIONED: removal passes the suite (verdict-identical on the
+  committed corpus, re-verified every run) and a committed row in
+  guard_sweep_dispositions.py records why (staged overlap, owning
+  context). Platform and other-gate guards may carry rows; lane
+  guards may not — a lane-owned survivor fails naming it.
+- Anything else fails naming it: an unaccounted survivor, a stale
+  row (dispositioned guard now killed: promote to kill), an orphan
+  row (no such guard: update or drop it), or a swept/collected
+  mismatch (the self-check below).
+
+Self-checks (loop rule: mechanical, no judgement): the run set must
+equal the collected set; call edges include higher-order references
+(a bare module-function Name in value position, e.g. map(f, ...),
+counts as an edge); any dynamic dispatch the edges cannot resolve
+(getattr/eval/exec/__import__/globals/locals/vars) fails closed
+naming it.
 
 Usage:
   python3 -I tests/python/test_guard_removal_sweep.py [-v] [--workers N]
@@ -48,6 +47,8 @@ Usage:
 import argparse
 import ast
 import concurrent.futures
+import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -100,14 +101,6 @@ LANE_PREFIXES = (
 # this lane's (canary/G4/G5 validate the version-matrix provider through
 # it); branches that never reach it are other gates.
 MATRIX_SEAM = "exact_matrix_observation"
-
-# Module entry points, named structurally (not scope members): the test
-# suite entry seeds test-only code, and the CLI entry stays a gate even
-# though self-test invokes it (otherwise every CLI-dispatched validator
-# would misclassify as test-only). Calls from test-only code never make
-# a helper shared: tests exercise gates; they are not gates.
-TEST_ENTRY = "self_test"
-MAIN_ENTRY = "main"
 
 # Bare Name-calls that are validation stages, besides nested helpers
 # (take, anchored, pinned_line). matrix_fixture_path is deliberately
@@ -253,14 +246,41 @@ def collect_guards(func_node):
     return guards
 
 
-def local_callees(func_node, funcs):
-    """Module-level function names called anywhere inside func_node."""
+def referenced_names(func_node, funcs):
+    """Module-level function names referenced anywhere inside func_node:
+    direct calls plus higher-order references in value position (map(f,
+    ...), callbacks, aliases). Conservative: a bare Name may denote a
+    call edge the direct-call walk would miss."""
     names = set()
     for node in ast.walk(func_node):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in funcs:
-                names.add(node.func.id)
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id in funcs):
+            names.add(node.id)
     return names
+
+
+# Dynamic dispatch the static edges cannot resolve: fail closed.
+DYNAMIC_DISPATCH = (
+    "getattr",
+    "eval",
+    "exec",
+    "__import__",
+    "globals",
+    "locals",
+    "vars",
+)
+
+
+def fail_closed_dynamic(funcs, scope):
+    """Any dynamic dispatch inside the swept scope fails naming it."""
+    for name in sorted(scope):
+        for node in ast.walk(funcs[name]):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in DYNAMIC_DISPATCH:
+                    raise SweepError(
+                        f"{name}:{node.lineno}: dynamic dispatch "
+                        f"{node.func.id}() cannot be edged statically"
+                    )
 
 
 def module_level_roots(tree, funcs):
@@ -280,122 +300,60 @@ def module_level_roots(tree, funcs):
 
 
 def closure_scope(tree, funcs):
-    """Swept roots and their transitive closure. Roots: the lane entries,
-    functions called by unconditional module-level statements (import-time
-    derivation), and the fixture-oracle family by naming convention. The
-    closure from validate_induced follows only kept statements (shared
-    head/tail plus matrix-reaching lane branches), so other gates'
-    exclusive helpers never enter. Returns
-    (roots, scope, dropped_spans, branch_labels)."""
+    """Roots and their transitive closure over reference edges (direct
+    calls plus higher-order Name references). Roots: the lane entries,
+    functions called by unconditional module-level statements
+    (import-time derivation), and the fixture-oracle family by naming
+    convention. No statement filtering: G-branch callees enter like
+    everything else (their guards route to other-gate dispositions).
+    Returns (roots, scope)."""
     for name in ENTRY_POINTS:
         if name not in funcs:
             raise SweepError(f"entry point {name} is gone")
-    if MATRIX_SEAM not in funcs:
-        raise SweepError(f"matrix seam {MATRIX_SEAM} is gone")
-    if TEST_ENTRY not in funcs:
-        raise SweepError(f"test entry {TEST_ENTRY} is gone")
     family = {n for n in funcs if n.startswith(ORACLE_PREFIXES)}
     if not family:
         raise SweepError("fixture-oracle family is empty")
     roots = set(ENTRY_POINTS) | module_level_roots(tree, funcs) | family
-    dropped, labels = induced_dropped_spans(funcs["validate_induced"], funcs)
-
-    def seed_calls(stmts, spans):
-        names = set()
-        for sub in ast.walk(ast.Module(body=stmts, type_ignores=[])):
-            if (isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Name)
-                    and sub.func.id in funcs
-                    and not any(start <= sub.lineno and sub.end_lineno <= stop
-                                for start, stop in spans)):
-                names.add(sub.func.id)
-        return names
-
     seen, stack = set(roots), []
     for name in roots:
-        spans = dropped if name == "validate_induced" else []
-        stack.extend(seed_calls(funcs[name].body, spans) - seen)
-    # Module-level unconditional statements seed derivation callers too.
+        stack.extend(referenced_names(funcs[name], funcs) - seen)
     for stmt in tree.body:
         if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign,
                               ast.AugAssign, ast.Assert)):
-            stack.extend(seed_calls([stmt], []) - seen)
+            for sub in ast.walk(stmt):
+                if (isinstance(sub, ast.Name)
+                        and isinstance(sub.ctx, ast.Load)
+                        and sub.id in funcs
+                        and sub.id not in seen):
+                    stack.append(sub.id)
     while stack:
         name = stack.pop()
         if name in seen:
             continue
         seen.add(name)
-        stack.extend(local_callees(funcs[name], funcs) - seen)
-    return roots, seen, dropped, labels
-
-
-def caller_map(funcs):
-    """Reverse call graph over module-level function definitions."""
-    callers = {name: set() for name in funcs}
-    for caller, node in funcs.items():
-        for name in local_callees(node, funcs):
-            callers[name].add(caller)
-    return callers
-
-
-def test_only(funcs, scope):
-    """Functions provably called only from tests: the fixpoint seeded at
-    the test entry over non-empty caller sets. Other lanes' validators
-    stay gates even when self-test exercises them (main/CLI calls them
-    too); a function with no callers at all never qualifies."""
-    callers = caller_map(funcs)
-    tests = {TEST_ENTRY}
-    while True:
-        more = {
-            name for name in funcs
-            if name not in scope
-            and name not in tests
-            and name != MAIN_ENTRY
-            and callers[name]
-            and callers[name] <= tests
-        }
-        if not more:
-            return tests - {TEST_ENTRY}
-        tests |= more
+        stack.extend(referenced_names(funcs[name], funcs) - seen)
+    return roots, seen
 
 
 def lane_owned(name):
-    """Lane-domain naming convention (see LANE_PREFIXES)."""
+    """Lane-domain naming convention (see LANE_PREFIXES): routing rule
+    for acceptance (per-guard kills required), never for enumeration."""
     return name.startswith(LANE_PREFIXES)
 
 
-def shared_allowlist(funcs, scope):
-    """Closure members outside the lane-domain convention: platform
-    validators this lane uses but does not own. Each carries its
-    external callers as supporting evidence (empty does not matter:
-    the convention, not the callers, draws this line)."""
-    for name in ENTRY_POINTS:
-        if not lane_owned(name):
-            raise SweepError(f"entry point {name} left the lane convention")
-    callers = caller_map(funcs)
-    tests = test_only(funcs, scope) | {TEST_ENTRY}
-    allow = {}
-    for name in sorted(scope):
-        if lane_owned(name):
-            continue
-        outside = sorted(
-            c for c in callers[name]
-            if c not in scope and c not in tests
-        )
-        allow[name] = outside
-    return allow
-
-
-def induced_dropped_spans(func_node, funcs):
+def induced_branch_spans(func_node, funcs):
     """Line spans of validate_induced lane branches that never reach the
-    matrix seam. Returns (dropped spans, kept/dropped branch labels)."""
+    matrix seam, for routing their guards to other-gate dispositions
+    (the guards are still collected and run like everything else).
+    Returns (other-gate spans, branch labels). Fails closed when the
+    lane dispatch is absent or nothing reaches the seam."""
     def reaches_seam(stmts):
         seen, stack = set(), []
         for sub in ast.walk(ast.Module(body=stmts, type_ignores=[])):
-            if (isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Name)
-                    and sub.func.id in funcs):
-                stack.append(sub.func.id)
+            if (isinstance(sub, ast.Name)
+                    and isinstance(sub.ctx, ast.Load)
+                    and sub.id in funcs):
+                stack.append(sub.id)
         while stack:
             callee = stack.pop()
             if callee in seen:
@@ -403,7 +361,7 @@ def induced_dropped_spans(func_node, funcs):
             seen.add(callee)
             if callee == MATRIX_SEAM:
                 return True
-            stack.extend(local_callees(funcs[callee], funcs) - seen)
+            stack.extend(referenced_names(funcs[callee], funcs) - seen)
         return False
 
     def is_lane_test(test):
@@ -444,31 +402,83 @@ def induced_dropped_spans(func_node, funcs):
     return dropped, labels
 
 
+def guard_head_id(source_lines, lineno):
+    """Content hash of a guard's first line (edit-stable except for the
+    guard's own text: rewording a guard orphans its disposition row)."""
+    head = " ".join(source_lines[lineno - 1].split())
+    return hashlib.sha1(head.encode("utf-8")).hexdigest()[:12]
+
+
 def enumerate_guards(source):
+    """Every guard in the closure scope, with routing and stable IDs.
+
+    Returns (guards, info) where each guard is
+    (func, lineno, end, kind, routing, guard_id) and info carries the
+    scope, roots, branch labels and other-gate spans. Routing is
+    other-gate (inside a non-matrix lane branch), lane-owned (lane
+    convention), or platform. Fails closed on dynamic dispatch and on
+    a vanished lane dispatch or seam."""
     tree = ast.parse(source)
+    source_lines = source.splitlines(keepends=True)
     funcs = {}
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             funcs[node.name] = node
-    roots, scope, dropped, labels = closure_scope(tree, funcs)
-    allow = shared_allowlist(funcs, scope)
-    swept = scope - set(allow)
+    roots, scope = closure_scope(tree, funcs)
+    fail_closed_dynamic(funcs, scope)
+    spans, labels = induced_branch_spans(funcs["validate_induced"], funcs)
+    if not labels:
+        raise SweepError("validate_induced has no lane dispatch to route")
+    if not any(reaches for _, reaches in labels):
+        raise SweepError("no induced lane branch reaches the matrix seam")
     guards = []
-    for name in [n for n in funcs if n in swept]:
-        excluded = dropped if name == "validate_induced" else []
+    for name in [n for n in funcs if n in scope]:
         for lineno, end, kind in collect_guards(funcs[name]):
-            if any(start <= lineno and end <= stop for start, stop in excluded):
-                continue
-            guards.append((name, lineno, end, kind))
+            if name == "validate_induced" and any(
+                    start <= lineno and end <= stop
+                    for start, stop in spans):
+                routing = "other-gate"
+            elif lane_owned(name):
+                routing = "lane-owned"
+            else:
+                routing = "platform"
+            guards.append([name, lineno, end, kind, routing, None])
     guards.sort(key=lambda g: (list(funcs).index(g[0]), g[1]))
-    info = {"labels": labels, "allowlist": allow, "scope": scope,
-            "roots": roots}
-    return guards, info
+    seen = {}
+    for guard in guards:
+        func, lineno, _, kind = guard[0], guard[1], guard[2], guard[3]
+        head = guard_head_id(source_lines, lineno)
+        key = (func, kind, head)
+        occurrence = seen.get(key, 0)
+        seen[key] = occurrence + 1
+        guard[5] = f"{func}:{kind}:{head}:{occurrence}"
+    info = {"labels": labels, "scope": scope, "roots": roots,
+            "other_gate_spans": spans}
+    return [tuple(guard) for guard in guards], info
+
+
+DISPOSITIONS_FILE = "tests/python/guard_sweep_dispositions.py"
+
+DISPOSITION_CATEGORIES = ("platform-overlap", "platform-untested",
+                          "other-gate")
+
+
+def load_dispositions():
+    """Committed survivor dispositions: {guard_id: (category, cluster)}.
+    Missing file means none recorded yet."""
+    path = ROOT / DISPOSITIONS_FILE
+    if not path.is_file():
+        return {}, {}
+    spec = importlib.util.spec_from_file_location(
+        "guard_sweep_dispositions", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return dict(module.DISPOSITIONS), dict(module.CLUSTERS)
 
 
 def remove_guard(source_lines, guard):
     """Replace the guard's line range with `pass` at its indent."""
-    _, lineno, end, _ = guard
+    _, lineno, end, _, _, _ = guard
     indent = source_lines[lineno - 1][
         : len(source_lines[lineno - 1]) - len(source_lines[lineno - 1].lstrip())
     ]
@@ -553,24 +563,34 @@ def main(argv):
     source_lines = source.splitlines(keepends=True)
     try:
         guards, info = enumerate_guards(source)
+        dispositions, clusters = load_dispositions()
     except SweepError as error:
         print(f"sweep broken: {error}")
         return 2
-    allow = info["allowlist"]
-    funcs = {name for name, _, _, _ in guards}
-    print(f"enumerated {len(guards)} guards in {len(funcs)} functions; "
-          f"scope {len(info['scope'])} functions, "
-          f"allowlist {len(allow)} shared helpers")
+    except (OSError, SyntaxError, AttributeError, TypeError) as error:
+        print(f"sweep broken: cannot load dispositions: {error}")
+        return 2
+    by_routing = {}
+    for guard in guards:
+        by_routing.setdefault(guard[4], 0)
+        by_routing[guard[4]] += 1
+    print(f"enumerated {len(guards)} guards in "
+          f"{len({name for name, _, _, _, _, _ in guards})} functions; "
+          f"scope {len(info['scope'])} functions; "
+          + ", ".join(f"{count} {routing}"
+                      for routing, count in sorted(by_routing.items())))
     print("induced lane branches: " + ", ".join(
-        f"{lane}={'kept' if reaches else 'dropped'}"
+        f"{lane}={'matrix' if reaches else 'other-gate'}"
         for lane, reaches in info["labels"]))
     if args.list:
-        for index, (func, lineno, end, kind) in enumerate(guards):
-            head = source_lines[lineno - 1].strip()[:72]
-            print(f"{index:3d} {func}:{lineno}-{end} {kind} :: {head}")
-        print("---- allowlist (shared: also called from outside the lane) ----")
-        for name in sorted(allow):
-            print(f"allow {name} <- {', '.join(allow[name])}")
+        for index, (func, lineno, end, kind, routing, gid) in enumerate(guards):
+            head = source_lines[lineno - 1].strip()[:60]
+            disp = dispositions.get(gid)
+            mark = ("DISP+" if disp else "----")
+            print(f"{index:3d} {func}:{lineno}-{end} {kind} "
+                  f"[{routing}/{mark}] :: {head}")
+        print(f"---- dispositions: {len(dispositions)} rows, "
+              f"{len(clusters)} clusters ----")
         return 0
     base = Path(os.environ.get("TMPDIR", "/tmp"))
     base.mkdir(parents=True, exist_ok=True)
@@ -615,17 +635,73 @@ def main(argv):
         for future in concurrent.futures.as_completed(future_of):
             guard, status, detail = future.result()
             results.append((guard, status, detail))
-            func, lineno, _, kind = guard
+            func, lineno, _, kind, _, _ = guard
             extra = f" ({detail})" if args.verbose else ""
             print(f"{func}:{lineno} {kind}: {status}{extra}", flush=True)
+    # Self-check: the swept set must equal the collected set.
+    if args.guard is None:
+        ran = {guard[5] for guard, _, _ in results}
+        collected = {guard[5] for guard in guards}
+        if ran != collected:
+            missing = sorted(collected - ran)
+            extra = sorted(ran - collected)
+            print(f"sweep broken: swept != collected "
+                  f"(missing={missing} extra={extra})")
+            return 2
+    # Disposition file checks (schema, orphans, lane-owned rows).
+    problems = []
+    by_id = {guard[5]: guard for guard in guards}
+    for gid, row in dispositions.items():
+        if gid not in by_id:
+            problems.append(f"orphan disposition row: {gid}")
+            continue
+        if not (isinstance(row, (tuple, list)) and len(row) == 3):
+            problems.append(f"malformed disposition row: {gid}")
+            continue
+        category, cluster, note = row
+        if category not in DISPOSITION_CATEGORIES:
+            problems.append(f"bad category in row: {gid}")
+        if cluster not in clusters:
+            problems.append(f"unknown cluster in row: {gid}")
+        if not note:
+            problems.append(f"empty note in row: {gid}")
+        routing = by_id[gid][4]
+        if routing == "lane-owned":
+            problems.append(f"lane-owned guard must be killed, not rowed: {gid}")
+        elif category == "other-gate" and routing != "other-gate":
+            problems.append(f"other-gate row on {routing} guard: {gid}")
+        elif category in ("platform-overlap", "platform-untested") \
+                and routing != "platform":
+            problems.append(f"platform row on {routing} guard: {gid}")
+    # Verdicts: killed, dispositioned, or failing (naming it).
+    failures = []
+    for guard, status, detail in results:
+        func, lineno, _, kind, routing, gid = guard
+        if status == "ERROR":
+            failures.append(f"ERROR {func}:{lineno} {kind} ({detail})")
+        elif status == "KILLED":
+            if gid in dispositions:
+                failures.append(
+                    f"STALE-ROW {func}:{lineno} {kind}: now killed, "
+                    "promote to kill (drop the row)")
+        elif gid in dispositions:
+            pass
+        else:
+            failures.append(
+                f"SURVIVED {func}:{lineno} {kind} [{routing}] ({detail})")
     results.sort(key=lambda item: selected.index(item[0]))
-    bad = [(g, s, d) for g, s, d in results if s != "KILLED"]
     print("----")
-    for (func, lineno, _, kind), status, detail in bad:
-        print(f"{status} {func}:{lineno} {kind} ({detail})")
-    print(f"killed {len(results) - len(bad)}/{len(results)}; "
-          f"survivors/errors: {len(bad)}")
-    return 1 if bad else 0
+    for problem in problems:
+        print(problem)
+    for failure in failures:
+        print(failure)
+    killed = sum(1 for _, status, _ in results if status == "KILLED")
+    disped = sum(1 for guard, status, _ in results
+                 if status != "KILLED" and guard[5] in dispositions)
+    print(f"killed {killed}/{len(results)}; "
+          f"dispositioned {disped}; problems {len(problems)}; "
+          f"failures {len(failures)}")
+    return 1 if (problems or failures) else 0
 
 
 if __name__ == "__main__":

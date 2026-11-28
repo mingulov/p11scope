@@ -154,6 +154,57 @@ class SuiteRegistryTests(unittest.TestCase):
             "tests/entry_object_paired.rs",
         )
 
+    def test_a_workflow_with_the_exact_runner_invocation_drives(self):
+        text = (
+            "jobs:\n"
+            "  sweep:\n"
+            "    steps:\n"
+            '      - run: python3 -I scripts/run-python-suites.py test_b.py\n'
+        )
+        problems = problems_of(
+            {"test_b.py"}, [], {"test_b.py": "w/nightly.yml"}, {},
+            reader({"w/nightly.yml": text}),
+        )
+        self.assertEqual(problems, [])
+
+    def test_a_workflow_echo_does_not_drive(self):
+        text = '- run: echo "tests/python/test_b.py"\n'
+        problems = problems_of(
+            {"test_b.py"}, [], {"test_b.py": "w/nightly.yml"}, {},
+            reader({"w/nightly.yml": text}),
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("without driving it", problems[0])
+
+    def test_a_workflow_env_var_does_not_drive(self):
+        text = '        SUITE: "tests/python/test_b.py"\n'
+        problems = problems_of(
+            {"test_b.py"}, [], {"test_b.py": "w/nightly.yml"}, {},
+            reader({"w/nightly.yml": text}),
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("without driving it", problems[0])
+
+    def test_a_commented_out_workflow_run_does_not_drive(self):
+        text = ("# - run: python3 -I scripts/run-python-suites.py "
+                "test_b.py\n")
+        problems = problems_of(
+            {"test_b.py"}, [], {"test_b.py": "w/nightly.yml"}, {},
+            reader({"w/nightly.yml": text}),
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("no longer names it", problems[0])
+
+    def test_a_multiline_workflow_run_does_not_drive(self):
+        text = ("      - run: |\n"
+                "        python3 -I scripts/run-python-suites.py test_b.py\n")
+        problems = problems_of(
+            {"test_b.py"}, [], {"test_b.py": "w/nightly.yml"}, {},
+            reader({"w/nightly.yml": text}),
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("without driving it", problems[0])
+
 
 if __name__ == "__main__":
     unittest.main()

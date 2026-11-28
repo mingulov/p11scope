@@ -1823,7 +1823,7 @@ fn recovered_production_base(euid: u32) -> PathBuf {
 /// `$TMPDIR`, then `/tmp`. Each label names the parent in diagnostics.
 /// A test override or a caller-supplied non-production base stays exact:
 /// refusal twins must not gain a fallback the production chain owns.
-fn recovery_base_chain(base: &Path) -> Vec<(PathBuf, &'static str)> {
+pub(crate) fn recovery_base_chain(base: &Path) -> Vec<(PathBuf, &'static str)> {
     #[cfg(test)]
     if std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR").is_some_and(|dir| dir == base.as_os_str()) {
         return vec![(base.to_path_buf(), "the test recovery parent")];
@@ -1968,63 +1968,15 @@ fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File,
     }
 }
 
-/// Opens the recovery dir through the production parent chain. An
-/// absent or unwritable parent moves to the next root (`$TMPDIR`, then
-/// `/tmp`), and so does a failed base/sibling attempt on a writable
-/// parent (a full recovery volume falls through to the next root
-/// instead of losing the capture); once a root succeeds, the exact
-/// per-euid base keeps its squatter-resistant sibling fallback on that
-/// same parent. The warning names every parent skipped and its reason
-/// before naming the parent actually used. A single-root chain (a
-/// caller-supplied or test base, never production) attempts its root
-/// directly: with no next root the preflight could only replace the
-/// sibling attempt's error — which names the base and the failed
-/// fallback — with its own verdict.
-fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
-    let chain = recovery_base_chain(base);
-    if chain.len() == 1 {
-        return open_recovered_dir_or_sibling_fallback(&chain[0].0);
-    }
-    open_recovered_chain(&chain, open_recovered_dir_or_sibling_fallback)
-}
-
-/// Walks a multi-root recovery chain with an injectable attempt, so a
-/// writable-but-failing root (a full volume) falls through to the next
-/// root with a named reason instead of ending the chain.
-fn open_recovered_chain(
-    chain: &[(PathBuf, &'static str)],
-    attempt: impl Fn(&Path) -> Result<(std::fs::File, PathBuf), String>,
-) -> Result<(std::fs::File, PathBuf), String> {
-    let mut skipped = Vec::new();
-    for (index, (candidate, label)) in chain.iter().enumerate() {
-        if let Some(reason) = recovery_parent_unusable(candidate) {
-            skipped.push(format!("{label} unavailable ({reason})"));
-            continue;
-        }
-        match attempt(candidate) {
-            Ok(opened) => {
-                if index != 0 {
-                    let parent = candidate
-                        .parent()
-                        .unwrap_or_else(|| Path::new("/"))
-                        .display();
-                    let _ =
-                        crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
-                            "p11scope: warning: {}; using {parent} instead",
-                            skipped.join("; ")
-                        )));
-                }
-                return Ok(opened);
-            }
-            Err(error) => {
-                skipped.push(format!("{label} failed ({error})"));
-            }
-        }
-    }
-    Err(format!(
-        "no writable recovery parent: {}",
+/// Names every skipped chain root and its reason before naming the
+/// parent actually used. Shared by the whole-save and staging-fill
+/// chains so the operator line stays identical.
+fn warn_chain_fallback(skipped: &[String], used: &Path) {
+    let parent = used.parent().unwrap_or_else(|| Path::new("/")).display();
+    let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
+        "p11scope: warning: {}; using {parent} instead",
         skipped.join("; ")
-    ))
+    )));
 }
 
 /// Opens a recovery base's parent held (no symlink traversal), for
@@ -2260,32 +2212,39 @@ fn account_name(uid: u32) -> Option<String> {
 /// recovery dir: `p11scope-<yyyymmddThhmmssZ>-<pid>[.<seq>].<ext>`
 /// (the `-o` extension, `json` when absent) via
 /// `O_CREAT|O_EXCL|O_NOFOLLOW`, then `fsync` of the file and the dir.
-/// A partial file on write/sync failure is unlinked again. Returns the
-/// saved path.
+/// Each chain root is attempted whole (re-reading the temp from the
+/// start per attempt); a partial file on write/sync failure is
+/// unlinked before falling through. Returns the saved path.
 fn save_recovered_capture(
     temp_file: &std::fs::File,
     dest: &Path,
     base: &Path,
 ) -> Result<PathBuf, String> {
-    // An independent offset via a clone, so the temp's own offset is
-    // untouched for the operator when the temp is kept.
+    let chain = recovery_base_chain(base);
+    save_over_chain(&chain, &mut |candidate| {
+        save_capture_at(temp_file, dest, candidate)
+    })
+}
+
+/// The whole-save attempt of a finished capture at one exact chain
+/// root: re-reads the full document from the start, then saves it
+/// there. The clone is an owned, seekable handle for the shared temp
+/// ref (a dup shares the temp's offset, so each attempt re-seeks to
+/// 0 first); redone for every root attempted, so a fall-through
+/// never resumes a partial stream. Recovery only reads the temp —
+/// every kept-temp reader opens its path fresh.
+fn save_capture_at(
+    temp_file: &std::fs::File,
+    dest: &Path,
+    candidate: &Path,
+) -> Result<PathBuf, String> {
     let mut src = temp_file
         .try_clone()
         .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
     use std::io::{Seek as _, SeekFrom};
     src.seek(SeekFrom::Start(0))
         .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
-    save_recovered_stream(&mut src, dest, base)
-}
-
-/// Saves finished in-memory bytes to a new `0600` file in the recovery
-/// dir (same names, `O_EXCL` and `fsync` discipline as
-/// [`save_recovered_capture`]). After a failed `-o` write the temp
-/// holds at most a partial write, so the caller passes its complete
-/// document instead of the temp.
-fn save_recovered_bytes(bytes: &[u8], dest: &Path, base: &Path) -> Result<PathBuf, String> {
-    let mut src: &[u8] = bytes;
-    save_recovered_stream(&mut src, dest, base)
+    save_stream_at(&mut src, dest, candidate)
 }
 
 /// A streaming recovery file: created up front in the held recovery
@@ -2311,11 +2270,20 @@ pub(crate) struct RecoveryStaging {
 
 impl RecoveryStaging {
     /// Creates an empty private staging file for `dest` (whose
-    /// extension names the bounded suffix, `json` when absent) in the
-    /// recovery dir held for `base`. The file is `0600`, `O_EXCL`,
-    /// unique over 128 sequence retries.
-    pub(crate) fn create(dest: &Path, base: &Path) -> Result<Self, String> {
-        let (dir, actual) = open_recovered_dir_or_fallback(base)?;
+    /// extension names the bounded suffix, `json` when absent) in one
+    /// exact chain root: the root's held recovery dir, or the fresh
+    /// fallback sibling when the root is occupied. The file is `0600`,
+    /// `O_EXCL`, unique over 128 sequence retries. Chain walking
+    /// lives in the callers ([`save_over_chain`] and
+    /// [`create_staging_over_chain`]); each attempt holds its own dir.
+    fn create_exact(dest: &Path, candidate: &Path) -> Result<Self, String> {
+        let (dir, actual) = open_recovered_dir_or_sibling_fallback(candidate)?;
+        Self::create_in(dir, actual, dest)
+    }
+
+    /// Creates the `0600`, `O_EXCL` staging file in an already-held
+    /// recovery dir, unique over 128 sequence retries.
+    fn create_in(dir: std::fs::File, actual: PathBuf, dest: &Path) -> Result<Self, String> {
         // Bound the suffix to 32 chars: a valid 255-byte destination
         // basename can carry a 253-byte extension, which would push
         // the timestamped recovery name past `NAME_MAX` (`ENAMETOOLONG`).
@@ -2337,6 +2305,19 @@ impl RecoveryStaging {
                 format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
             };
             let c_name = CString::new(name.clone()).expect("generated recovery name has no NUL");
+            #[cfg(test)]
+            if seq == 0 {
+                // One-shot create fault, in the exact shape of a real
+                // `openat(O_CREAT)` failure (a full volume fails every
+                // sequence number the same way, starting here).
+                if let Some(errno) = TEST_STAGING_FAIL_NEXT_CREATE.with(|flag| flag.take()) {
+                    let error = std::io::Error::from_raw_os_error(errno);
+                    return Err(format!(
+                        "creating recovery file {name} in {} failed: {error}",
+                        actual.display()
+                    ));
+                }
+            }
             // SAFETY: the dir fd and the NUL-terminated name outlive the call;
             // the returned fd is owned below on success.
             let fd = unsafe {
@@ -2365,7 +2346,9 @@ impl RecoveryStaging {
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let path = actual.join(&name);
             #[cfg(test)]
-            let fail_write_with = TEST_STAGING_FAIL_WRITE.with(|flag| flag.get());
+            let fail_write_with = TEST_STAGING_FAIL_WRITE
+                .with(|flag| flag.get())
+                .or_else(|| TEST_STAGING_FAIL_NEXT_WRITE.with(|flag| flag.take()));
             return Ok(Self {
                 dir,
                 file,
@@ -2397,6 +2380,16 @@ impl RecoveryStaging {
             .to_str()
             .expect("generated recovery name is UTF-8")
             .to_string();
+        #[cfg(test)]
+        if let Some(errno) = TEST_STAGING_FAIL_NEXT_SYNC.with(|flag| flag.take()) {
+            let error = std::io::Error::from_raw_os_error(errno);
+            let _ = unlinkat(&self.dir, &self.name);
+            self.finished = true;
+            return Err(format!(
+                "syncing recovery file {name} in {} failed: {error}",
+                self.actual.display()
+            ));
+        }
         if let Err(error) = self.file.sync_all() {
             let _ = unlinkat(&self.dir, &self.name);
             self.finished = true;
@@ -2457,17 +2450,52 @@ impl Drop for RecoveryStaging {
     }
 }
 
-/// The shared recovery write: a new `0600` file in the held recovery
-/// dir (the base, or the fresh fallback sibling when the base is
-/// occupied), `O_EXCL`, then `fsync` of the file and the dir. A
-/// partial file on write/sync failure is unlinked again. Returns the
-/// saved path, under the dir actually held.
-fn save_recovered_stream(
+/// Saves through the production recovery chain: each root is
+/// attempted whole (open the dir with sibling fallback, create the
+/// file, write, fsync), and any step's failure falls through to the
+/// next root with a named reason instead of losing the capture. A
+/// partial file is unlinked before falling through. Single-root
+/// chains attempt their root directly, exactly as before.
+fn save_over_chain(
+    chain: &[(PathBuf, &'static str)],
+    attempt: &mut dyn FnMut(&Path) -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    if chain.len() == 1 {
+        return attempt(&chain[0].0);
+    }
+    let mut errors = Vec::new();
+    for (index, (candidate, label)) in chain.iter().enumerate() {
+        if let Some(reason) = recovery_parent_unusable(candidate) {
+            errors.push(format!("{label} unavailable ({reason})"));
+            continue;
+        }
+        match attempt(candidate) {
+            Ok(saved) => {
+                if index != 0 {
+                    warn_chain_fallback(&errors, candidate);
+                }
+                return Ok(saved);
+            }
+            Err(error) => errors.push(format!("{label} failed ({error})")),
+        }
+    }
+    Err(format!(
+        "no writable recovery destination: {}",
+        errors.join("; ")
+    ))
+}
+
+/// The whole-save attempt at one exact chain root: a new `0600` file
+/// in the held recovery dir (the root, or the fresh fallback sibling
+/// when it is occupied), `O_EXCL`, then `fsync` of the file and the
+/// dir. A partial file on write/sync failure is unlinked again.
+/// Returns the saved path, under the dir actually held.
+fn save_stream_at(
     reader: &mut dyn std::io::Read,
     dest: &Path,
-    base: &Path,
+    candidate: &Path,
 ) -> Result<PathBuf, String> {
-    let mut staging = RecoveryStaging::create(dest, base)?;
+    let mut staging = RecoveryStaging::create_exact(dest, candidate)?;
     let name = staging
         .path
         .file_name()
@@ -2483,6 +2511,88 @@ fn save_recovered_stream(
         ));
     }
     staging.finish()
+}
+
+/// Saves finished in-memory bytes to a new `0600` file in the recovery
+/// dir (same names, `O_EXCL` and `fsync` discipline as
+/// [`save_recovered_capture`]), retrying across the recovery chain:
+/// after a failed `-o` write the temp holds at most a partial write,
+/// so the caller passes its complete document, re-sliced for every
+/// root attempted, instead of the temp.
+fn save_recovered_bytes(bytes: &[u8], dest: &Path, base: &Path) -> Result<PathBuf, String> {
+    let chain = recovery_base_chain(base);
+    save_over_chain(&chain, &mut |candidate| {
+        let mut src: &[u8] = bytes;
+        save_stream_at(&mut src, dest, candidate)
+    })
+}
+
+/// Creates a staging on the first chain root that accepts the full
+/// fill (the streaming failover: a create plus a re-readable fill,
+/// such as the confirmed-prefix replay and the failing record), and
+/// falls through to the next root with a named reason when the
+/// create or the fill fails there instead of losing the export. A
+/// failed fill's partial staging is dropped (unlinked) before the
+/// next root is attempted. Cancellation stops the chain with `None`:
+/// the flag is checked before every root and after every failed
+/// fill, so a cancel observed mid-fill is reported as cancelled
+/// rather than retried (the flag is sticky once fired, so a
+/// cancellation can only arrive, never clear, between the fill's own
+/// checks and the walker's). Single-root chains create and fill
+/// their root directly, exactly as before.
+pub(crate) fn create_staging_over_chain(
+    chain: &[(PathBuf, &'static str)],
+    dest: &Path,
+    cancelled: &dyn Fn() -> bool,
+    fill: &mut dyn FnMut(&mut RecoveryStaging) -> Result<(), String>,
+) -> Result<Option<RecoveryStaging>, String> {
+    if chain.len() == 1 {
+        if cancelled() {
+            return Ok(None);
+        }
+        let mut staging = RecoveryStaging::create_exact(dest, &chain[0].0)?;
+        fill(&mut staging)?;
+        return Ok(Some(staging));
+    }
+    let mut errors = Vec::new();
+    for (index, (candidate, label)) in chain.iter().enumerate() {
+        if cancelled() {
+            return Ok(None);
+        }
+        if let Some(reason) = recovery_parent_unusable(candidate) {
+            errors.push(format!("{label} unavailable ({reason})"));
+            continue;
+        }
+        let mut staging = match RecoveryStaging::create_exact(dest, candidate) {
+            Ok(staging) => staging,
+            Err(error) => {
+                errors.push(format!("{label} failed ({error})"));
+                continue;
+            }
+        };
+        match fill(&mut staging) {
+            Ok(()) => {
+                if index != 0 {
+                    warn_chain_fallback(&errors, candidate);
+                }
+                return Ok(Some(staging));
+            }
+            Err(error) => {
+                // Drop (unlink) the partial staging before the next
+                // root: a failed fill must leave no fallback file
+                // behind on the root it abandons.
+                drop(staging);
+                if cancelled() {
+                    return Ok(None);
+                }
+                errors.push(format!("{label} failed ({error})"));
+            }
+        }
+    }
+    Err(format!(
+        "no writable recovery staging: {}",
+        errors.join("; ")
+    ))
 }
 
 /// Serializes tests that override the recovery directory: the override
@@ -2536,6 +2646,12 @@ thread_local! {
     static TEST_WRITE_BUDGET: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
     static TEST_STAGING_FAIL_WRITE: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_STAGING_FAIL_NEXT_WRITE: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_STAGING_FAIL_NEXT_SYNC: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_STAGING_FAIL_NEXT_CREATE: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -2591,6 +2707,74 @@ pub(crate) fn hold_staging_fail_write(errno: i32) -> StagingFailGuard {
 impl Drop for StagingFailGuard {
     fn drop(&mut self) {
         TEST_STAGING_FAIL_WRITE.with(|flag| flag.set(None));
+    }
+}
+
+/// Which one-shot staging fault a [`StagingFailNextGuard`] clears.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum StagingFailNextKind {
+    Write,
+    Sync,
+    Create,
+}
+
+/// Holds a one-shot staging write fault for one twin: the next
+/// recovery staging created on this thread fails its writes with
+/// `errno`, then the fault is consumed so a fall-through retry on
+/// another root writes normally. Clears on drop.
+#[cfg(test)]
+pub(crate) struct StagingFailNextGuard {
+    kind: StagingFailNextKind,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_staging_fail_next_write(errno: i32) -> StagingFailNextGuard {
+    TEST_STAGING_FAIL_NEXT_WRITE.with(|flag| flag.set(Some(errno)));
+    StagingFailNextGuard {
+        kind: StagingFailNextKind::Write,
+    }
+}
+
+/// Holds a one-shot staging sync fault for one twin: the next
+/// recovery staging finished on this thread fails its file sync
+/// with `errno`, then the fault is consumed so a fall-through retry
+/// on another root syncs normally. Clears on drop.
+#[cfg(test)]
+pub(crate) fn hold_staging_fail_next_sync(errno: i32) -> StagingFailNextGuard {
+    TEST_STAGING_FAIL_NEXT_SYNC.with(|flag| flag.set(Some(errno)));
+    StagingFailNextGuard {
+        kind: StagingFailNextKind::Sync,
+    }
+}
+
+/// Holds a one-shot staging create fault for one twin: the next
+/// recovery staging file creation on this thread fails with `errno`
+/// (as its `openat(O_CREAT)` would on a full volume), then the
+/// fault is consumed so a fall-through retry on another root
+/// creates normally. Clears on drop.
+#[cfg(test)]
+pub(crate) fn hold_staging_fail_next_create(errno: i32) -> StagingFailNextGuard {
+    TEST_STAGING_FAIL_NEXT_CREATE.with(|flag| flag.set(Some(errno)));
+    StagingFailNextGuard {
+        kind: StagingFailNextKind::Create,
+    }
+}
+
+#[cfg(test)]
+impl Drop for StagingFailNextGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            StagingFailNextKind::Write => {
+                TEST_STAGING_FAIL_NEXT_WRITE.with(|flag| flag.set(None));
+            }
+            StagingFailNextKind::Sync => {
+                TEST_STAGING_FAIL_NEXT_SYNC.with(|flag| flag.set(None));
+            }
+            StagingFailNextKind::Create => {
+                TEST_STAGING_FAIL_NEXT_CREATE.with(|flag| flag.set(None));
+            }
+        }
     }
 }
 
@@ -4993,10 +5177,10 @@ mod tests {
         );
     }
 
-    /// A failed base/sibling attempt on a writable parent (a full
-    /// recovery volume) falls through to the next chain root instead of
-    /// ending the chain: the first root is attempted, then the second
-    /// root's opened file is returned.
+    /// A failed whole-save attempt on a writable parent (a full
+    /// recovery volume) falls through to the next chain root instead
+    /// of ending the chain: the first root is attempted, then the
+    /// second root's saved path is returned.
     #[test]
     fn chain_advances_past_a_failed_root_with_a_named_reason() {
         let first = private_tempdir();
@@ -5008,16 +5192,15 @@ mod tests {
         let attempts = std::cell::RefCell::new(Vec::new());
         let sentinel = second.path().join("sentinel");
         std::fs::write(&sentinel, b"recovered").unwrap();
-        let opened = open_recovered_chain(&chain, |candidate| {
+        let mut attempt = |candidate: &Path| {
             attempts.borrow_mut().push(candidate.to_path_buf());
             if candidate.starts_with(first.path()) {
                 return Err("No space left on device (os error 28)".to_string());
             }
-            let file = std::fs::File::open(&sentinel).unwrap();
-            Ok((file, sentinel.clone()))
-        })
-        .expect("the second root succeeds");
-        assert_eq!(opened.1, sentinel);
+            Ok(sentinel.clone())
+        };
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root succeeds");
+        assert_eq!(saved, sentinel);
         assert_eq!(
             *attempts.borrow(),
             vec![chain[0].0.clone(), chain[1].0.clone()]
@@ -5034,20 +5217,349 @@ mod tests {
             (first.path().join("base"), "/var/tmp"),
             (second.path().join("base"), "$TMPDIR"),
         ];
-        let error = open_recovered_chain(&chain, |candidate| {
-            Err::<(std::fs::File, PathBuf), String>(format!(
-                "No space left on device ({})",
-                candidate.display()
-            ))
-        })
-        .unwrap_err();
+        let mut attempt = |candidate: &Path| {
+            Err::<PathBuf, String>(format!("No space left on device ({})", candidate.display()))
+        };
+        let error = save_over_chain(&chain, &mut attempt).unwrap_err();
         assert!(
-            error.starts_with("no writable recovery parent: "),
+            error.starts_with("no writable recovery destination: "),
             "{error}"
         );
         assert!(error.contains("/var/tmp failed ("), "{error}");
         assert!(error.contains("$TMPDIR failed ("), "{error}");
         assert!(error.contains("No space left on device"), "{error}");
+    }
+
+    /// hy4f #1, create step: the recovery dir opens fine on the
+    /// first root but the file creation fails there (ENOSPC on a
+    /// full volume, after a successful dir open — the exact case
+    /// the dir-only chain missed), and the save falls through to
+    /// the second root whole. Without fall-through the create error
+    /// ends the save.
+    #[test]
+    fn whole_save_create_failure_falls_through_to_the_next_root() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let _fault = hold_staging_fail_next_create(libc::ENOSPC);
+        let mut attempt = |candidate: &Path| {
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root saves");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert!(
+            chain[0].0.is_dir(),
+            "the first root's dir opened (only the file create failed)"
+        );
+        assert!(
+            std::fs::read_dir(&chain[0].0).unwrap().next().is_none(),
+            "the failed root keeps no partial file"
+        );
+    }
+
+    /// hy4f #1, write step: a write failure on the first root falls
+    /// through to the second with the real save (not a mock
+    /// attempt): the second root holds the complete document and the
+    /// first root keeps no partial file behind. Without fall-through
+    /// the write error ends the save.
+    #[test]
+    fn whole_save_write_failure_falls_through_to_the_next_root() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let _fault = hold_staging_fail_next_write(libc::ENOSPC);
+        let mut attempt = |candidate: &Path| {
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root saves");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert!(
+            std::fs::read_dir(&chain[0].0).unwrap().next().is_none(),
+            "the failed root keeps no partial file"
+        );
+    }
+
+    /// hy4f #1, sync step: a sync failure on the first root falls
+    /// through to the second: the second root holds the complete
+    /// document (rewritten whole, not resumed) and the first root
+    /// keeps no partial file behind. Without fall-through the sync
+    /// error ends the save.
+    #[test]
+    fn whole_save_sync_failure_falls_through_to_the_next_root() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let _fault = hold_staging_fail_next_sync(libc::EIO);
+        let mut attempt = |candidate: &Path| {
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root saves");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert!(
+            std::fs::read_dir(&chain[0].0).unwrap().next().is_none(),
+            "the failed root keeps no partial file"
+        );
+    }
+
+    /// hy4f #1, open step: a root under an absent parent is skipped
+    /// by the preflight (never attempted, its parent never created)
+    /// and the save lands on the second root whole.
+    #[test]
+    fn whole_save_skips_an_absent_parent_without_touching_it() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("absent/base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let mut attempt = |candidate: &Path| {
+            attempts.borrow_mut().push(candidate.to_path_buf());
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root saves");
+        assert_eq!(*attempts.borrow(), vec![chain[1].0.clone()]);
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert!(
+            !first.path().join("absent").exists(),
+            "the preflight creates nothing under the absent parent"
+        );
+    }
+
+    /// hy4f #1, capture re-read: a fall-through re-reads the finished
+    /// capture from the start for the next root (a fresh clone
+    /// re-seeked to 0 per attempt), so the second root holds the
+    /// full document. Resuming the first attempt's partial offset
+    /// instead would truncate the rescued file here.
+    #[test]
+    fn capture_retry_rereads_the_full_document_from_the_start() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"ok\":true}";
+        let dir = private_tempdir();
+        let temp_path = dir.path().join("capture.tmp");
+        std::fs::write(&temp_path, document).unwrap();
+        let temp = std::fs::File::open(&temp_path).unwrap();
+        let dest = Path::new("observed.json");
+        let _fault = hold_staging_fail_next_write(libc::ENOSPC);
+        let mut attempt = |candidate: &Path| save_capture_at(&temp, dest, candidate);
+        let saved = save_over_chain(&chain, &mut attempt).expect("the second root saves");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert_eq!(
+            std::fs::read(&temp_path).unwrap(),
+            document,
+            "recovery only reads the temp, like the operator's fresh open"
+        );
+    }
+
+    /// hy4f #1, every step exhausted: when the real save fails on
+    /// every root, the error names each root and its own reason, and
+    /// no root keeps a partial file behind.
+    #[test]
+    fn real_save_failure_on_every_root_names_each_root_and_leaves_no_partial() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let _fault = hold_staging_fail_write(libc::ENOSPC);
+        let mut attempt = |candidate: &Path| {
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let error = save_over_chain(&chain, &mut attempt).unwrap_err();
+        assert!(
+            error.starts_with("no writable recovery destination: "),
+            "{error}"
+        );
+        assert!(error.contains("/var/tmp failed ("), "{error}");
+        assert!(error.contains("$TMPDIR failed ("), "{error}");
+        assert!(error.contains("No space left on device"), "{error}");
+        for (root, _) in &chain {
+            assert!(
+                std::fs::read_dir(root).unwrap().next().is_none(),
+                "{} keeps no partial file",
+                root.display()
+            );
+        }
+    }
+
+    /// hy4f #1, streaming failover: a fill failure on the first root
+    /// falls through to the second with a real staging: the second
+    /// root's staging finishes into the complete document and the
+    /// first root keeps no partial file behind. Without
+    /// fall-through the export is lost with a staging error.
+    #[test]
+    fn staging_fill_failure_falls_through_to_the_next_root() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let document = b"{\"kind\":\"footer\"}\n";
+        let dest = Path::new("diagnostics.jsonl");
+        let _fault = hold_staging_fail_next_write(libc::ENOSPC);
+        let mut fill = |staging: &mut RecoveryStaging| {
+            std::io::Write::write_all(staging, document).map_err(|error| error.to_string())
+        };
+        let staging = create_staging_over_chain(&chain, dest, &|| false, &mut fill)
+            .expect("the second root fills")
+            .expect("not cancelled");
+        let saved = staging.finish().expect("the second root finishes");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+        assert!(
+            std::fs::read_dir(&chain[0].0).unwrap().next().is_none(),
+            "the failed root keeps no partial file"
+        );
+    }
+
+    /// hy4f #1, streaming create: a staging-create failure on the
+    /// first root falls through to the second before any fill runs
+    /// there: only the second root's fill runs, and its staging
+    /// finishes into the complete document.
+    #[test]
+    fn staging_create_failure_falls_through_before_any_fill() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let fills = std::cell::RefCell::new(0u32);
+        let document = b"{\"kind\":\"footer\"}\n";
+        let dest = Path::new("diagnostics.jsonl");
+        let _fault = hold_staging_fail_next_create(libc::ENOSPC);
+        let mut fill = |staging: &mut RecoveryStaging| {
+            *fills.borrow_mut() += 1;
+            std::io::Write::write_all(staging, document).map_err(|error| error.to_string())
+        };
+        let staging = create_staging_over_chain(&chain, dest, &|| false, &mut fill)
+            .expect("the second root fills")
+            .expect("not cancelled");
+        assert_eq!(*fills.borrow(), 1, "only the second root's fill runs");
+        let saved = staging.finish().expect("the second root finishes");
+        assert!(saved.starts_with(second.path()), "{saved:?}");
+        assert_eq!(std::fs::read(&saved).unwrap(), document);
+    }
+
+    /// The single-root fast path reports its root's raw error
+    /// exactly as before (no chain wrapping): deleting the fast
+    /// path wraps this line and goes red here. Substring twins
+    /// cannot pin this (wrapping preserves every substring), so
+    /// the equality is exact.
+    #[test]
+    fn single_root_save_reports_the_raw_error_unwrapped() {
+        let dir = private_tempdir();
+        let root = dir.path().join("absent/base");
+        let chain = vec![(root.clone(), "the recovery parent")];
+        let document = b"{\"ok\":true}";
+        let dest = Path::new("observed.json");
+        let mut attempt = |candidate: &Path| {
+            let mut src: &[u8] = document;
+            save_stream_at(&mut src, dest, candidate)
+        };
+        let error = save_over_chain(&chain, &mut attempt).unwrap_err();
+        let parent = root.parent().unwrap().display().to_string();
+        let cause = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+        let raw = format!("opening recovery parent {parent} failed: {cause}");
+        assert_eq!(
+            error,
+            format!("{raw}; recovery fallback also failed: {raw}")
+        );
+    }
+
+    /// The single-root staging path creates its root directly with
+    /// the raw error (no chain wrapping): deleting the fast path
+    /// wraps this line and goes red here. The fill never runs: a
+    /// create failure short-circuits before it.
+    #[test]
+    fn single_root_staging_reports_the_raw_error_unwrapped() {
+        let dir = private_tempdir();
+        let root = dir.path().join("absent/base");
+        let chain = vec![(root.clone(), "the recovery parent")];
+        let fills = std::cell::RefCell::new(0u32);
+        let dest = Path::new("diagnostics.jsonl");
+        let mut fill = |_: &mut RecoveryStaging| {
+            *fills.borrow_mut() += 1;
+            Ok::<(), String>(())
+        };
+        let error = match create_staging_over_chain(&chain, dest, &|| false, &mut fill) {
+            Err(error) => error,
+            Ok(_) => panic!("creation on an absent parent must fail"),
+        };
+        assert_eq!(*fills.borrow(), 0, "no fill runs when creation fails");
+        let parent = root.parent().unwrap().display().to_string();
+        let cause = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+        let raw = format!("opening recovery parent {parent} failed: {cause}");
+        assert_eq!(
+            error,
+            format!("{raw}; recovery fallback also failed: {raw}")
+        );
+    }
+
+    /// A cancelled staging chain stops before the first root: no
+    /// fill runs, no recovery dir is created anywhere, and the
+    /// caller reports cancellation rather than retrying.
+    #[test]
+    fn staging_chain_stops_before_the_first_root_when_cancelled() {
+        let first = private_tempdir();
+        let second = private_tempdir();
+        let chain = vec![
+            (first.path().join("base"), "/var/tmp"),
+            (second.path().join("base"), "$TMPDIR"),
+        ];
+        let fills = std::cell::RefCell::new(0u32);
+        let dest = Path::new("diagnostics.jsonl");
+        let mut fill = |_: &mut RecoveryStaging| {
+            *fills.borrow_mut() += 1;
+            Ok(())
+        };
+        let staging = create_staging_over_chain(&chain, dest, &|| true, &mut fill)
+            .expect("cancellation is not an error");
+        assert!(staging.is_none(), "cancelled, no staging kept");
+        assert_eq!(*fills.borrow(), 0, "no fill runs when cancelled");
+        for (root, _) in &chain {
+            assert!(
+                !root.exists(),
+                "nothing is created under {}",
+                root.display()
+            );
+        }
     }
 
     /// Item 4 twin: the parent preflight names an absent parent and an

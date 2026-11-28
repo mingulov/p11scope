@@ -87,7 +87,7 @@ impl DiagnosticsDestination {
         // it. The writer and `write_jsonl` share the cancellation
         // closure through the cell (never called reentrantly: record
         // writes and record-boundary polls strictly alternate).
-        let (export, primary_failed, primary_error, staging, creation_error, staging_error) = {
+        let (export, primary_failed, primary_error, staging, staging_error) = {
             let cancel: RefCell<&mut dyn FnMut() -> bool> = RefCell::new(&mut second_signal);
             let mut writer = LazyRecoveryWriter {
                 output: &mut self.output,
@@ -97,7 +97,6 @@ impl DiagnosticsDestination {
                 primary_failed: false,
                 primary_error: None,
                 staging: None,
-                creation_error: None,
                 staging_error: None,
                 cancel: &cancel,
             };
@@ -107,7 +106,6 @@ impl DiagnosticsDestination {
                 writer.primary_failed,
                 writer.primary_error,
                 writer.staging.take(),
-                writer.creation_error,
                 writer.staging_error,
             )
         };
@@ -128,9 +126,7 @@ impl DiagnosticsDestination {
                                 self.path.display()
                             ));
                         }
-                        let second = creation_error
-                            .or(staging_error)
-                            .unwrap_or_else(|| "unknown error".to_string());
+                        let second = staging_error.unwrap_or_else(|| "unknown error".to_string());
                         return Err(format!(
                             "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
                             self.path.display(),
@@ -181,9 +177,7 @@ impl DiagnosticsDestination {
                 // the buffered sites do. Cancellation and serialization
                 // stay distinct.
                 if primary_failed && matches!(error, ExportError::Io(_)) {
-                    let second = creation_error
-                        .or(staging_error)
-                        .unwrap_or_else(|| "unknown error".to_string());
+                    let second = staging_error.unwrap_or_else(|| "unknown error".to_string());
                     return Err(format!(
                         "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
                         self.path.display(),
@@ -254,8 +248,8 @@ impl DiagnosticsDestination {
 /// the failing record plus the tail there. The confirmed prefix is
 /// tracked before each attempted record, so a partial primary write
 /// cannot duplicate. Both sinks failed is an I/O error carrying the
-/// primary cause; the recovery cause travels in `creation_error` or
-/// `staging_error` for the delivery boundary to report both as lost.
+/// primary cause; the recovery cause travels in `staging_error` for
+/// the delivery boundary to report both as lost.
 struct LazyRecoveryWriter<'cell, 'signal> {
     output: &'cell mut AtomicFile,
     dest: PathBuf,
@@ -264,7 +258,6 @@ struct LazyRecoveryWriter<'cell, 'signal> {
     primary_failed: bool,
     primary_error: Option<String>,
     staging: Option<crate::output::RecoveryStaging>,
-    creation_error: Option<String>,
     staging_error: Option<String>,
     cancel: &'cell RefCell<&'signal mut dyn FnMut() -> bool>,
 }
@@ -278,59 +271,75 @@ enum ReplayOutcome {
 }
 
 impl LazyRecoveryWriter<'_, '_> {
-    /// Fails over to recovery after a primary write error: checks
-    /// cancellation, lazily opens the staging, replays the confirmed
-    /// prefix, and writes the failing record's bytes there. Returns
+    /// Fails over to recovery after a primary write error: creates
+    /// a staging across the recovery chain and fills it (confirmed
+    /// prefix replay plus the failing record's bytes), falling
+    /// through to the next root with a named reason when one root's
+    /// create or fill fails instead of losing the export. Returns
     /// the full length on success; on any failure records the cause
     /// and returns the primary error for the export to abort with.
+    /// Cancellation stops the chain with no staging kept.
     fn fail_over(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if (*self.cancel.borrow_mut())() {
-            return Err(self.primary_io_error());
-        }
-        match crate::output::RecoveryStaging::create(&self.dest, &self.base) {
-            Ok(staging) => {
+        let chain = crate::output::recovery_base_chain(&self.base);
+        // Copy the shared cancel-cell reference out: the cancelled
+        // closure borrows the caller's cell, not this writer, so the
+        // fill closure can borrow the writer mutably beside it.
+        let cancel = self.cancel;
+        let cancelled = || (*cancel.borrow_mut())();
+        // Failover runs at most once per export (after the first
+        // primary write error), so cloning the destination path for
+        // the fill closure's mutable borrow costs nothing.
+        let dest = self.dest.clone();
+        match crate::output::create_staging_over_chain(&chain, &dest, &cancelled, &mut |staging| {
+            self.fill_staging(staging, bytes)
+        }) {
+            Ok(Some(staging)) => {
                 self.staging = Some(staging);
+                Ok(bytes.len())
             }
+            Ok(None) => Err(self.primary_io_error()),
             Err(error) => {
-                self.creation_error = Some(error);
-                return Err(self.primary_io_error());
-            }
-        }
-        match self.replay_prefix() {
-            Ok(()) => {}
-            Err(ReplayOutcome::Cancelled) => {
-                return Err(self.primary_io_error());
-            }
-            Err(ReplayOutcome::Failed(error)) => {
+                // The create and fill causes share one channel (a
+                // single-root chain reports its raw cause exactly as
+                // before; a longer chain names every root it tried).
                 self.staging_error = Some(error);
-                self.staging = None;
-                return Err(self.primary_io_error());
-            }
-        }
-        let write_result = match self.staging.as_mut() {
-            Some(staging) => std::io::Write::write_all(staging, bytes),
-            None => unreachable!("a replayed staging accepts the failing record"),
-        };
-        match write_result {
-            Ok(()) => Ok(bytes.len()),
-            Err(error) => {
-                self.staging_error = Some(error.to_string());
-                self.staging = None;
                 Err(self.primary_io_error())
             }
         }
+    }
+
+    /// Fills one failover staging: replays the confirmed prefix from
+    /// the held readable primary FD, then writes the failing
+    /// record's bytes. Re-readable end to end (a fresh primary clone
+    /// per call, the record in hand), so the chain walker retries it
+    /// whole on the next root when this root fails.
+    fn fill_staging(
+        &mut self,
+        staging: &mut crate::output::RecoveryStaging,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match self.replay_prefix(staging) {
+            Ok(()) => {}
+            Err(ReplayOutcome::Cancelled) => {
+                // Discarded on the walker's cancelled path (the
+                // delivery boundary reports `cancelled`, not this
+                // string); honest if a non-sticky flag ever surfaces
+                // it as one root's reason among others.
+                return Err("cancellation observed during recovery fill".to_string());
+            }
+            Err(ReplayOutcome::Failed(error)) => return Err(error),
+        }
+        std::io::Write::write_all(staging, bytes).map_err(|error| error.to_string())
     }
 
     /// Replays the confirmed prefix from the held readable primary FD
     /// into the staging with fixed 8 KiB scratch, checking
     /// cancellation between chunks. The primary is abandoned after
     /// failover, so moving its shared offset is harmless.
-    fn replay_prefix(&mut self) -> Result<(), ReplayOutcome> {
-        let Some(staging) = self.staging.as_mut() else {
-            return Err(ReplayOutcome::Failed(
-                "recovery staging is gone".to_string(),
-            ));
-        };
+    fn replay_prefix(
+        &mut self,
+        staging: &mut crate::output::RecoveryStaging,
+    ) -> Result<(), ReplayOutcome> {
         let mut src = self.output.file().try_clone().map_err(|error| {
             ReplayOutcome::Failed(format!(
                 "reading confirmed prefix for recovery failed: {error}"
@@ -1350,5 +1359,156 @@ mod tests {
             "no partial fallback file remains on a double failure: {saved:?}"
         );
         assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure plus a failed recovery sync (EIO here)
+    /// reports both errors with `capture lost`: the staging was
+    /// completely written but its sync failed, so the export is lost
+    /// honestly and no unsynced file remains. This pins the residual
+    /// hy4f #1 step (streaming finish): unlike the failover fill,
+    /// the finished staging is not re-seedable onto another root.
+    #[test]
+    fn diagnostics_recovery_sync_failure_reports_capture_lost() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let _sync_fault = crate::output::hold_staging_fail_next_sync(libc::EIO);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let recovery = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+        assert!(
+            error.contains(&primary),
+            "the error carries the primary cause, got: {error}"
+        );
+        assert!(
+            error.contains(&recovery),
+            "the error carries the recovery cause, got: {error}"
+        );
+        assert!(
+            error.contains("also failed"),
+            "the error names the recovery failure, got: {error}"
+        );
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(
+            saved.is_empty(),
+            "no unsynced fallback file remains: {saved:?}"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A staging write after a successful failover aborts the export
+    /// with the primary cause and drops the staging (unlinked, no
+    /// retry): the tail records it held are lost with the honest
+    /// double-failure line. This pins the residual hy4f #1 step
+    /// (streaming tail): the tail lives only in the failed staging,
+    /// so no next root can be seeded from it. The empty first write
+    /// is the deterministic trigger: the primary still fails on it
+    /// (the fault fires regardless of length), the failover fill
+    /// writes nothing (no confirmed prefix, an empty record), and
+    /// the one-shot write fault survives for the tail write.
+    #[test]
+    fn staging_tail_failure_aborts_with_the_primary_cause() {
+        use std::io::Write as _;
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let _fault = crate::output::hold_staging_fail_next_write(libc::ENOSPC);
+        let mut no_cancel = || false;
+        let cancel: RefCell<&mut dyn FnMut() -> bool> = RefCell::new(&mut no_cancel);
+        let mut writer = LazyRecoveryWriter {
+            output: &mut destination.output,
+            dest: path.clone(),
+            base: recovered_base.clone(),
+            confirmed: 0,
+            primary_failed: false,
+            primary_error: None,
+            staging: None,
+            staging_error: None,
+            cancel: &cancel,
+        };
+        let written = writer
+            .write(b"")
+            .expect("the failover fill writes nothing and succeeds");
+        assert_eq!(written, 0, "an empty write reports zero bytes");
+        assert!(
+            writer.staging.is_some(),
+            "the failover keeps its staging for the tail"
+        );
+        let error = writer
+            .write(b"tail record")
+            .expect_err("the tail write fails on the armed fault");
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        assert!(
+            error.to_string().contains(&primary),
+            "the tail failure aborts with the primary cause, got: {error}"
+        );
+        assert!(
+            writer.staging.is_none(),
+            "the failed staging is dropped, not retried"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(
+            saved.is_empty(),
+            "no partial fallback file remains: {saved:?}"
+        );
+    }
+
+    /// Failover checks cancellation before creating any staging: a
+    /// pre-cancelled export reports the primary error with no
+    /// staging kept and no recovery dir created anywhere.
+    #[test]
+    fn failover_checks_cancellation_before_creating_any_staging() {
+        use std::io::Write as _;
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let mut cancelled = || true;
+        let cancel: RefCell<&mut dyn FnMut() -> bool> = RefCell::new(&mut cancelled);
+        let mut writer = LazyRecoveryWriter {
+            output: &mut destination.output,
+            dest: path.clone(),
+            base: recovered_base.clone(),
+            confirmed: 0,
+            primary_failed: false,
+            primary_error: None,
+            staging: None,
+            staging_error: None,
+            cancel: &cancel,
+        };
+        let error = writer
+            .write(b"record")
+            .expect_err("a cancelled failover reports the primary error");
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        assert!(error.to_string().contains(&primary), "got: {error}");
+        assert!(
+            writer.staging.is_none() && writer.staging_error.is_none(),
+            "cancelled, no staging kept and no recovery cause recorded"
+        );
+        assert!(
+            !recovered_base.exists(),
+            "no recovery dir is created when cancelled"
+        );
     }
 }

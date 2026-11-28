@@ -21199,6 +21199,65 @@ mod tests {
         );
     }
 
+    /// A divergent live claimant against a collapsed adoption never
+    /// joins: the single live group disagrees with the adopted
+    /// object, so the agreement check refuses what the group count
+    /// allows.
+    #[test]
+    fn exact_note_with_divergent_claimant_and_collapsed_adoption_resolves_to_nothing() {
+        use super::test_fixture::{
+            backing_file, mark_pre_copy_up, overlay, reback, split_prearm_pin,
+        };
+        let fd_key = overlay(41);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let e_id = pins.pinned().next().expect("the pin").id;
+        let mut twin = split_prearm_pin(fd_key, fd_key, "deadbeef", 1);
+        reback(&mut twin, &other);
+        mark_pre_copy_up(&mut twin);
+        assert!(pins.absorb(twin).is_empty());
+        pins.by_id
+            .get_mut(&e_id)
+            .expect("the adopted entry")
+            .collapsed = true;
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[e_id]),
+            None,
+            "a group divergent from the adoption never joins"
+        );
+    }
+
+    /// A same-file live co-owner never vetoes the adopted join: one
+    /// identity group agrees with the adoption, so the note folds
+    /// onto the adopted row.
+    #[test]
+    fn exact_note_with_same_file_live_co_owner_resolves_to_planned_owner() {
+        use super::test_fixture::{backing_file, overlay, reback, repath_single_pin};
+        let fd_key = overlay(41);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let e_id = pins.pinned().next().expect("the pin").id;
+        let mut twin = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut twin, &file);
+        repath_single_pin(&mut twin, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        let (_, entry) = twin.by_id.pop_first().expect("the twin entry");
+        let raw = entry.raw.clone();
+        let f_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(f_id, entry);
+        pins.raw_to_id.insert(raw, f_id);
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[e_id]),
+            Some(e_id),
+            "one identity group agreeing with the adoption joins"
+        );
+    }
+
     /// Same file restaged under a second spelling merges: the exact
     /// note joins the one adopted object, and no second owner exists
     /// to force ambiguity.

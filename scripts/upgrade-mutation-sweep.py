@@ -416,15 +416,23 @@ MUTATIONS = [
     {
         "site": "diff positive before caller occurrence",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": '    for side in ("before", "after"):',
-        "new": '    for side in ("after",):',
+        "old": """    for side in ("before", "after"):
+        evidence = _snapshot_evidence(document, side)
+        occurrences = evidence.get("caller_occurrences") if evidence is not None else None""",
+        "new": """    for side in ("after",):
+        evidence = _snapshot_evidence(document, side)
+        occurrences = evidence.get("caller_occurrences") if evidence is not None else None""",
         "killer": f"{VALIDATOR_TEST}.test_diff_positive_payload_rejects_hollow_caller_projections",
     },
     {
         "site": "diff positive after caller occurrence",
         "file": "scripts/upgrade_artifact_validation.py",
-        "old": '    for side in ("before", "after"):',
-        "new": '    for side in ("before",):',
+        "old": """    for side in ("before", "after"):
+        evidence = _snapshot_evidence(document, side)
+        occurrences = evidence.get("caller_occurrences") if evidence is not None else None""",
+        "new": """    for side in ("before",):
+        evidence = _snapshot_evidence(document, side)
+        occurrences = evidence.get("caller_occurrences") if evidence is not None else None""",
         "killer": f"{VALIDATOR_TEST}.test_diff_positive_payload_rejects_hollow_caller_projections",
     },
     {

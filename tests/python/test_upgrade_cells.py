@@ -52,6 +52,26 @@ def load_vocab_generator():
     return module
 
 
+def load_workload():
+    spec = importlib.util.spec_from_file_location(
+        "upgrade_softhsm_workload_under_test",
+        ROOT / "scripts/upgrade-softhsm-workload.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_sweep():
+    spec = importlib.util.spec_from_file_location(
+        "upgrade_mutation_sweep_under_test",
+        ROOT / "scripts/upgrade-mutation-sweep.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def artifact_pin(name):
     """Read one committed sha256 pin (single source: the manifest file)."""
     manifest = json.loads((ROOT / "scripts/upgrade-artifact-pins.json").read_text())
@@ -753,7 +773,10 @@ class UpgradeGate6Harness:
             "entries": {
                 "count": 0,
                 "coverage": {
-                    "counted": 0,
+                    # Coherent measured fold: the one folded edge was
+                    # counted (observed with zero entries), so the
+                    # positive flow exercises the measured path.
+                    "counted": 1,
                     "first_min_ns": None,
                     "lossy": 0,
                     "pid_exit": 0,
@@ -2487,6 +2510,55 @@ class UpgradeGate6PureTests(unittest.TestCase):
             {prefix}, {prefix, f"{prefix}.zzz_new"}, vocabs)
         self.assertEqual(delta["unexpected"], {f"{prefix}.zzz_new"})
 
+    def test_measured_child_entries_unknown_refuses(self):
+        doc = parity_doc(n_callers=3, child_entries=0)
+        for edge in doc["edges"]:
+            if edge["caller"] != "c0":
+                edge["entries"]["observation"] = "unknown (usage observation unavailable)"
+        total, measured = self.gate6.measured_child_entries(doc)
+        self.assertEqual(total, 0)
+        self.assertFalse(measured)
+
+    def test_measured_child_entries_observed_zero_passes(self):
+        doc = parity_doc(n_callers=3, child_entries=0)
+        for edge in doc["edges"]:
+            if edge["caller"] != "c0":
+                edge["entries"]["observation"] = "observed"
+        total, measured = self.gate6.measured_child_entries(doc)
+        self.assertEqual(total, 0)
+        self.assertTrue(measured)
+
+    def test_measured_child_entries_excludes_unknown(self):
+        doc = parity_doc(n_callers=3, child_entries=0)
+        edges = [e for e in doc["edges"] if e["caller"] != "c0"]
+        edges[0]["entries"].update({"observation": "observed", "count": 10})
+        edges[1]["entries"].update(
+            {"observation": "unknown (usage observation lossy)", "count": 99})
+        total, measured = self.gate6.measured_child_entries(doc)
+        self.assertEqual(total, 10)
+        self.assertTrue(measured)
+
+    def test_measured_child_entries_vacuous_without_children(self):
+        total, measured = self.gate6.measured_child_entries(
+            parity_doc(n_callers=1))
+        self.assertEqual((total, measured), (0, True))
+
+    def test_measured_child_entries_departed_measured(self):
+        doc = parity_doc(n_callers=1, folded_callers=2)
+        doc["modules"][0]["departed_use"]["entries"]["coverage"] = {
+            "counted": 2, "witnessed": 0, "watched_no_use": 0}
+        doc["modules"][0]["departed_use"]["entries"]["count"] = 7
+        total, measured = self.gate6.measured_child_entries(doc)
+        self.assertEqual((total, measured), (7, True))
+
+    def test_measured_child_entries_departed_unmeasured(self):
+        doc = parity_doc(n_callers=1, folded_callers=2)
+        doc["modules"][0]["departed_use"]["entries"]["coverage"] = {
+            "counted": 0, "witnessed": 0, "watched_no_use": 0}
+        doc["modules"][0]["departed_use"]["entries"]["count"] = 0
+        total, measured = self.gate6.measured_child_entries(doc)
+        self.assertEqual((total, measured), (0, False))
+
     def test_b1_vocabularies_match_across_eras(self):
         committed = json.loads(self.gate6.VOCABULARIES_MANIFEST.read_text())
         for prefix, labels in committed["v072"].items():
@@ -2495,6 +2567,9 @@ class UpgradeGate6PureTests(unittest.TestCase):
     def test_admission_parity_folded_counts_close(self):
         old = parity_doc(n_callers=11, child_entries=0)
         new = parity_doc(n_callers=2, child_entries=0, folded_callers=9)
+        for doc in (old, new):
+            for edge in doc["edges"]:
+                edge["entries"]["observation"] = "observed"
         ok, detail = self.gate6.admission_parity(old, new)
         self.assertTrue(ok, detail)
 
@@ -2509,16 +2584,42 @@ class UpgradeGate6PureTests(unittest.TestCase):
         old = parity_doc(n_callers=11, child_entries=10)
         new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
                          folded_entries=5)
+        for doc in (old, new):
+            for edge in doc["edges"]:
+                edge["entries"]["observation"] = "observed"
         ok, detail = self.gate6.admission_parity(old, new)
         self.assertFalse(ok)
-        self.assertIn("entries", detail)
+        self.assertIn("entry shortfall", detail)
 
     def test_admission_parity_entries_up_passes(self):
         old = parity_doc(n_callers=11, child_entries=0)
         new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
                          folded_entries=64)
+        for doc in (old, new):
+            for edge in doc["edges"]:
+                edge["entries"]["observation"] = "observed"
         ok, detail = self.gate6.admission_parity(old, new)
         self.assertTrue(ok, detail)
+
+    def test_admission_parity_unmeasured_oracle_refuses(self):
+        old = parity_doc(n_callers=11, child_entries=0)
+        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9)
+        ok, detail = self.gate6.admission_parity(old, new)
+        self.assertFalse(ok)
+        self.assertIn("entry oracle not measured", detail)
+
+    def test_b1_vocab_removed_unexercised_fails(self):
+        prefix = "modules[0].unbound_use.reasons"
+        removed = self.gate6.vocab_removed_labels(
+            {prefix: ["gone"]}, {prefix: []})
+        self.assertEqual(removed, {f"{prefix}.gone"})
+
+    def test_b1_vocab_removed_equal_passes(self):
+        prefix = "modules[0].unbound_use.reasons"
+        labels = ["a", "b"]
+        removed = self.gate6.vocab_removed_labels(
+            {prefix: labels}, {prefix: list(labels)})
+        self.assertEqual(removed, set())
 
     def test_b1_vocabularies_loader_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2727,6 +2828,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "diff_typed",
                 "diff_churn_lifecycle",
                 "b1_vocabularies",
+                "b1_vocab_removed",
                 "b1_no_removed",
                 "b1_all_present",
                 "b1_exact",
@@ -2755,6 +2857,23 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         del removed["callers"][0]["app_hint"]
         old_departed = self.harness.good_old_doc()
         old_departed["modules"][0]["departed_use"] = None
+        thin_admission_old = self.harness.good_old_doc()
+        template_caller = copy.deepcopy(thin_admission_old["callers"][0])
+        template_edge = copy.deepcopy(thin_admission_old["edges"][0])
+        for index in (1, 2):
+            caller = copy.deepcopy(template_caller)
+            caller["id"] = f"c{index}"
+            caller["pid"] = template_caller["pid"] + index
+            thin_admission_old["callers"].append(caller)
+            edge = copy.deepcopy(template_edge)
+            edge["caller"] = f"c{index}"
+            thin_admission_old["edges"].append(edge)
+        for edge in thin_admission_old["edges"]:
+            edge["entries"]["observation"] = "observed"
+            edge["entries"]["count"] = 0
+        thin_admission_new = self.harness.good_new_doc()
+        thin_admission_new["edges"][0]["entries"]["observation"] = "observed"
+        thin_admission_new["edges"][0]["entries"]["count"] = 0
 
         def then_missing(old, new):
             required = new["allOf"][0]["then"]["properties"]["evidence"]["required"]
@@ -2767,6 +2886,8 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             return old, new
 
         scenarios = [
+            ("admission_parity", {"old_doc": thin_admission_old,
+                                  "new_doc": thin_admission_new}),
             ("inputs_present", {"missing_old_binary": True}),
             ("reports_generated", {"generate_error": "injected generation failure"}),
             ("reports_generated", {"module_present": False}),
@@ -2798,6 +2919,18 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         for check_name, kwargs in scenarios:
             with self.subTest(check=check_name):
                 self.assert_gate_failure(check_name, **kwargs)
+
+    def test_run_gate_b1_vocab_removed_fires(self):
+        prefix = "modules[0].unbound_use.reasons"
+        vocabs = ({"v071": {prefix: ["gone"]}, "v072": {prefix: []}}, "")
+        with mock.patch.object(self.gate6, "load_reason_vocabularies",
+                               return_value=vocabs):
+            code, result = self.harness.execute()
+        self.assertEqual(code, 1)
+        self.assertIn("b1_vocab_removed", result["checks"])
+        self.assertIs(result["checks"]["b1_vocab_removed"]["pass"], False)
+        self.assertEqual(result["fail_reason"].split(":", 1)[0], "b1_vocab_removed")
+        self.assertIn("gone", result["fail_reason"])
 
     def test_diff_zero_failure_detail_uses_actual_schema(self):
         result = self.assert_gate_failure(
@@ -3032,6 +3165,64 @@ class UpgradeSchemaDeltaTests(unittest.TestCase):
             },
         )
         self.assertEqual(removed, set())
+
+
+class UpgradeWorkloadLoopTests(unittest.TestCase):
+    def test_child_repeats_digest_during_lifetime(self):
+        workload = load_workload()
+        inits = []
+
+        class FakeLib:
+            def C_GetSlotList(self, _present, slots, count):
+                import ctypes
+
+                if slots is None:
+                    ctypes.cast(count, ctypes.POINTER(ctypes.c_ulong)).contents.value = 1
+                else:
+                    slots[0] = 7
+                    ctypes.cast(count, ctypes.POINTER(ctypes.c_ulong)).contents.value = 1
+                return 0
+
+            def C_OpenSession(self, *args):
+                del args
+                return 0
+
+            def C_DigestInit(self, *args):
+                del args
+                inits.append(1)
+                return 0
+
+            def C_Digest(self, *args):
+                del args
+                return 0
+
+            def C_CloseSession(self, *args):
+                del args
+                return 0
+
+            def C_Finalize(self, *args):
+                del args
+                return 0
+
+        with (
+            mock.patch.object(workload, "prepare_token"),
+            mock.patch.object(workload, "open_provider", return_value=FakeLib()),
+            mock.patch("time.sleep"),
+        ):
+            self.assertEqual(workload.child("fake.so"), 0)
+        self.assertEqual(len(inits), workload.CHILD_DIGESTS)
+        self.assertGreaterEqual(workload.CHILD_DIGESTS, 2)
+
+
+class UpgradeSweepControlTests(unittest.TestCase):
+    def test_control_covers_pure_killers(self):
+        sweep = load_sweep()
+        self.assertIn("UpgradeGate6PureTests", sweep.CONTROL_TESTS)
+
+    def test_control_test_count_parses(self):
+        sweep = load_sweep()
+        self.assertEqual(sweep.control_tests_ran("Ran 36 tests in 1s\nOK\n"), 36)
+        self.assertEqual(sweep.control_tests_ran("nope"), 0)
 
 
 if __name__ == "__main__":

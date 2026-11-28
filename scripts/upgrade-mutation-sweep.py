@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -35,6 +36,64 @@ PROFILE_FLOW_KILLER = (
 CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_schema_violations"
 
 MUTATIONS = [
+    {
+        "site": "b1 vocab removal computation",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "                removed.add(f\"{prefix}.{label}\")",
+        "new": "                pass",
+        "killer": "UpgradeGate6PureTests.test_b1_vocab_removed_unexercised_fails",
+    },
+    {
+        "site": "b1 vocab removed wiring",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        len(removed_labels) == 0,",
+        "new": "        True,",
+        "killer": "UpgradeGate6ActivationTests.test_run_gate_b1_vocab_removed_fires",
+    },
+    {
+        "site": "admission parity wiring",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    parity_ok, parity_detail = admission_parity(old, new)",
+        "new": "    parity_ok, parity_detail = (True, \"\")",
+        "killer": "UpgradeGate6ActivationTests.test_run_gate_activation_negative_controls",
+    },
+    {
+        "site": "measured observed gate",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        if entries.get(\"observation\") == OBSERVED_LABEL:",
+        "new": "        if True:",
+        "killer": "UpgradeGate6PureTests.test_measured_child_entries_excludes_unknown",
+    },
+    {
+        "site": "measured departed coverage gate",
+        "file": "scripts/upgrade-gate6.py",
+        "old": """        if coverage.get("counted", 0) + coverage.get("witnessed", 0) + coverage.get(
+            "watched_no_use", 0
+        ) > 0:""",
+        "new": "        if True:",
+        "killer": "UpgradeGate6PureTests.test_measured_child_entries_departed_unmeasured",
+    },
+    {
+        "site": "measured vacuous rule",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    if not short_lived_rows and folded_caller_count(document) == 0:",
+        "new": "    if False:",
+        "killer": "UpgradeGate6PureTests.test_measured_child_entries_vacuous_without_children",
+    },
+    {
+        "site": "unmeasured oracle refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    if not old_measured or not new_measured:",
+        "new": "    if False:",
+        "killer": "UpgradeGate6PureTests.test_admission_parity_unmeasured_oracle_refuses",
+    },
+    {
+        "site": "workload child digest loop",
+        "file": "scripts/upgrade-softhsm-workload.py",
+        "old": "    for _ in range(count):",
+        "new": "    for _ in []:",
+        "killer": "UpgradeWorkloadLoopTests.test_child_repeats_digest_during_lifetime",
+    },
     {
         "site": "admission caller shortfall refusal",
         "file": "scripts/upgrade-gate6.py",
@@ -596,8 +655,16 @@ CONTROL_TESTS = [
     VALIDATOR_TEST,
     "UpgradeGate5SimulationTests",
     "UpgradeGate6ActivationTests",
+    "UpgradeGate6PureTests",
     "UpgradeJsonSchemaConformanceTests",
 ]
+
+
+def control_tests_ran(output: str) -> int:
+    """Parse the unittest "Ran N tests" count; 0 when absent (a zero-match
+    selector or crashed runner must never count as a green control)."""
+    match = re.search(r"^Ran (\d+) tests", output or "", re.MULTILINE)
+    return int(match.group(1)) if match else 0
 
 
 def copy_cell_tree(destination: Path) -> None:
@@ -654,6 +721,9 @@ def sweep(mutations: list[dict], timeout: int, keep: bool) -> dict:
         control_tree.mkdir()
         copy_cell_tree(control_tree)
         control = run_tests(control_tree, CONTROL_TESTS, timeout)
+        control_ran = control_tests_ran(control.stdout or "")
+        if control_ran < 1:
+            control.returncode = 1
         results = []
         for index, mutation in enumerate(mutations):
             tree = base / f"mutation-{index}"
@@ -692,6 +762,7 @@ def sweep(mutations: list[dict], timeout: int, keep: bool) -> dict:
         "control": {
             "selectors": CONTROL_TESTS,
             "returncode": control.returncode,
+            "tests_ran": control_ran,
             "output_tail": control.stdout[-3000:],
         },
         "mutations": results,

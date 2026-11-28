@@ -28,6 +28,7 @@ import time
 CHILD_COUNT = 10
 FIRST_CHILD_DELAY_S = 8.0
 CHILD_INTERVAL_S = 1.2
+CHILD_DIGESTS = 4
 
 CKF_SERIAL_SESSION = 1 << 1
 CKF_RW_SESSION = 1 << 2
@@ -118,20 +119,27 @@ def prepare_token() -> tempfile.TemporaryDirectory:
     return temporary
 
 
+def run_child_digests(library, count=CHILD_DIGESTS, interval=0.5) -> None:
+    """Digest repeatedly across the child lifetime so post-admission calls
+    are observed (a single process-start digest always races admission and
+    stays unmeasured)."""
+    for _ in range(count):
+        digest_once(library)
+        time.sleep(interval)
+
+
 def child(module: str) -> int:
     temporary = None
     if not os.environ.get("SOFTHSM2_CONF"):
         temporary = prepare_token()
     library = open_provider(module)
     try:
-        digest_once(library)
         # Stay mapped long enough for several capture passes to observe this
         # caller alive, then exit so the new binary folds it into departed_use
-        # while the old binary keeps it a live row. Two seconds: the slow-host
-        # admission regression (product lane v072-slow-host-admission) eats 2s
-        # children on fedora-sm1, and gate 6 stays red on it until that lane
-        # lands. Do not lengthen to mask it.
-        time.sleep(2.0)
+        # while the old binary keeps it a live row. Digests repeat during the
+        # lifetime so child usage is measured, not a single pre-admission call
+        # that can never be observed.
+        run_child_digests(library)
     finally:
         library.C_Finalize(None)
         if temporary is not None:

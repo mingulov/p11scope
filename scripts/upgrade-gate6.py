@@ -26,8 +26,12 @@ Typed checks (exit 0 only if all pass):
   2. New binary reads old via cbom (rc 0, CycloneDX JSON), via diff
      old-vs-old (rc 0 and typed zero changes) and old-vs-new (rc 0).
   3. B1: old has no departed_use key; new has every pinned B1 key; the
-     new-vs-old key delta is exactly the B1 set plus a pinned additive set
-     (all optional, all ignored by readers), with no removed keys.
+     new-vs-old STRUCTURAL key delta is exactly the B1 set plus a pinned
+     additive set (all optional, all ignored by readers), with no removed
+     keys. Reason-map leaves compare by vocabulary membership (derived
+     label sets per era), never by occurrence; dynamic reason leaves are
+     not compared. Admission parity (callers[] + folded + measured
+     entries) runs first so shape comparison never masks a shortfall.
   4. B2: v0.7.1 object-observations schemas v1-v5 (from tag v0.7.1) do not
      list live_joint_feed_absent in their reason enums; this tree's do;
      new cbom accepts a report carrying that reason and renders it through.
@@ -139,6 +143,21 @@ def load_reason_vocabularies(path=None):
             ):
                 return None, f"refused: reason vocabularies {era}.{prefix} not string list"
     return {"v071": data["v071"], "v072": data["v072"]}, ""
+
+
+def vocab_removed_labels(v071, v072) -> set:
+    """Reasons present in the v0.7.1 registry but absent from v0.7.2's.
+
+    Capture-independent: compares the mechanically derived vocabularies,
+    never per-capture occurrences. A removal fails whether or not any
+    capture exercised the reason. Returns flattened "map.label" paths.
+    """
+    removed = set()
+    for prefix, labels in v071.items():
+        for label in labels:
+            if label not in v072.get(prefix, ()):
+                removed.add(f"{prefix}.{label}")
+    return removed
 
 
 def split_reason_keys(keys):
@@ -389,9 +408,18 @@ def folded_caller_count(document: dict) -> int:
     return total
 
 
-def child_entry_total(document: dict) -> int:
-    """Entries attributed to short-lived callers: live edges except the
-    longest-lived caller (the workload's parent) plus folded entries."""
+OBSERVED_LABEL = "observed"
+
+
+def measured_child_entries(document: dict) -> tuple:
+    """Child-attributed entries backed by observation, plus validity.
+
+    Live short-lived edges count only with observation "observed"; the
+    departed aggregate counts when its coverage shows counted, witnessed
+    or watched content. Unknown/unreadable usage is never a measured
+    zero. Returns (total, measured); a report with no short-lived
+    content at all is vacuously measured.
+    """
     callers = document.get("callers", [])
     spans = {
         caller.get("id"): caller.get("last_seen_ns", 0) - caller.get("first_seen_ns", 0)
@@ -399,35 +427,56 @@ def child_entry_total(document: dict) -> int:
     }
     parent = max(spans, key=lambda cid: spans[cid]) if spans else None
     total = 0
+    measured = False
+    short_lived_rows = [caller for caller in callers if caller.get("id") != parent]
     for edge in document.get("edges", []):
-        if edge.get("caller") != parent:
-            total += ((edge.get("entries") or {}).get("count", 0))
+        if edge.get("caller") == parent:
+            continue
+        entries = edge.get("entries") or {}
+        if entries.get("observation") == OBSERVED_LABEL:
+            total += entries.get("count", 0)
+            measured = True
     for module in document.get("modules", []):
         departed = (module or {}).get("departed_use") or {}
-        total += ((departed.get("entries") or {}).get("count", 0))
-    return total
+        entries = departed.get("entries") or {}
+        coverage = entries.get("coverage") or {}
+        if coverage.get("counted", 0) + coverage.get("witnessed", 0) + coverage.get(
+            "watched_no_use", 0
+        ) > 0:
+            measured = True
+        total += entries.get("count", 0)
+    if not short_lived_rows and folded_caller_count(document) == 0:
+        return 0, True
+    return total, measured
 
 
 def admission_parity(old: dict, new: dict) -> tuple:
     """Fold-aware admission parity: every old caller is a new row or folded,
-    and attributed child entries did not drop.
+    and measured attributed child entries did not drop.
 
     v0.7.2 folds exited callers into departed_use by design, so the new
     caller ROW count legitimately trails the old one; what must close
     exactly is rows + folded (the churn workload spawns a fixed count).
     A caller in neither is a real shortfall and stays red, naming the
-    missing count. Returns (ok, detail).
+    missing count. Entry totals compare only when measured on both sides;
+    an unmeasured oracle refuses with a typed reason instead of passing
+    on zeros. Returns (ok, detail).
     """
     old_rows = len(old.get("callers", []))
     new_rows = len(new.get("callers", []))
     folded = folded_caller_count(new)
     shortfall = old_rows - (new_rows + folded)
-    old_entries = child_entry_total(old)
-    new_entries = child_entry_total(new)
+    old_entries, old_measured = measured_child_entries(old)
+    new_entries, new_measured = measured_child_entries(new)
     if shortfall > 0:
         return False, (
             f"caller shortfall: old={old_rows} rows={new_rows} "
             f"folded={folded} missing={shortfall}"
+        )
+    if not old_measured or not new_measured:
+        return False, (
+            f"entry oracle not measured: old_measured={old_measured} "
+            f"new_measured={new_measured}"
         )
     if new_entries < old_entries:
         return False, (
@@ -816,6 +865,15 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         not vocab_error,
         vocab_error
         or f"v071/v072 cover {len(REASON_MAP_PREFIXES)} reason maps",
+    )
+    removed_labels = vocab_removed_labels(
+        vocabularies["v071"], vocabularies["v072"]
+    )
+    check(
+        result,
+        "b1_vocab_removed",
+        len(removed_labels) == 0,
+        f"removed_reasons={sorted(removed_labels)}",
     )
     old_keys = set(flatten_keys(old))
     new_keys = set(flatten_keys(new))

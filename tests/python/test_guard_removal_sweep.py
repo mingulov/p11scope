@@ -28,6 +28,9 @@ Usage:
   python3 -I tests/python/test_guard_removal_sweep.py [-v] [--workers N]
   python3 -I tests/python/test_guard_removal_sweep.py --list
   python3 -I tests/python/test_guard_removal_sweep.py --guard INDEX [--suite ...]
+
+Bare or -v runs the unittest wrapper below (the sweep as one typed
+test); explicit sweep flags keep the direct CLI.
 """
 
 import argparse
@@ -38,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -428,5 +432,17 @@ def main(argv):
     return 1 if bad else 0
 
 
+class GuardRemovalSweepTests(unittest.TestCase):
+    def test_all_guards_killed(self):
+        self.assertEqual(main([]), 0)
+
+
+# Sweep flags keep the direct CLI; anything else (bare, -v, unittest
+# selectors) runs the unittest wrapper so the typed runner records the
+# sweep as one test with terminal records.
+_CLI_FLAGS = ("--workers", "--guard", "--suite", "--list", "--verbose")
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    if any(arg.split("=")[0] in _CLI_FLAGS for arg in sys.argv[1:]):
+        sys.exit(main(sys.argv[1:]))
+    unittest.main()

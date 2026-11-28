@@ -24960,9 +24960,9 @@ impl Engine {
             .map(|max| max.saturating_add(1))
             .unwrap_or(0);
         for (key, note) in &self.learned_notes {
-            if planned.contains(key) {
-                continue;
-            }
+            // A row already carrying this file's note ends the matter
+            // (its note came from this same map); this also covers a
+            // stale rendering the id-based fold below would miss.
             if self.discovery.modules.iter().any(|module| {
                 module.dev == (key.device.major, key.device.minor)
                     && module.ino == key.inode
@@ -24970,17 +24970,23 @@ impl Engine {
             }) {
                 continue;
             }
-            // Same-file fold across the proved overlay split, resolved
-            // before any pin lookup: the note names a planned object
-            // the exact key joins miss (fd-domain note key vs
+            // An adopted key joins its planned owner: a duplicate note
+            // staged after the final projection still folds onto the
+            // adopted row (forward-only, via the fold below) instead of
+            // vanishing in a planned-key skip. A split key resolves
+            // across the proved overlay split: the note names a planned
+            // object the exact key joins miss (fd-domain note key vs
             // maps-domain plan key, possibly surviving only as a
-            // retained alias after a merge or re-key), so it folds onto
-            // that row — forward-only, never clobbering an attached
-            // note — instead of publishing a ghost row for the same
-            // file. A planned-but-unprojected target still publishes:
-            // the file is otherwise unnamed, so the record is
-            // representation, not duplication.
-            if let Some(target) = self.pinned.resolve_split_note_target(*key, &planned_ids) {
+            // retained alias after a merge or re-key). An unresolvable
+            // note of either shape falls through to the representation
+            // below; a planned-but-unprojected target still publishes
+            // there, since the file is otherwise unnamed.
+            let target = if planned.contains(key) {
+                self.pinned.resolve_exact_note_target(*key, &planned_ids)
+            } else {
+                self.pinned.resolve_split_note_target(*key, &planned_ids)
+            };
+            if let Some(target) = target {
                 let mut folded = false;
                 if let Some(module) = self
                     .plan

@@ -4570,70 +4570,78 @@ impl PinnedObjects {
         owners
     }
 
+    /// Live owners of a learned-note key partitioned by complete
+    /// opened-file identity: one group per distinct file filing the
+    /// key. Same-file pins under two path spellings share a group;
+    /// divergent twins never do. Greedy and deterministic (owners are
+    /// visited in id order against each group's first member);
+    /// groups are never empty.
+    fn note_owner_groups(&self, key: ObjectKey) -> Vec<BTreeSet<PinnedObjectId>> {
+        let mut groups: Vec<BTreeSet<PinnedObjectId>> = Vec::new();
+        for owner in self.live_note_owners(key) {
+            let mut placed = false;
+            for group in groups.iter_mut() {
+                let member = group.iter().next().expect("groups never empty");
+                if self.exactly_matches(owner, self, *member) {
+                    group.insert(owner);
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                groups.push(BTreeSet::from([owner]));
+            }
+        }
+        groups
+    }
+
     /// Display identity backing an unjoined learned-note key: the one
-    /// live pin filing it (shown with its digest), or the structured
-    /// reason the row carries no file details. A poisoned key is
-    /// ambiguous (its rejection proved same-key divergence). Callers
-    /// publish in every arm; a note never vanishes for lack of a pin.
+    /// live identity filing it (shown with its digest), or the
+    /// structured reason the row carries no file details. A poisoned
+    /// key is ambiguous (its rejection proved same-key divergence),
+    /// and so is a key two identities file. Same-file pins under two
+    /// spellings are one identity and render the canonical spelling's
+    /// details. Callers publish in every arm; a note never vanishes
+    /// for lack of a pin.
     pub(crate) fn note_representation(&self, key: ObjectKey) -> NoteRepresentation<'_> {
         if self.rejected_keys.contains(&key) {
             return NoteRepresentation::Ambiguous;
         }
-        let owners = self.live_note_owners(key);
-        let mut owners = owners.into_iter();
-        let Some(first) = owners.next() else {
-            return NoteRepresentation::Unpinned;
-        };
-        if owners.next().is_some() {
-            return NoteRepresentation::Ambiguous;
+        let groups = self.note_owner_groups(key);
+        if groups.len() != 1 {
+            return if groups.is_empty() {
+                NoteRepresentation::Unpinned
+            } else {
+                NoteRepresentation::Ambiguous
+            };
         }
-        match self.summary(first) {
+        let group = &groups[0];
+        let canonical = group.iter().find(|id| {
+            self.by_id
+                .get(*id)
+                .is_some_and(|entry| entry.raw.key == key)
+        });
+        let representative = canonical.or_else(|| group.iter().next()).copied();
+        match representative.and_then(|id| self.summary(id)) {
             Some(pin) => NoteRepresentation::Detailed(pin),
             None => NoteRepresentation::Unpinned,
         }
     }
 
-    /// Resolve a learned-note key to the planned same-file object
-    /// across a pre-6.8 overlay split, so the note folds onto the live
-    /// row instead of publishing a ghost `prearm`-only row for the same
-    /// file. The join follows merges and re-keys through the identity
-    /// owner: every raw filing the note key routes — canonical fd pins
-    /// and retained aliases (absorb re-keys, split refiles) alike —
-    /// never canonical-key equality alone. A uniquely-owned planned
-    /// alias folds directly (the merge or refile already proved the
-    /// alias names this object); otherwise the join crosses the split
-    /// only on proof, mirroring
-    /// [`refile_split_prearm_alias`](Self::refile_split_prearm_alias):
-    /// a pin filed under the note key carries the pin-time
-    /// self-mapping proof (`Entry::probed_maps_key`) naming the maps
-    /// key, and the one planned object answering that maps key
+    /// Proof vote for one live owner: the pin-time self-mapping proof
+    /// (`Entry::probed_maps_key`) names the maps key, and the one
+    /// planned object answering that maps key
     /// ([`object_matches_key`](Self::object_matches_key), a selector)
-    /// is the same complete opened-file identity
-    /// ([`exactly_matches`](Self::exactly_matches), the authority).
-    /// Anything else fails closed to `None` and the note keeps its
-    /// own terminal record: a poisoned note key, several live owners,
-    /// an unproven or collapsed pin, a collapsed target (never across
-    /// a heuristic collapse, never by key equality alone — inode
-    /// numbers repeat across btrfs subvolumes and overlay layers),
-    /// and genuinely distinct files.
-    pub(crate) fn resolve_split_note_target(
+    /// with the same complete opened-file identity
+    /// ([`exactly_matches`](Self::exactly_matches), the authority)
+    /// takes the note. Mirrors
+    /// [`refile_split_prearm_alias`](Self::refile_split_prearm_alias).
+    fn split_proof_target(
         &self,
-        learned_key: ObjectKey,
+        owner: PinnedObjectId,
         planned: &[PinnedObjectId],
     ) -> Option<PinnedObjectId> {
-        if self.rejected_keys.contains(&learned_key) {
-            return None;
-        }
-        let owners = self.live_note_owners(learned_key);
-        let mut owners = owners.into_iter();
-        let owner = owners.next()?;
-        if owners.next().is_some() {
-            return None;
-        }
-        let entry = &self.by_id[&owner];
-        if planned.contains(&owner) && entry.raw.key != learned_key {
-            return Some(owner);
-        }
+        let entry = self.by_id.get(&owner)?;
         let probed = entry.probed_maps_key?;
         let mut targets = BTreeSet::new();
         for target in planned {
@@ -4662,16 +4670,100 @@ impl PinnedObjects {
         None
     }
 
+    /// Resolve a learned-note key to the planned same-file object
+    /// across a pre-6.8 overlay split, so the note folds onto the live
+    /// row instead of publishing a ghost `prearm`-only row for the same
+    /// file. The join follows merges and re-keys through the identity
+    /// owner: every raw filing the note key routes — canonical fd pins
+    /// and retained aliases (absorb re-keys, split refiles) alike —
+    /// never canonical-key equality alone. Owners are counted by
+    /// identity, not by raw: one identity group votes its join, while
+    /// two identities refuse. Each member votes — a planned alias
+    /// votes its adoption, a canonical pin its proof — and the note
+    /// joins iff every vote names the same planned object; members
+    /// that can vote neither way abstain. A planned alias votes
+    /// without re-proving because every retained alias is proof-backed
+    /// at creation: absorb re-keys only on same-file proof and
+    /// [`refile_split_prearm_alias`](Self::refile_split_prearm_alias)
+    /// refiles only on the pin-time self-mapping proof, while a
+    /// divergent same-key pin either pair-files (second group, refused
+    /// above), is refused without filing (no note stages), or poisons
+    /// the key (rejected gate below) — so a voting alias never names a
+    /// second live file. Anything else fails closed to `None` and the
+    /// note keeps its own terminal record: a poisoned note key,
+    /// several live identities, an unproven or collapsed pin, a
+    /// collapsed target (never across a heuristic collapse, never by
+    /// key equality alone — inode numbers repeat across btrfs
+    /// subvolumes and overlay layers), and genuinely distinct files.
+    pub(crate) fn resolve_split_note_target(
+        &self,
+        learned_key: ObjectKey,
+        planned: &[PinnedObjectId],
+    ) -> Option<PinnedObjectId> {
+        if self.rejected_keys.contains(&learned_key) {
+            return None;
+        }
+        let groups = self.note_owner_groups(learned_key);
+        if groups.len() != 1 {
+            return None;
+        }
+        let mut votes = BTreeSet::new();
+        for owner in &groups[0] {
+            let entry = &self.by_id[owner];
+            if planned.contains(owner) && entry.raw.key != learned_key {
+                votes.insert(*owner);
+            } else if let Some(target) = self.split_proof_target(*owner, planned) {
+                votes.insert(target);
+            }
+        }
+        if votes.len() == 1 {
+            return votes.into_iter().next();
+        }
+        None
+    }
+
     /// Resolve an exact-key learned note to its adopted owner: the
     /// unique planned object filed canonically under the note key,
-    /// vetoed by contradiction. RED STUB (test commit): always
-    /// refuses; the implementation commit fills the query.
+    /// vetoed by contradiction. A duplicate note staged after the
+    /// final projection still joins its adopted row; zero live
+    /// claimants join uncontradicted (nothing disputes the adoption),
+    /// while a rejected key, a dual adoption, several live identities,
+    /// or a live group disagreeing with the adopted object all refuse
+    /// — the note then publishes its own gapped record instead.
     pub(crate) fn resolve_exact_note_target(
         &self,
-        _learned_key: ObjectKey,
-        _planned: &[PinnedObjectId],
+        learned_key: ObjectKey,
+        planned: &[PinnedObjectId],
     ) -> Option<PinnedObjectId> {
-        None
+        if self.rejected_keys.contains(&learned_key) {
+            return None;
+        }
+        let mut adopted = None;
+        for target in planned {
+            let Some(entry) = self.by_id.get(target) else {
+                continue;
+            };
+            if entry.raw.key != learned_key {
+                continue;
+            }
+            if adopted.is_some() {
+                return None;
+            }
+            adopted = Some(*target);
+        }
+        let adopted = adopted?;
+        let groups = self.note_owner_groups(learned_key);
+        if groups.len() > 1 {
+            return None;
+        }
+        if let Some(group) = groups.first() {
+            for member in group {
+                if !self.exactly_matches(*member, self, adopted) {
+                    return None;
+                }
+            }
+        }
+        Some(adopted)
     }
 
     /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed

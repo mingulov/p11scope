@@ -1351,4 +1351,80 @@ mod tests {
         );
         assert_no_temporary_files(directory.path());
     }
+
+    /// Oracle for the recovery-saved ownership note, recomputed from
+    /// the OS account database: root keeps the root-only note,
+    /// anyone else names their login name, or uid without a passwd
+    /// entry. Mirrors the `output` contract, which stays private.
+    fn expected_saved_note() -> String {
+        let euid = unsafe { libc::geteuid() } as u32;
+        if euid == 0 {
+            return "(root-only, mode 0600)".to_string();
+        }
+        match test_account_name(euid) {
+            Some(name) => format!("(mode 0600, readable only by {name})"),
+            None => format!("(mode 0600, readable only by uid {euid})"),
+        }
+    }
+
+    /// The login name for `uid`, if the account database knows one.
+    fn test_account_name(uid: u32) -> Option<String> {
+        let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0u8; 16 * 1024];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 || result.is_null() || account.pw_name.is_null() {
+            return None;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(account.pw_name) };
+        Some(name.to_string_lossy().into_owned())
+    }
+
+    /// The recovery-saved message prints the `writing ... failed`
+    /// prefix once: the helper already names the `-o` path, so the
+    /// caller passes the bare primary cause, not a second wrapped
+    /// prefix carrying the same path again. Exact text: the whole
+    /// message, with the ownership note recomputed from the OS.
+    #[test]
+    fn diagnostics_write_failure_recovery_message_prints_the_prefix_once() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let final_path = destination.output.path().to_path_buf();
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+        let expected = format!(
+            "writing {} failed: {}; capture saved to {} {}",
+            final_path.display(),
+            primary,
+            saved[0].display(),
+            expected_saved_note()
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
 }

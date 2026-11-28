@@ -4937,6 +4937,81 @@ mod tests {
         );
     }
 
+    /// A streaming double failure (the `-o` write failed, then the
+    /// recovery staging's finish failed) names the recovery dir
+    /// actually attempted: the staging fell back to a fresh sibling
+    /// when its base was refused, so the recomputed base is the
+    /// unusable path, not the failed save. Exact text: the whole
+    /// message, with the staging dir in the `saving to` slot.
+    #[test]
+    fn streaming_double_failure_names_the_staging_dir_not_the_recomputed_base() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        // The helper recomputes this base; the staging below is
+        // created for another (refused) base, so the two differ and
+        // the message must name the staging's dir.
+        let other_base = dir.path().join("other-recovered");
+        let _override = hold_recovered_override(&other_base);
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut staging = RecoveryStaging::create(&path, &refused).unwrap();
+        let actual = staging.actual().to_path_buf();
+        assert_ne!(
+            actual, other_base,
+            "the staging dir must differ from the recomputed base"
+        );
+        assert!(
+            actual.starts_with(plant.path()),
+            "the fallback sibling stays in the test dir: {actual:?}"
+        );
+        let name = staging
+            .path
+            .file_name()
+            .expect("a staging has a file name")
+            .to_string_lossy()
+            .into_owned();
+        // A deterministic finish failure: an O_PATH handle, whose
+        // fsync fails EBADF. Proved before the call, so the
+        // double-failure below cannot be vacuous.
+        let probe = CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let probe_fd = unsafe { libc::open(probe.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(probe_fd >= 0, "an O_PATH probe must open");
+        staging.file = unsafe { std::fs::File::from_raw_fd(probe_fd) };
+        assert_eq!(
+            staging.file.sync_all().unwrap_err().raw_os_error(),
+            Some(libc::EBADF),
+            "the O_PATH swap must fail the staging sync with EBADF"
+        );
+        let sink = AtomicFile::create(&path).unwrap();
+        let write_error = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let failure = sink.fail_streaming_write_with_recovery(staging, write_error.clone());
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        assert!(
+            failure.saved_to_recovery().is_none(),
+            "a double failure saves nothing"
+        );
+        let attempted = std::io::Error::from_raw_os_error(libc::EBADF).to_string();
+        let second = format!(
+            "syncing recovery file {name} in {} failed: {attempted}",
+            actual.display()
+        );
+        let expected = format!(
+            "writing {} failed: {write_error}; saving to {} also failed: {second}; capture lost",
+            path.display(),
+            actual.display()
+        );
+        assert_eq!(failure.into_message(), expected);
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
     /// The production recovery dir carries the caller's uid, so one
     /// user's fallback never blocks another's: root and unprivileged
     /// callers recover into different directories.

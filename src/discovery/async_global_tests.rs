@@ -2844,13 +2844,9 @@ fn remap_provider(
     engine: &mut Engine,
     session: &mut ScriptedSession,
     reattach: bool,
-) -> std::process::Child {
-    let child = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let view = ProcessView::open(ProcessViewId(5), child.id()).unwrap();
+) -> ParkedSleep {
+    let child = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let view = ProcessView::open(ProcessViewId(5), child.pid()).unwrap();
     let modules = child_provider_modules(&view);
     engine.next_view_id = engine.next_view_id.max(6);
     engine.views.push(view);
@@ -2917,7 +2913,7 @@ fn system_proven_exit_with_zero_mappers_opens_no_coverage_window() {
 #[test]
 fn system_mapper_seen_after_zero_mapper_retire_discloses_until_reattach() {
     let (mut engine, mut session, _modules, retired) = system_zero_mapper_exit();
-    let mut child = remap_provider(&mut engine, &mut session, true);
+    let child = remap_provider(&mut engine, &mut session, true);
     let windows = engine.coverage_retire_windows();
     assert_eq!(
         windows.len(),
@@ -2936,8 +2932,7 @@ fn system_mapper_seen_after_zero_mapper_retire_discloses_until_reattach() {
     for module in &retired {
         assert_eq!(record_retire_windows(&engine, *module).len(), 1);
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// F1 twin (b), no re-attach yet: the mapper is seen but its cover has
@@ -2946,7 +2941,7 @@ fn system_mapper_seen_after_zero_mapper_retire_discloses_until_reattach() {
 #[test]
 fn system_mapper_seen_without_reattach_keeps_the_window_open() {
     let (mut engine, mut session, _modules, retired) = system_zero_mapper_exit();
-    let mut child = remap_provider(&mut engine, &mut session, false);
+    let child = remap_provider(&mut engine, &mut session, false);
     let windows = engine.coverage_retire_windows();
     assert_eq!(windows.len(), retired.len());
     assert!(
@@ -2990,8 +2985,7 @@ fn system_mapper_seen_without_reattach_keeps_the_window_open() {
         1,
         "the endpoint counts once"
     );
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Promotion counts only live mappers: while a pending retire still
@@ -3318,12 +3312,8 @@ fn system_pending_zero_mapper_retire_parks_without_a_window() {
 fn shared_object_with_an_unproven_retiring_mapper_keeps_the_lossy_window() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
-    let mut second = std::process::Command::new("sleep")
-        .arg("30")
-        .die_with_parent()
-        .spawn()
-        .unwrap();
-    let view = ProcessView::open(ProcessViewId(5), second.id()).unwrap();
+    let second = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let view = ProcessView::open(ProcessViewId(5), second.pid()).unwrap();
     let modules2 = child_provider_modules(&view);
     engine.next_view_id = engine.next_view_id.max(6);
     engine.views.push(view);
@@ -3364,8 +3354,7 @@ fn shared_object_with_an_unproven_retiring_mapper_keeps_the_lossy_window() {
     );
     assert!(engine.coverage_retire_parked().is_empty());
     assert!(retire_skip_filed(&engine));
-    second.kill().unwrap();
-    second.wait().unwrap();
+    second.close();
 }
 
 /// A reallocated view id names a new generation: an earlier exit proof
@@ -3563,17 +3552,16 @@ fn b1_softhsm_path() -> std::path::PathBuf {
 /// A long-lived holder mapping the real SoftHSM provider (no calls,
 /// just the mapping): `python3 -c` loads it with ctypes, then sleeps.
 /// Returns the child once `libsofthsm2.so` is visible in its maps.
-fn b1_softhsm_holder() -> std::process::Child {
-    let mut child = std::process::Command::new("python3")
-        .args([
-            "-c",
-            "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); time.sleep(30)",
-        ])
-        .arg(b1_softhsm_path())
-        .die_with_parent()
-        .spawn()
-        .expect("spawn the SoftHSM holder");
-    let pid = child.id();
+fn b1_softhsm_holder() -> ParkedSleep {
+    let mut child = ParkedSleep::spawn_unparked(
+        std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); time.sleep(600)",
+            ])
+            .arg(b1_softhsm_path()),
+    );
+    let pid = child.pid();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let maps =
@@ -3586,7 +3574,11 @@ fn b1_softhsm_holder() -> std::process::Child {
             "the holder never mapped SoftHSM"
         );
         assert!(
-            child.try_wait().expect("poll the holder").is_none(),
+            child
+                .inner_mut()
+                .try_wait()
+                .expect("poll the holder")
+                .is_none(),
             "the holder exited before mapping SoftHSM"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3602,7 +3594,7 @@ fn cgroup_refresh_admit_first() -> (
     ScriptedSession,
     tempfile::TempDir,
     std::collections::BTreeSet<crate::plan::ModuleId>,
-    std::process::Child,
+    ParkedSleep,
     usize,
 ) {
     let mut engine = Engine::empty();
@@ -3612,11 +3604,11 @@ fn cgroup_refresh_admit_first() -> (
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::with_records([], 0);
     let first = b1_softhsm_holder();
-    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", first.id()))
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", first.pid()))
         .expect("a cgroup.procs");
     cgroup_refresh_until_cover(&mut engine, &mut session);
     assert!(
-        engine.views.iter().any(|view| view.pid() == first.id()),
+        engine.views.iter().any(|view| view.pid() == first.pid()),
         "premise: tick 0 admitted the first holder"
     );
     let attached: Vec<u32> = engine
@@ -3652,10 +3644,9 @@ fn cgroup_refresh_park() -> (
     std::collections::BTreeSet<crate::plan::ModuleId>,
     usize,
 ) {
-    let (mut engine, mut session, dir, retired, mut first, endpoints) =
+    let (mut engine, mut session, dir, retired, first, endpoints) =
         cgroup_refresh_admit_first();
-    first.kill().unwrap();
-    first.wait().unwrap();
+    first.close();
     std::fs::write(dir.path().join("cgroup.procs"), String::new()).expect("a cgroup.procs");
     refresh_inventory_with(&mut engine, &mut session);
     assert!(
@@ -3729,8 +3720,8 @@ fn cgroup_refresh_until_cover(engine: &mut Engine, session: &mut ScriptedSession
 #[test]
 fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach() {
     let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
-    let mut mapper = b1_softhsm_holder();
-    let mapper_pid = mapper.id();
+    let mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.pid();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
     engine.skip_tick_arm_for_test = true;
@@ -3787,8 +3778,7 @@ fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach()
         "no second window: {windows:?}"
     );
     assert_eq!(windows[0].end_ns, closed_end, "the end is the re-attach");
-    mapper.kill().unwrap();
-    mapper.wait().unwrap();
+    mapper.close();
 }
 
 /// B1 twin (1b), red: the park and the admit share one tick (the common
@@ -3800,12 +3790,11 @@ fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach()
 /// alone (1).
 #[test]
 fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
-    let (mut engine, mut session, dir, retired, mut first, endpoints) =
+    let (mut engine, mut session, dir, retired, first, endpoints) =
         cgroup_refresh_admit_first();
-    let mut mapper = b1_softhsm_holder();
-    let mapper_pid = mapper.id();
-    first.kill().unwrap();
-    first.wait().unwrap();
+    let mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.pid();
+    first.close();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
     engine.skip_tick_arm_for_test = true;
@@ -3830,8 +3819,7 @@ fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
     assert_eq!(engine.coverage_retired_slots(), endpoints as u64);
     assert!(retire_skip_filed(&engine));
     assert!(engine.coverage_retire_parked().is_empty());
-    mapper.kill().unwrap();
-    mapper.wait().unwrap();
+    mapper.close();
 }
 
 /// B1 twin (2), red: the mapper admitted with no follow-up (seam,
@@ -3842,8 +3830,8 @@ fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
 #[test]
 fn cgroup_refresh_short_lived_mapper_leaves_a_disclosed_window() {
     let (mut engine, mut session, dir, retired, endpoints) = cgroup_refresh_park();
-    let mut mapper = b1_softhsm_holder();
-    let mapper_pid = mapper.id();
+    let mapper = b1_softhsm_holder();
+    let mapper_pid = mapper.pid();
     std::fs::write(dir.path().join("cgroup.procs"), format!("{mapper_pid}\n"))
         .expect("a cgroup.procs");
     engine.skip_tick_arm_for_test = true;
@@ -3865,8 +3853,7 @@ fn cgroup_refresh_short_lived_mapper_leaves_a_disclosed_window() {
         windows[0]
     );
     let (start_ns, end_ns) = (windows[0].start_ns, windows[0].end_ns);
-    mapper.kill().unwrap();
-    mapper.wait().unwrap();
+    mapper.close();
     std::fs::write(dir.path().join("cgroup.procs"), String::new()).expect("a cgroup.procs");
     for slot in engine
         .plan

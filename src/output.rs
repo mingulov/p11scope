@@ -2526,11 +2526,25 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static TEST_RECOVERY_FALLBACK: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static TEST_STAGING_FAIL_CREATE: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_STAGING_FIXED_NAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 fn test_recovery_fallback_enabled() -> bool {
     TEST_RECOVERY_FALLBACK.with(|flag| flag.get())
+}
+
+#[cfg(test)]
+fn test_staging_fail_create() -> Option<i32> {
+    TEST_STAGING_FAIL_CREATE.with(|flag| flag.get())
+}
+
+#[cfg(test)]
+fn test_staging_fixed_name() -> bool {
+    TEST_STAGING_FIXED_NAME.with(|flag| flag.get())
 }
 
 #[cfg(test)]
@@ -2606,6 +2620,48 @@ pub(crate) fn hold_recovery_fallback() -> RecoveryFallbackGuard {
 impl Drop for RecoveryFallbackGuard {
     fn drop(&mut self) {
         TEST_RECOVERY_FALLBACK.with(|flag| flag.set(false));
+    }
+}
+
+/// Holds a staging creation fault for one twin: every recovery
+/// staging created on this thread while the guard lives fails file
+/// creation with `errno` instead of opening (an `EEXIST` fault
+/// collides on every attempt, pinning the name-exhaustion path).
+/// The faulted candidate name is fixed, so the failure text is
+/// deterministic. Clears on drop.
+#[cfg(test)]
+pub(crate) struct StagingFailCreateGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_staging_fail_create(errno: i32) -> StagingFailCreateGuard {
+    TEST_STAGING_FAIL_CREATE.with(|flag| flag.set(Some(errno)));
+    StagingFailCreateGuard
+}
+
+#[cfg(test)]
+impl Drop for StagingFailCreateGuard {
+    fn drop(&mut self) {
+        TEST_STAGING_FAIL_CREATE.with(|flag| flag.set(None));
+    }
+}
+
+/// Holds a fixed staging file name for one twin: recovery files
+/// created on this thread while the guard lives use
+/// `p11scope-test-staging.<ext>` instead of a timestamped name, so
+/// copy-failure text is deterministic. Clears on drop.
+#[cfg(test)]
+pub(crate) struct StagingFixedNameGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_staging_fixed_name() -> StagingFixedNameGuard {
+    TEST_STAGING_FIXED_NAME.with(|flag| flag.set(true));
+    StagingFixedNameGuard
+}
+
+#[cfg(test)]
+impl Drop for StagingFixedNameGuard {
+    fn drop(&mut self) {
+        TEST_STAGING_FIXED_NAME.with(|flag| flag.set(false));
     }
 }
 
@@ -5043,6 +5099,277 @@ mod tests {
             Vec::<String>::new(),
             "nothing is written through the refused symlink"
         );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A buffered double failure with a pinned refused base names
+    /// the base: no staging was ever held. The whole message, exact;
+    /// `/` keeps the inner refusal deterministic.
+    #[test]
+    fn buffered_double_failure_with_pinned_base_names_the_base() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let base = PathBuf::from("/");
+        let mut a = AtomicFile::create(&path).unwrap();
+        a.set_fail_write_with(libc::ENOSPC);
+        let error = a.write_document(b"{\"ok\":true}").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let _override = hold_recovered_override(&base);
+        let write_error = error.to_string();
+        let failure = a.fail_write_with_recovery(b"{\"ok\":true}", write_error.clone());
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        assert!(
+            failure.saved_to_recovery().is_none(),
+            "a double failure saves nothing"
+        );
+        let expected = format!(
+            "writing {} failed: {write_error}; saving to {} also failed: recovery directory {} has no file name; capture lost",
+            path.display(),
+            base.display(),
+            base.display(),
+        );
+        assert_eq!(failure.into_message(), expected);
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A buffered double failure with a recovery-file creation
+    /// failure (EDQUOT) in a fallback sibling names the sibling: the
+    /// file creation was attempted there. The whole message, exact.
+    #[test]
+    fn buffered_double_failure_with_failed_file_creation_names_the_sibling() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        a.set_fail_write_with(libc::ENOSPC);
+        let error = a.write_document(b"{\"ok\":true}").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let _override = hold_recovered_override(&refused);
+        let _fallback = hold_recovery_fallback();
+        let _create_fail = hold_staging_fail_create(libc::EDQUOT);
+        let write_error = error.to_string();
+        let failure = a.fail_write_with_recovery(b"{\"ok\":true}", write_error.clone());
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let cause = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing {} failed: {write_error}; saving to {} also failed: creating recovery file p11scope-test-create-fault.json in {} failed: {cause}; capture lost",
+            path.display(),
+            actual.display(),
+            actual.display(),
+        );
+        assert_eq!(failure.into_message(), expected);
+        assert_eq!(
+            recovered_files(actual),
+            Vec::<String>::new(),
+            "no file is created when creation fails"
+        );
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A buffered double failure with a failed recovery copy (EDQUOT)
+    /// in a fallback sibling names the sibling: the copy was
+    /// attempted there. The whole message, exact; the sibling holds
+    /// no partial file afterwards.
+    #[test]
+    fn buffered_double_failure_with_failed_copy_names_the_sibling() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        a.set_fail_write_with(libc::ENOSPC);
+        let error = a.write_document(b"{\"ok\":true}").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        let _override = hold_recovered_override(&refused);
+        let _fallback = hold_recovery_fallback();
+        let _fixed_name = hold_staging_fixed_name();
+        let _staging_fail = hold_staging_fail_write(libc::EDQUOT);
+        let write_error = error.to_string();
+        let failure = a.fail_write_with_recovery(b"{\"ok\":true}", write_error.clone());
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let cause = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing {} failed: {write_error}; saving to {} also failed: writing recovery file p11scope-test-staging.json in {} failed: {cause}; capture lost",
+            path.display(),
+            actual.display(),
+            actual.display(),
+        );
+        assert_eq!(failure.into_message(), expected);
+        assert_eq!(
+            recovered_files(actual),
+            Vec::<String>::new(),
+            "no partial fallback file remains in the sibling"
+        );
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A commit double failure with a pinned refused base names the
+    /// base: no staging was ever held. The whole message, exact.
+    #[test]
+    fn commit_double_failure_with_pinned_base_names_the_base() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let base = PathBuf::from("/");
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&base);
+        let error = a.commit().unwrap_err();
+        let sync = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+        let first = format!(
+            "syncing temporary output beside {} failed: {sync}",
+            path.display()
+        );
+        let expected = format!(
+            "writing {} failed: {first}; saving to {} also failed: recovery directory {} has no file name; capture lost",
+            path.display(),
+            base.display(),
+            base.display(),
+        );
+        assert_eq!(error, expected);
+        assert!(!path.exists(), "the requested -o does not exist");
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A commit double failure with a recovery-file creation failure
+    /// (EDQUOT) in a fallback sibling names the sibling. The whole
+    /// message, exact.
+    #[test]
+    fn commit_double_failure_with_failed_file_creation_names_the_sibling() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let plant = private_tempdir();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut a = AtomicFile::create(&path).unwrap();
+        std::io::Write::write_all(a.file(), b"{\"ok\":true}").unwrap();
+        a.fail_sync_with = Some(libc::EIO);
+        let _override = hold_recovered_override(&refused);
+        let _fallback = hold_recovery_fallback();
+        let _create_fail = hold_staging_fail_create(libc::EDQUOT);
+        let error = a.commit().unwrap_err();
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let sync = std::io::Error::from_raw_os_error(libc::EIO).to_string();
+        let first = format!(
+            "syncing temporary output beside {} failed: {sync}",
+            path.display()
+        );
+        let cause = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing {} failed: {first}; saving to {} also failed: creating recovery file p11scope-test-create-fault.json in {} failed: {cause}; capture lost",
+            path.display(),
+            actual.display(),
+            actual.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            recovered_files(&target),
+            Vec::<String>::new(),
+            "nothing is written through the refused symlink"
+        );
+        assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
+    }
+
+    /// A streaming double failure with the base held names the base:
+    /// no fallback engaged, so the base is the attempted dir. The
+    /// whole message, exact.
+    #[test]
+    fn streaming_double_failure_with_held_base_names_the_base() {
+        let dir = private_tempdir();
+        let path = dir.path().join("observed.json");
+        let base = dir.path().join("p11scope-recovered");
+        let _override = hold_recovered_override(&base);
+        let mut staging = RecoveryStaging::create(&path, &base).unwrap();
+        let actual = staging.actual().to_path_buf();
+        assert_eq!(
+            actual, base,
+            "the staging dir must be the held base (no fallback)"
+        );
+        let name = staging
+            .path
+            .file_name()
+            .expect("a staging has a file name")
+            .to_string_lossy()
+            .into_owned();
+        let probe = CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let probe_fd = unsafe { libc::open(probe.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(probe_fd >= 0, "an O_PATH probe must open");
+        staging.file = unsafe { std::fs::File::from_raw_fd(probe_fd) };
+        assert_eq!(
+            staging.file.sync_all().unwrap_err().raw_os_error(),
+            Some(libc::EBADF),
+            "the O_PATH swap must fail the staging sync with EBADF"
+        );
+        let sink = AtomicFile::create(&path).unwrap();
+        let write_error = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let failure = sink.fail_streaming_write_with_recovery(staging, write_error.clone());
+        assert_eq!(failure.kind(), CommitFailureKind::RecoveryFailed);
+        let attempted = std::io::Error::from_raw_os_error(libc::EBADF).to_string();
+        let second = format!(
+            "syncing recovery file {name} in {} failed: {attempted}",
+            base.display()
+        );
+        let expected = format!(
+            "writing {} failed: {write_error}; saving to {} also failed: {second}; capture lost",
+            path.display(),
+            base.display()
+        );
+        assert_eq!(failure.into_message(), expected);
         assert_eq!(temp_litter(dir.path()), Vec::<String>::new());
     }
 

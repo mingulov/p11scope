@@ -1552,4 +1552,259 @@ mod tests {
              saving to /var/tmp/p11scope-recovered-1000.0123456789abcdef also failed: Disk quota exceeded (os error 122); capture lost"
         );
     }
+
+    /// A primary write failure (ENOSPC) plus a pinned refused base
+    /// names the base: no staging was ever held, so the base is the
+    /// attempted dir. The whole message, exact; `/` keeps the inner
+    /// refusal deterministic (no errno, no filesystem touch).
+    #[test]
+    fn diagnostics_double_failure_with_pinned_base_names_the_base() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let base = PathBuf::from("/");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&base);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: recovery directory {} has no file name; capture lost",
+            path.display(),
+            primary,
+            base.display(),
+            base.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure (ENOSPC) plus a recovery-file creation
+    /// failure (EDQUOT) in a fallback sibling names the sibling: the
+    /// file creation was attempted there, not at the refused base.
+    /// The whole message, exact.
+    #[test]
+    fn diagnostics_double_failure_with_failed_file_creation_names_the_sibling() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let plant = private_directory();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&refused);
+        let _fallback = crate::output::hold_recovery_fallback();
+        let _create_fail = crate::output::hold_staging_fail_create(libc::EDQUOT);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let cause = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: creating recovery file p11scope-test-create-fault.jsonl in {} failed: {cause}; capture lost",
+            path.display(),
+            primary,
+            actual.display(),
+            actual.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure (ENOSPC) plus recovery-name exhaustion
+    /// in a fallback sibling names the sibling: the allocation was
+    /// attempted there. The whole message, exact.
+    #[test]
+    fn diagnostics_double_failure_with_name_exhaustion_names_the_sibling() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let plant = private_directory();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&refused);
+        let _fallback = crate::output::hold_recovery_fallback();
+        let _create_fail = crate::output::hold_staging_fail_create(libc::EEXIST);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: cannot allocate a unique recovery file in {}; capture lost",
+            path.display(),
+            primary,
+            actual.display(),
+            actual.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure (ENOSPC) plus a recovery-file creation
+    /// failure (EDQUOT) in the held base names the base: no fallback
+    /// engaged, so the base is the attempted dir. The whole message,
+    /// exact; the base holds no file afterwards.
+    #[test]
+    fn diagnostics_double_failure_with_failed_file_creation_names_the_base() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&base);
+        let _create_fail = crate::output::hold_staging_fail_create(libc::EDQUOT);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let cause = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: creating recovery file p11scope-test-create-fault.jsonl in {} failed: {cause}; capture lost",
+            path.display(),
+            primary,
+            base.display(),
+            base.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let leftover: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no file is created when creation fails: {leftover:?}"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure (ENOSPC) plus a failed recovery write
+    /// (EDQUOT) in the held base names the base: no fallback engaged.
+    /// The whole message, exact.
+    #[test]
+    fn diagnostics_double_failure_with_failed_write_names_the_base() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&base);
+        let _staging_fail = crate::output::hold_staging_fail_write(libc::EDQUOT);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let recovery = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: {recovery}; capture lost",
+            path.display(),
+            primary,
+            base.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure (ENOSPC) plus a failed fallback-dir
+    /// creation names the base: neither the base nor a sibling was
+    /// ever held. The whole message, exact; nothing is created under
+    /// the missing parent.
+    #[test]
+    fn diagnostics_double_failure_with_failed_fallback_names_the_base() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let plant = private_directory();
+        let parent = plant.path().join("no-such-parent");
+        let base = parent.join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&base);
+        let _fallback = crate::output::hold_recovery_fallback();
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+        let first = format!(
+            "opening recovery parent {} failed: {missing}",
+            parent.display()
+        );
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: {first}; recovery fallback also failed: {first}; capture lost",
+            path.display(),
+            primary,
+            base.display(),
+        );
+        assert_eq!(error, expected);
+        assert!(
+            !parent.exists(),
+            "nothing is created under the missing parent"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        assert_no_temporary_files(directory.path());
+    }
 }

@@ -4576,6 +4576,19 @@ impl PinnedObjects {
     /// divergent twins never do. Greedy and deterministic (owners are
     /// visited in id order against each group's first member);
     /// groups are never empty.
+    ///
+    /// Cost: one full raw-map walk per call plus pairwise identity
+    /// comparisons. Each comparison is memory-only until mapping,
+    /// fd_dev, pin and digest all match, after which the
+    /// inode-uniqueness probe may issue one `fstatfs` per side (plus,
+    /// on tmpfs only, bounded mount-table reads) — so native calls
+    /// happen only among mutually almost-identical files, never for
+    /// divergent twins. Calls run per unjoined note at projection and
+    /// terminal publication only, bounded by the 32-note learned cap
+    /// with a handful of owners per key in practice (one canonical
+    /// filing plus retained aliases and witness pairs): the same cost
+    /// class and sites as the proof path's long-standing comparisons,
+    /// and never on the per-event path.
     fn note_owner_groups(&self, key: ObjectKey) -> Vec<BTreeSet<PinnedObjectId>> {
         let mut groups: Vec<BTreeSet<PinnedObjectId>> = Vec::new();
         for owner in self.live_note_owners(key) {

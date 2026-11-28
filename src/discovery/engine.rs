@@ -11142,9 +11142,17 @@ fn discovery_evidence(
         .iter()
         .filter_map(|m| pinned.summary(m.object).map(|pin| pin.key))
         .collect();
+    // Adopted keys join only through the identity owner: a rejected
+    // key, a dual adoption, or a live divergent claimant refuses the
+    // attach here exactly as at terminal time, and the refused note
+    // keeps its gapped terminal record instead of vanishing.
+    let mut exact_notes: BTreeMap<PinnedObjectId, render::FirstLoadedBy> = BTreeMap::new();
     let mut split_notes: BTreeMap<PinnedObjectId, render::FirstLoadedBy> = BTreeMap::new();
     for (key, note) in learned {
         if exact_keys.contains(key) {
+            if let Some(target) = pinned.resolve_exact_note_target(*key, &planned_ids) {
+                exact_notes.entry(target).or_insert_with(|| note.clone());
+            }
             continue;
         }
         if let Some(target) = pinned.resolve_split_note_target(*key, &planned_ids) {
@@ -11218,9 +11226,9 @@ fn discovery_evidence(
                 coverage_retired_folded: None,
                 first_attached_at_ns: None,
                 first_attach_points: None,
-                first_loaded_by: pinned.summary(m.object).and_then(|pin| {
-                    learned
-                        .get(&pin.key)
+                first_loaded_by: pinned.summary(m.object).and_then(|_| {
+                    exact_notes
+                        .get(&m.object)
                         .cloned()
                         .or_else(|| split_notes.get(&m.object).cloned())
                 }),

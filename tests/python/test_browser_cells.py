@@ -194,12 +194,13 @@ FF_NOMOD_KNOWN_SKIPS = frozenset({
     ("learned provider file", oracle.LEARNED_FIRST_USE_REASON),
 })
 
-#: The one gap cause the CR-RUN-NODELAY post-scan exit race discloses
-#: (KI-26): the victim exits during the post-scan, its /proc mem open
-#: fails unreadable, and the engine latches scan_unavailable loud.
-#: Only the "unreadable" typed reason is the granted race; "ptrace",
-#: "gone" and a missing detail stay generic (see mem_unavailable in
-#: src/discovery/scan.rs for the product vocabulary).
+#: The one gap cause the CR-RUN-NODELAY unreadable-scan race discloses
+#: (KI-26): a post-scan of a run-tree child intermittently cannot read
+#: its memory (typed reason "unreadable"), and the engine latches
+#: scan_unavailable loud. The row claims only the unreadable scan, not
+#: victim exit, which the product does not record for this class;
+#: "ptrace", "gone" and a missing detail stay generic (see
+#: mem_unavailable in src/discovery/scan.rs for the vocabulary).
 CR_RUN_NODELAY_KNOWN_GAP = "scan_unavailable"
 CR_RUN_NODELAY_KNOWN_SCAN_REASON = "unreadable"
 
@@ -2231,6 +2232,20 @@ class BrowserCells(unittest.TestCase):
         result, sha = self._twin_nodelay_result(
             "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
             "gone")
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_cr_run_nodelay_scan_gap_plus_extra_cause_stays_generic(self):
+        """KI-26 twin: the known gap plus another cause stays generic."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows,
+            sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable", "in_flight_at_end"],
+            "unreadable")
         with self.assertRaises(AssertionError) as raised:
             self._check_nodelay_cell(result, sha)
         self.assertIs(type(raised.exception), AssertionError)
@@ -5463,6 +5478,16 @@ class ClassifierMutationTests(unittest.TestCase):
             known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
         with self.assertRaises(AttributeError):
             mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN)
+
+    def test_nodelay_dispatch_guard_kills(self):
+        mutant = self.mutate('if cell == "CR-RUN-NODELAY":', "if True:")
+        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                                     "unreadable")
+        failures = [self.nodelay_gap_failure()]
+        self.assertIsNone(known_failure_signature("CR-RUN-SIGN", report, failures,
+                                                  _GAPS_ATTACHED_RUN))
+        self.assertEqual(mutant("CR-RUN-SIGN", report, failures, _GAPS_ATTACHED_RUN),
+                         CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
     def test_nodelay_length_gate_is_redundant(self):
         # Equivalent survivor, kept as a cheap early-out: any failure list

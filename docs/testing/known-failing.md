@@ -24,10 +24,15 @@ Required fields: `path`, `test`, `cell`, `issues`, `target`, `runner`,
 - `issues`: nonempty unique list of `KI-nn` ids. One row may cover two
   issues.
 - `target`: `0.7.3` or `0.8.0`. A row expires at its target release:
-  once `docs/releases/v<target>.md` exists the row is refused.
-- `runner`: `privileged-lib`, `python-suite`, or `cell:<script>`. There
-  is no `host-matrix` runner: the schema as implemented is accepted
-  (controller ruling, fix4 brief N8).
+  once `docs/releases/v<target>.md` exists without the exact draft
+  marker line (`Status: draft (not released)`), the row is refused.
+  Draft-marked notes are not a release.
+- `runner`: `privileged-lib`, `python-suite`,
+  `python-suite-strict-browser`, or `cell:<script>`. The strict-browser
+  runner is the strict browser-cells CI stream, selected by
+  `P11SCOPE_KNOWN_FAILING_RUNNER`; rows naming it are judged only
+  there. There is no `host-matrix` runner: the schema as implemented
+  is accepted (controller ruling, fix4 brief N8).
 - `signature`: nonempty nested record of typed values only (snake-case
   field names, enum-like leaves, never log text), with a mandatory
   `branch` naming the typed failure branch. A bare producer state or
@@ -42,9 +47,11 @@ Required fields: `path`, `test`, `cell`, `issues`, `target`, `runner`,
   judge exists.
 - `mode`: `always` (must fail; a pass is a stale row) or `intermittent`
   (may pass; a failure must match `signature` exactly, type-sensitive).
-- Every row has a CI judge. A `python-suite` row needs `github` in
-  `hosts`, or no `hosts` (python suites are judged only with host
-  `github`). A `cell:` row needs a workflow invocation with the same
+- Every row has a CI judge. A `python-suite` or
+  `python-suite-strict-browser` row needs `github` in `hosts`, or no
+  `hosts` (suite streams are judged only with host `github`; the
+  browser-cells job judges the strict-browser stream). A `cell:` row
+  needs a workflow invocation with the same
   `--known-failing-runner` and a compatible host (`"$kf_host"` matches
   any host). A `cell:` row's `path` equals its runner script, except
   `.rs` rows whose typed path comes from `tests/ignored-tests.json`.

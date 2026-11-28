@@ -56,13 +56,14 @@ file sits outside the narrowed capture selection.
 ### KI-26: a no-delay Chromium run sometimes reports an unreadable post-scan
 
 The CR-RUN-NODELAY cell intermittently fails with its signs exact: a
-Chromium descendant exits while a discovery post-scan reads it, the
-`/proc/<pid>/mem` open fails unreadable, and the observer honestly
-files a loud `scan_unavailable` gap the run cells do not allowlist
-(`src/discovery/scan.rs` mem-open class, `src/discovery/engine.rs`
-exit-proof latch). Measured 1 of 6 on Fedora; the owed signs were
-fully observed. The 0.8.0 fix re-proves victim exit before latching
-loud, mirroring the `gone` precedent.
+discovery post-scan of a Chromium child intermittently reports its
+memory unreadable (the typed `scan_unavailable` reason), and the
+observer honestly files a loud `scan_unavailable` gap the run cells
+do not allowlist (`src/discovery/scan.rs` mem-open class). Measured 1
+of 6 on Fedora; the owed signs were fully observed. Whether the
+unreadable child had exited is not recorded; recording victim exit
+for unreadable scans is a v0.8.0 follow-up so a future row can narrow
+to the exit race.
 
 ## Known limitations in 0.7.0
 

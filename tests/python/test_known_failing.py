@@ -1295,6 +1295,26 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("2 intermittent passes", result.stdout)
 
+    def test_row_signature_from_another_cell_stays_red(self):
+        f, signatures = self.browser_fixture()
+        entries = [
+            {"path": "tests/python/test_browser_cells.py",
+             "test": "BrowserCells.test_ff_nomod_observes_nothing",
+             "state": "passed", "signature": None},
+            {"path": "tests/python/test_browser_cells.py",
+             "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
+             "state": "passed", "signature": None},
+            {"path": "tests/python/test_browser_cells.py",
+             "test": "BrowserCells.test_cr_run_sign_observes_client_cert_signs",
+             "state": "failed",
+             "signature": signatures[
+                 "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"]},
+        ]
+        doc = result_doc(entries, runner="python-suite-strict-browser")
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failing test not listed", result.stderr)
+
     def test_skipped_strict_browser_row_is_not_a_pass(self):
         f, signatures = self.browser_fixture()
         entries = [{"path": "tests/python/test_browser_cells.py",
@@ -2492,6 +2512,46 @@ class TypedEnvironmentTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(plain.read_text(encoding="utf-8"))["runner"], "python-suite")
 
+    STRICT_FAILING_BODY = (
+        "import unittest\n"
+        "class TypedFailure(AssertionError):\n"
+        "    def __init__(self):\n"
+        "        super().__init__('raw prose that must not be copied')\n"
+        "        self.p11scope_signature = {'cell': 'X', 'branch': 'B'}\n"
+        "class Sample(unittest.TestCase):\n"
+        "    def test_x(self): raise TypedFailure()\n"
+        "if __name__ == '__main__': unittest.main()\n")
+
+    def test_strict_absorption_returns_success_on_covered_failure(self):
+        f = fixture(self)
+        f.registry()
+        shutil.copy2(ROOT / "scripts/run-python-suites.py",
+                     f.root / "scripts/run-python-suites.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     f.root / "scripts/check-known-failing.py")
+        # Borrow a production-registered suite name so the file-based RUN
+        # proof holds; only the file content is the tiny failing body.
+        suite = f.root / "tests/python/test_known_failing.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(self.STRICT_FAILING_BODY, encoding="utf-8")
+        runner = load_script(f.root / "scripts/run-python-suites.py",
+                             "python_suite_runner_absorb")
+        runner.RUN = [("test_known_failing.py", [])]
+        f.rows([row(runner="python-suite-strict-browser",
+                    path="tests/python/test_known_failing.py")])
+        merged = f.root / "merged.json"
+        full_env = {"PATH": os.environ.get("PATH", ""),
+                    "P11SCOPE_KNOWN_FAILING_RESULTS": str(merged),
+                    "P11SCOPE_KNOWN_FAILING_HOST": "github",
+                    "P11SCOPE_KNOWN_FAILING_RUNNER": "python-suite-strict-browser"}
+        with mock.patch.dict(os.environ, full_env, clear=True):
+            self.assertEqual(runner.run_suites(set()), [])
+        document = json.loads(merged.read_text(encoding="utf-8"))
+        self.assertEqual(document["runner"], "python-suite-strict-browser")
+        judged = f.run_checker("--results", str(merged))
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+        self.assertIn("1 expected failures", judged.stdout)
+
     def test_typed_runner_env_reaches_the_merged_document(self):
         f = fixture(self)
         shutil.copy2(ROOT / "scripts/run-python-suites.py",
@@ -3644,6 +3704,53 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 else:
                     mutant_ok = ok
         self.record(results, "python-runner-default", original_ok, mutant_ok)
+
+        # Outer absorption: nonzero suite outcomes covered by the ledger
+        # return success; dropping the absorption return turns a covered
+        # strict failure back into red.
+        absorb_mutant = self.mutate_source(
+            ROOT / "scripts/run-python-suites.py",
+            '                print("run-python-suites: nonzero suite outcomes are exactly covered by the typed known-failing ledger")\n'
+            '                return []',
+            '                print("run-python-suites: nonzero suite outcomes are exactly covered by the typed known-failing ledger")')
+        for label, source in (("original", runner_source), ("mutant", absorb_mutant)):
+            absorb_fixture = fixture(self)
+            (absorb_fixture.root / "scripts/run-python-suites.py").write_text(
+                source, encoding="utf-8")
+            shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                         absorb_fixture.root / "scripts/check-known-failing.py")
+            absorb_fixture.registry()
+            # Borrow a production-registered suite name so the file-based
+            # RUN proof holds; only the file content is tiny and failing.
+            absorb_suite = absorb_fixture.root / "tests/python/test_known_failing.py"
+            absorb_suite.parent.mkdir(parents=True, exist_ok=True)
+            absorb_suite.write_text(
+                "import unittest\n"
+                "class TypedFailure(AssertionError):\n"
+                "    def __init__(self):\n"
+                "        super().__init__('raw prose')\n"
+                "        self.p11scope_signature = {'cell': 'X', 'branch': 'B'}\n"
+                "class Sample(unittest.TestCase):\n"
+                "    def test_x(self): raise TypedFailure()\n"
+                "if __name__ == '__main__': unittest.main()\n", encoding="utf-8")
+            absorb_runner = load_script(
+                absorb_fixture.root / "scripts/run-python-suites.py",
+                f"python_suite_runner_absorb_{label}")
+            absorb_runner.RUN = [("test_known_failing.py", [])]
+            absorb_fixture.rows([row(runner="python-suite-strict-browser",
+                                    path="tests/python/test_known_failing.py")])
+            absorb_merged = absorb_fixture.root / "merged.json"
+            absorb_env = {"PATH": os.environ.get("PATH", ""),
+                          "P11SCOPE_KNOWN_FAILING_RESULTS": str(absorb_merged),
+                          "P11SCOPE_KNOWN_FAILING_HOST": "github",
+                          "P11SCOPE_KNOWN_FAILING_RUNNER": "python-suite-strict-browser"}
+            with mock.patch.dict(os.environ, absorb_env, clear=True):
+                ok = absorb_runner.run_suites(set()) == []
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-absorb-covered", original_ok, mutant_ok)
 
         # Fragment admission is exact-typed: a boolean process_exit must not
         # pass as the integer 1 via isinstance.
@@ -5299,7 +5406,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = module.json_exact_equal(node, node) is False
         self.record(results, "equality-depth-limit", outcomes["original"], outcomes["mutant"])
 
-        total = 85
+        total = 86
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

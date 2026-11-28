@@ -361,9 +361,10 @@ impl AtomicFile {
             }
             Err(e2) => CommitFailure {
                 message: format!(
-                    "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+                    "writing {} failed: {write_error}; saving to {} also failed: {}; capture lost",
                     self.final_path.display(),
-                    base.display()
+                    e2.attempted().display(),
+                    e2.message(),
                 ),
                 kind: CommitFailureKind::RecoveryFailed,
                 saved: None,
@@ -519,9 +520,10 @@ impl AtomicFile {
                     }
                     Err(e2) => Err(CommitFailure {
                         message: format!(
-                            "writing {} failed: {e1}; saving to {} also failed: {e2}; capture lost",
+                            "writing {} failed: {e1}; saving to {} also failed: {}; capture lost",
                             self.final_path.display(),
-                            base.display()
+                            e2.attempted().display(),
+                            e2.message(),
                         ),
                         kind: CommitFailureKind::RecoveryFailed,
                         saved: None,
@@ -1943,6 +1945,48 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
     Ok(dir)
 }
 
+/// A recovery-dir or recovery-file step failure carrying the exact
+/// directory attempted, so double-failure lines name the attempted
+/// dir. Built at the failing step (the base, or the fallback sibling
+/// once held); outer messages use only this, never a recomputed base.
+/// Derefs to the step's message text, which keeps the existing
+/// combined-failure assertions compiling unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryAttemptError {
+    attempted: PathBuf,
+    message: String,
+}
+
+impl RecoveryAttemptError {
+    fn new(attempted: PathBuf, message: String) -> Self {
+        Self { attempted, message }
+    }
+
+    /// The directory the failed step attempted. For `saving to` slots.
+    pub(crate) fn attempted(&self) -> &Path {
+        &self.attempted
+    }
+
+    /// The step's full cause text. For `also failed` slots.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::ops::Deref for RecoveryAttemptError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for RecoveryAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Opens the recovery dir, falling back to a fresh unique sibling
 /// when the base is occupied by a foreign object (another uid's dir,
 /// a file, a symlink, a permissive dir): the returned path is the
@@ -1952,7 +1996,9 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
 /// production sibling path; production always falls back, so another
 /// user can never block this caller's recovery, not even by squatting
 /// its per-euid name.
-fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+fn open_recovered_dir_or_sibling_fallback(
+    base: &Path,
+) -> Result<(std::fs::File, PathBuf), RecoveryAttemptError> {
     match open_recovered_dir(base) {
         Ok(dir) => Ok((dir, base.to_path_buf())),
         Err(first) => {
@@ -1961,10 +2007,14 @@ fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File,
                 .is_some_and(|dir| dir == base.as_os_str())
                 && !test_recovery_fallback_enabled()
             {
-                return Err(first);
+                return Err(RecoveryAttemptError::new(base.to_path_buf(), first));
             }
-            let (dir, fallback) = create_fallback_recovered_dir(base)
-                .map_err(|second| format!("{first}; recovery fallback also failed: {second}"))?;
+            let (dir, fallback) = create_fallback_recovered_dir(base).map_err(|second| {
+                RecoveryAttemptError::new(
+                    base.to_path_buf(),
+                    format!("{first}; recovery fallback also failed: {second}"),
+                )
+            })?;
             let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&format!(
                 "p11scope: warning: {first}; using {} instead",
                 fallback.display()
@@ -2253,15 +2303,23 @@ fn save_recovered_capture(
     temp_file: &std::fs::File,
     dest: &Path,
     base: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, RecoveryAttemptError> {
     // An independent offset via a clone, so the temp's own offset is
-    // untouched for the operator when the temp is kept.
-    let mut src = temp_file
-        .try_clone()
-        .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
+    // untouched for the operator when the temp is kept. No recovery
+    // dir is held yet, so a read failure here attempted the base.
+    let mut src = temp_file.try_clone().map_err(|error| {
+        RecoveryAttemptError::new(
+            base.to_path_buf(),
+            format!("reading finished capture for recovery failed: {error}"),
+        )
+    })?;
     use std::io::{Seek as _, SeekFrom};
-    src.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
+    src.seek(SeekFrom::Start(0)).map_err(|error| {
+        RecoveryAttemptError::new(
+            base.to_path_buf(),
+            format!("reading finished capture for recovery failed: {error}"),
+        )
+    })?;
     save_recovered_stream(&mut src, dest, base)
 }
 
@@ -2270,7 +2328,11 @@ fn save_recovered_capture(
 /// [`save_recovered_capture`]). After a failed `-o` write the temp
 /// holds at most a partial write, so the caller passes its complete
 /// document instead of the temp.
-fn save_recovered_bytes(bytes: &[u8], dest: &Path, base: &Path) -> Result<PathBuf, String> {
+fn save_recovered_bytes(
+    bytes: &[u8],
+    dest: &Path,
+    base: &Path,
+) -> Result<PathBuf, RecoveryAttemptError> {
     let mut src: &[u8] = bytes;
     save_recovered_stream(&mut src, dest, base)
 }
@@ -2301,7 +2363,7 @@ impl RecoveryStaging {
     /// extension names the bounded suffix, `json` when absent) in the
     /// recovery dir held for `base`. The file is `0600`, `O_EXCL`,
     /// unique over 128 sequence retries.
-    pub(crate) fn create(dest: &Path, base: &Path) -> Result<Self, String> {
+    pub(crate) fn create(dest: &Path, base: &Path) -> Result<Self, RecoveryAttemptError> {
         let (dir, actual) = open_recovered_dir_or_fallback(base)?;
         // Bound the suffix to 32 chars: a valid 255-byte destination
         // basename can carry a 253-byte extension, which would push
@@ -2318,7 +2380,32 @@ impl RecoveryStaging {
         let timestamp = fallback_timestamp();
         let pid = std::process::id();
         for seq in 0..128u32 {
-            let name = if seq == 0 {
+            // Test-only creation fault: fail file creation with
+            // `errno` under a fixed candidate name, so the failure
+            // text is deterministic. An `EEXIST` fault collides on
+            // every attempt, pinning the name-exhaustion path.
+            #[cfg(test)]
+            if let Some(errno) = test_staging_fail_create() {
+                if errno == libc::EEXIST {
+                    continue;
+                }
+                let name = format!("p11scope-test-create-fault.{ext}");
+                return Err(RecoveryAttemptError::new(
+                    actual.clone(),
+                    format!(
+                        "creating recovery file {name} in {} failed: {}",
+                        actual.display(),
+                        std::io::Error::from_raw_os_error(errno)
+                    ),
+                ));
+            }
+            #[cfg(test)]
+            let fixed = test_staging_fixed_name();
+            #[cfg(not(test))]
+            let fixed = false;
+            let name = if fixed {
+                format!("p11scope-test-staging.{ext}")
+            } else if seq == 0 {
                 format!("p11scope-{timestamp}-{pid}.{ext}")
             } else {
                 format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
@@ -2343,9 +2430,12 @@ impl RecoveryStaging {
                 if error.raw_os_error() == Some(libc::EEXIST) {
                     continue;
                 }
-                return Err(format!(
-                    "creating recovery file {name} in {} failed: {error}",
-                    actual.display()
+                return Err(RecoveryAttemptError::new(
+                    actual.clone(),
+                    format!(
+                        "creating recovery file {name} in {} failed: {error}",
+                        actual.display()
+                    ),
                 ));
             }
             // SAFETY: openat succeeded, so the fd is owned.
@@ -2364,9 +2454,12 @@ impl RecoveryStaging {
                 fail_write_with,
             });
         }
-        Err(format!(
-            "cannot allocate a unique recovery file in {}",
-            actual.display()
+        Err(RecoveryAttemptError::new(
+            actual.clone(),
+            format!(
+                "cannot allocate a unique recovery file in {}",
+                actual.display()
+            ),
         ))
     }
 
@@ -2453,7 +2546,7 @@ fn save_recovered_stream(
     reader: &mut dyn std::io::Read,
     dest: &Path,
     base: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, RecoveryAttemptError> {
     let mut staging = RecoveryStaging::create(dest, base)?;
     let name = staging
         .path
@@ -2464,12 +2557,17 @@ fn save_recovered_stream(
     let actual = staging.actual().to_path_buf();
     if let Err(error) = std::io::copy(reader, &mut staging) {
         staging.abort();
-        return Err(format!(
-            "writing recovery file {name} in {} failed: {error}",
-            actual.display()
+        return Err(RecoveryAttemptError::new(
+            actual.clone(),
+            format!(
+                "writing recovery file {name} in {} failed: {error}",
+                actual.display()
+            ),
         ));
     }
-    staging.finish()
+    staging
+        .finish()
+        .map_err(|error| RecoveryAttemptError::new(actual, error))
 }
 
 /// Serializes tests that override the recovery directory: the override

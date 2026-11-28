@@ -92,7 +92,7 @@ impl DiagnosticsDestination {
             primary_failed,
             primary_error,
             staging,
-            staging_dir,
+            attempted_dir,
             creation_error,
             staging_error,
         ) = {
@@ -105,7 +105,7 @@ impl DiagnosticsDestination {
                 primary_failed: false,
                 primary_error: None,
                 staging: None,
-                staging_dir: None,
+                attempted_dir: base.clone(),
                 creation_error: None,
                 staging_error: None,
                 cancel: &cancel,
@@ -116,20 +116,21 @@ impl DiagnosticsDestination {
                 writer.primary_failed,
                 writer.primary_error,
                 writer.staging.take(),
-                writer.staging_dir,
+                writer.attempted_dir,
                 writer.creation_error,
                 writer.staging_error,
             )
         };
         // From here the writer is gone; `second_signal`,
         // `self.output` and `staging` are usable again. Both
-        // double-failure arms below share one line: the dir actually
-        // attempted (the base when no staging was ever held).
+        // double-failure arms below share one line naming the dir
+        // the recovery steps attempted; that dir comes only from
+        // step outcomes, never from the requested base.
         let primary = primary_error.unwrap_or_else(|| "unknown error".to_string());
         let second = creation_error
             .or(staging_error)
             .unwrap_or_else(|| "unknown error".to_string());
-        let recovery_dir = staging_dir.as_deref().unwrap_or(&base);
+        let recovery_dir = attempted_dir.as_path();
         match export {
             Ok(summary) => {
                 if primary_failed {
@@ -282,8 +283,8 @@ fn diagnostics_double_failure_message(
 /// tracked before each attempted record, so a partial primary write
 /// cannot duplicate. Both sinks failed is an I/O error carrying the
 /// primary cause; the recovery cause travels in `creation_error` or
-/// `staging_error`, with the attempted dir in `staging_dir`, for the
-/// delivery boundary to report both as lost.
+/// `staging_error`, with the attempted dir in `attempted_dir`, for
+/// the delivery boundary to report both as lost.
 struct LazyRecoveryWriter<'cell, 'signal> {
     output: &'cell mut AtomicFile,
     dest: PathBuf,
@@ -292,10 +293,12 @@ struct LazyRecoveryWriter<'cell, 'signal> {
     primary_failed: bool,
     primary_error: Option<String>,
     staging: Option<crate::output::RecoveryStaging>,
-    /// The recovery dir actually held once a staging exists (the
-    /// base or its fallback sibling); retained after the staging is
-    /// dropped so the double-failure line names the attempted dir.
-    staging_dir: Option<PathBuf>,
+    /// The recovery dir attempted so far: the base until a staging
+    /// is held (possibly in a fallback sibling), then that dir;
+    /// retained after the staging is dropped, and taken from the
+    /// typed creation error when creation itself fails, so the
+    /// double-failure line always names the attempted dir.
+    attempted_dir: PathBuf,
     creation_error: Option<String>,
     staging_error: Option<String>,
     cancel: &'cell RefCell<&'signal mut dyn FnMut() -> bool>,
@@ -321,11 +324,12 @@ impl LazyRecoveryWriter<'_, '_> {
         }
         match crate::output::RecoveryStaging::create(&self.dest, &self.base) {
             Ok(staging) => {
-                self.staging_dir = Some(staging.actual().to_path_buf());
+                self.attempted_dir = staging.actual().to_path_buf();
                 self.staging = Some(staging);
             }
             Err(error) => {
-                self.creation_error = Some(error);
+                self.attempted_dir = error.attempted().to_path_buf();
+                self.creation_error = Some(error.message().to_string());
                 return Err(self.primary_io_error());
             }
         }

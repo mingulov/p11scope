@@ -1705,7 +1705,7 @@ class WorkflowScanTests(unittest.TestCase):
         checker = load_script(CHECKER, "known_failing_checker_scan_count")
         invocations, problems = checker.workflow_invocations(ROOT)
         self.assertEqual(problems, [])
-        self.assertEqual(len(invocations), 14)
+        self.assertEqual(len(invocations), 15)
 
     def test_yaml_workflow_scans_like_yml(self):
         checker = load_script(CHECKER, "known_failing_checker_yaml_pair")

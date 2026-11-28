@@ -87,7 +87,15 @@ impl DiagnosticsDestination {
         // it. The writer and `write_jsonl` share the cancellation
         // closure through the cell (never called reentrantly: record
         // writes and record-boundary polls strictly alternate).
-        let (export, primary_failed, primary_error, staging, creation_error, staging_error) = {
+        let (
+            export,
+            primary_failed,
+            primary_error,
+            staging,
+            staging_dir,
+            creation_error,
+            staging_error,
+        ) = {
             let cancel: RefCell<&mut dyn FnMut() -> bool> = RefCell::new(&mut second_signal);
             let mut writer = LazyRecoveryWriter {
                 output: &mut self.output,
@@ -97,6 +105,7 @@ impl DiagnosticsDestination {
                 primary_failed: false,
                 primary_error: None,
                 staging: None,
+                staging_dir: None,
                 creation_error: None,
                 staging_error: None,
                 cancel: &cancel,
@@ -107,12 +116,20 @@ impl DiagnosticsDestination {
                 writer.primary_failed,
                 writer.primary_error,
                 writer.staging.take(),
+                writer.staging_dir,
                 writer.creation_error,
                 writer.staging_error,
             )
         };
         // From here the writer is gone; `second_signal`,
-        // `self.output` and `staging` are usable again.
+        // `self.output` and `staging` are usable again. Both
+        // double-failure arms below share one line: the dir actually
+        // attempted (the base when no staging was ever held).
+        let primary = primary_error.unwrap_or_else(|| "unknown error".to_string());
+        let second = creation_error
+            .or(staging_error)
+            .unwrap_or_else(|| "unknown error".to_string());
+        let recovery_dir = staging_dir.as_deref().unwrap_or(&base);
         match export {
             Ok(summary) => {
                 if primary_failed {
@@ -128,14 +145,11 @@ impl DiagnosticsDestination {
                                 self.path.display()
                             ));
                         }
-                        let second = creation_error
-                            .or(staging_error)
-                            .unwrap_or_else(|| "unknown error".to_string());
-                        return Err(format!(
-                            "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
-                            self.path.display(),
-                            primary_error.unwrap_or_else(|| "unknown error".to_string()),
-                            base.display(),
+                        return Err(diagnostics_double_failure_message(
+                            &self.path,
+                            &primary,
+                            &second,
+                            recovery_dir,
                         ));
                     };
                     // The `-o` temp holds at most a partial write; the
@@ -151,10 +165,9 @@ impl DiagnosticsDestination {
                     // The helper already prints `writing <path> failed:`,
                     // so the caller passes the bare primary cause: a
                     // wrapped prefix would print it twice.
-                    let failure = self.output.fail_streaming_write_with_recovery(
-                        staging,
-                        primary_error.unwrap_or_else(|| "unknown error".to_string()),
-                    );
+                    let failure = self
+                        .output
+                        .fail_streaming_write_with_recovery(staging, primary.clone());
                     return Err(failure.into_message());
                 }
                 // Primary holds the complete export; no staging was
@@ -180,14 +193,11 @@ impl DiagnosticsDestination {
                 // the buffered sites do. Cancellation and serialization
                 // stay distinct.
                 if primary_failed && matches!(error, ExportError::Io(_)) {
-                    let second = creation_error
-                        .or(staging_error)
-                        .unwrap_or_else(|| "unknown error".to_string());
-                    return Err(format!(
-                        "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
-                        self.path.display(),
-                        primary_error.unwrap_or_else(|| "unknown error".to_string()),
-                        base.display(),
+                    return Err(diagnostics_double_failure_message(
+                        &self.path,
+                        &primary,
+                        &second,
+                        recovery_dir,
                     ));
                 }
                 Err(format!(
@@ -245,6 +255,24 @@ impl DiagnosticsDestination {
     }
 }
 
+/// The streaming double-failure line: the primary `-o` cause plus
+/// the recovery cause in the dir actually attempted, with the loss
+/// outcome. Shared by the export-error arm and the defensive
+/// success-without-staging arm so the two cannot diverge.
+fn diagnostics_double_failure_message(
+    dest: &Path,
+    primary: &str,
+    second: &str,
+    recovery_dir: &Path,
+) -> String {
+    format!(
+        "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
+        dest.display(),
+        primary,
+        recovery_dir.display(),
+    )
+}
+
 /// Streams each export line to the `-o` temp with bounded heap.
 /// The primary keeps priority: no recovery file or dir exists while
 /// it stays healthy. On the first primary write error the writer
@@ -254,7 +282,8 @@ impl DiagnosticsDestination {
 /// tracked before each attempted record, so a partial primary write
 /// cannot duplicate. Both sinks failed is an I/O error carrying the
 /// primary cause; the recovery cause travels in `creation_error` or
-/// `staging_error` for the delivery boundary to report both as lost.
+/// `staging_error`, with the attempted dir in `staging_dir`, for the
+/// delivery boundary to report both as lost.
 struct LazyRecoveryWriter<'cell, 'signal> {
     output: &'cell mut AtomicFile,
     dest: PathBuf,
@@ -263,6 +292,10 @@ struct LazyRecoveryWriter<'cell, 'signal> {
     primary_failed: bool,
     primary_error: Option<String>,
     staging: Option<crate::output::RecoveryStaging>,
+    /// The recovery dir actually held once a staging exists (the
+    /// base or its fallback sibling); retained after the staging is
+    /// dropped so the double-failure line names the attempted dir.
+    staging_dir: Option<PathBuf>,
     creation_error: Option<String>,
     staging_error: Option<String>,
     cancel: &'cell RefCell<&'signal mut dyn FnMut() -> bool>,
@@ -288,6 +321,7 @@ impl LazyRecoveryWriter<'_, '_> {
         }
         match crate::output::RecoveryStaging::create(&self.dest, &self.base) {
             Ok(staging) => {
+                self.staging_dir = Some(staging.actual().to_path_buf());
                 self.staging = Some(staging);
             }
             Err(error) => {
@@ -1496,5 +1530,26 @@ mod tests {
             "nothing is written through the refused link: {target_files:?}"
         );
         assert_no_temporary_files(directory.path());
+    }
+
+    /// The shared double-failure line names the given attempted dir:
+    /// the whole message, exact, against a literal. Both deliver
+    /// arms format through this helper, so this pins the defensive
+    /// success-without-staging arm's text too (that arm is
+    /// unreachable end to end: every staging failure aborts the
+    /// export with an I/O error, so success implies a staging).
+    #[test]
+    fn diagnostics_double_failure_message_names_the_attempted_dir() {
+        let message = diagnostics_double_failure_message(
+            Path::new("/tmp/x/diagnostics.jsonl"),
+            "No space left on device (os error 28)",
+            "Disk quota exceeded (os error 122)",
+            Path::new("/var/tmp/p11scope-recovered-1000.0123456789abcdef"),
+        );
+        assert_eq!(
+            message,
+            "writing diagnostics /tmp/x/diagnostics.jsonl failed: No space left on device (os error 28); \
+             saving to /var/tmp/p11scope-recovered-1000.0123456789abcdef also failed: Disk quota exceeded (os error 122); capture lost"
+        );
     }
 }

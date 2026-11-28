@@ -378,9 +378,10 @@ impl AtomicFile {
     /// destination stays full — the recovery dir on its own filesystem
     /// is the retry. Consumes the sink and the staging; `Drop` unlinks
     /// the partial temp. Reports the same typed failure as
-    /// `fail_write_with_recovery` with the same operator lines. The
-    /// caller checks cancellation before calling: a cancelled export
-    /// aborts its staging instead of finishing it.
+    /// `fail_write_with_recovery`: the saved line matches, while the
+    /// double-failure line names the staging's dir. The caller checks
+    /// cancellation before calling: a cancelled export aborts its
+    /// staging instead of finishing it.
     pub(crate) fn fail_streaming_write_with_recovery(
         self,
         staging: RecoveryStaging,

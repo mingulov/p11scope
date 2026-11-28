@@ -20610,14 +20610,14 @@ mod tests {
         );
     }
 
-    /// Owner-ambiguity twin: two pins file the note key (the kept
-    /// fd pin plus a stray same-key pin), so no unique identity owner
-    /// exists and the note keeps its own row. (The stray's proved
-    /// rendering also misses every planned key; see
-    /// `split_note_with_unique_owner_but_key_miss` for the key filter
-    /// in isolation with a unique owner.)
+    /// Key-filter twin: identical opened-file identity (through
+    /// honestly-unknown mount ids) but a maps key that misses the
+    /// proved rendering — the key filter must refuse the join, so the
+    /// note keeps its own row. (The stray's raw steals the fd filing
+    /// in the raw map, so the stray is the unique owner and only the
+    /// key filter stands between it and the join.)
     #[test]
-    fn split_note_with_two_same_key_pins_resolves_to_nothing() {
+    fn split_note_with_identity_but_key_miss_resolves_to_nothing() {
         use super::test_fixture::{SHA, backing_file, overlay, reback, split_prearm_pin};
         use p11scope_manifest::identity::MappingFileKey;
         let fd_key = overlay(41);
@@ -20649,7 +20649,7 @@ mod tests {
         assert_eq!(
             pins.resolve_split_note_target(fd_key, &[scan_id]),
             None,
-            "two pins filing one note key never resolve"
+            "a proved rendering that misses the target key never resolves"
         );
     }
 

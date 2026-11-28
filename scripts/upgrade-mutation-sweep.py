@@ -95,6 +95,17 @@ MUTATIONS = [
         "killer": "UpgradeWorkloadLoopTests.test_child_repeats_digest_during_lifetime",
     },
     {
+        "site": "workload child digest pacing",
+        "file": "scripts/upgrade-softhsm-workload.py",
+        "old": """    for _ in range(count):
+        digest_once(library)
+        time.sleep(interval)""",
+        "new": """    for _ in range(count):
+        digest_once(library)
+        pass""",
+        "killer": "UpgradeWorkloadLoopTests.test_child_repeats_digest_during_lifetime",
+    },
+    {
         "site": "admission caller shortfall refusal",
         "file": "scripts/upgrade-gate6.py",
         "old": "    if shortfall > 0:",

@@ -28,7 +28,8 @@ import time
 CHILD_COUNT = 10
 FIRST_CHILD_DELAY_S = 8.0
 CHILD_INTERVAL_S = 1.2
-CHILD_DIGESTS = 4
+CHILD_DIGESTS = 8
+CHILD_DIGEST_INTERVAL_S = 1.0
 
 CKF_SERIAL_SESSION = 1 << 1
 CKF_RW_SESSION = 1 << 2
@@ -119,10 +120,14 @@ def prepare_token() -> tempfile.TemporaryDirectory:
     return temporary
 
 
-def run_child_digests(library, count=CHILD_DIGESTS, interval=0.5) -> None:
+def run_child_digests(
+    library, count=CHILD_DIGESTS, interval=CHILD_DIGEST_INTERVAL_S
+) -> None:
     """Digest repeatedly across the child lifetime so post-admission calls
-    are observed (a single process-start digest always races admission and
-    stays unmeasured)."""
+    are observed. Admission (custody proof, image settle, route binding)
+    needs several passes: 2s-lived children shed every call as
+    use_before_admission, so children live ~8s with digests spread across
+    it. Still short-lived (3x under the 24s capture) and still folded."""
     for _ in range(count):
         digest_once(library)
         time.sleep(interval)

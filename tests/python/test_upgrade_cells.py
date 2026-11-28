@@ -3209,11 +3209,15 @@ class UpgradeWorkloadLoopTests(unittest.TestCase):
         with (
             mock.patch.object(workload, "prepare_token"),
             mock.patch.object(workload, "open_provider", return_value=FakeLib()),
-            mock.patch("time.sleep"),
+            mock.patch("time.sleep") as slept,
         ):
             self.assertEqual(workload.child("fake.so"), 0)
         self.assertEqual(len(inits), workload.CHILD_DIGESTS)
         self.assertGreaterEqual(workload.CHILD_DIGESTS, 2)
+        self.assertEqual(
+            [call.args for call in slept.call_args_list],
+            [(workload.CHILD_DIGEST_INTERVAL_S,)] * workload.CHILD_DIGESTS,
+        )
 
 
 class UpgradeSweepControlTests(unittest.TestCase):

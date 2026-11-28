@@ -101041,7 +101041,7 @@ fn sleep_spawns_hold_a_guard_or_exemption() {
     // Per-split custody needles: (file, split line, guard statement
     // that must appear within `window` lines below, dangerous ops
     // that must not appear between the split and the guard).
-    // Pure builders (22971, trace:70, wl:1985) construct no `Child`,
+    // Pure builders (22971, trace:104, wl:1985) construct no `Child`,
     // so they carry no needle; their spawn halves do.
     const SPLIT_GUARDS: [(&str, usize, &str, usize, &[&str]); 5] = [
         (

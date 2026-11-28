@@ -380,18 +380,64 @@ def evaluate_b1_delta(old_keys, new_keys, vocabularies) -> dict:
     }
 
 
-def admission_parity(old_count: int, new_count: int) -> tuple:
-    """New build admitted at least half the old caller count.
+def folded_caller_count(document: dict) -> int:
+    """Exact folded-caller aggregate over modules (counts never saturate)."""
+    total = 0
+    for module in document.get("modules", []):
+        departed = (module or {}).get("departed_use") or {}
+        total += departed.get("callers", 0)
+    return total
 
-    The churn workload is deterministic (the official v0.7.1 binary admits
-    11-12 callers every round); a new side under half the old count is the
-    slow-host admission shortfall (product lane v072-slow-host-admission),
-    never timing noise: observed healthy ratios stay >= 1.0, the shortfall
-    sits at 0.18. Returns (ok, detail).
+
+def child_entry_total(document: dict) -> int:
+    """Entries attributed to short-lived callers: live edges except the
+    longest-lived caller (the workload's parent) plus folded entries."""
+    callers = document.get("callers", [])
+    spans = {
+        caller.get("id"): caller.get("last_seen_ns", 0) - caller.get("first_seen_ns", 0)
+        for caller in callers
+    }
+    parent = max(spans, key=lambda cid: spans[cid]) if spans else None
+    total = 0
+    for edge in document.get("edges", []):
+        if edge.get("caller") != parent:
+            total += ((edge.get("entries") or {}).get("count", 0))
+    for module in document.get("modules", []):
+        departed = (module or {}).get("departed_use") or {}
+        total += ((departed.get("entries") or {}).get("count", 0))
+    return total
+
+
+def admission_parity(old: dict, new: dict) -> tuple:
+    """Fold-aware admission parity: every old caller is a new row or folded,
+    and attributed child entries did not drop.
+
+    v0.7.2 folds exited callers into departed_use by design, so the new
+    caller ROW count legitimately trails the old one; what must close
+    exactly is rows + folded (the churn workload spawns a fixed count).
+    A caller in neither is a real shortfall and stays red, naming the
+    missing count. Returns (ok, detail).
     """
-    ok = new_count * 2 >= old_count
-    detail = f"old callers={old_count} new callers={new_count}"
-    return ok, detail
+    old_rows = len(old.get("callers", []))
+    new_rows = len(new.get("callers", []))
+    folded = folded_caller_count(new)
+    shortfall = old_rows - (new_rows + folded)
+    old_entries = child_entry_total(old)
+    new_entries = child_entry_total(new)
+    if shortfall > 0:
+        return False, (
+            f"caller shortfall: old={old_rows} rows={new_rows} "
+            f"folded={folded} missing={shortfall}"
+        )
+    if new_entries < old_entries:
+        return False, (
+            f"entry shortfall: old child entries={old_entries} "
+            f"new child entries={new_entries}"
+        )
+    return True, (
+        f"old={old_rows} rows={new_rows} folded={folded} "
+        f"entries old={old_entries} new={new_entries}"
+    )
 
 
 def key_exists(value, wanted: str) -> bool:
@@ -757,7 +803,7 @@ def run_gate(args, workdir: Path, result: dict) -> int:
 
     # 1b. Admission parity runs before B1: comparing key shapes across an
     # admission-divergent pair is noise; the shortfall gets one signature.
-    parity_ok, parity_detail = admission_parity(len(old["callers"]), len(new["callers"]))
+    parity_ok, parity_detail = admission_parity(old, new)
     check(result, "admission_parity", parity_ok, parity_detail)
 
     # 2. B1: departed_use delta is exactly B1+additive, nothing else, and

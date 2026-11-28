@@ -82,6 +82,25 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def parity_doc(n_callers, child_entries=0, folded_callers=0, folded_entries=0):
+    """Minimal inventory-shaped doc for admission tests: caller c0 is the
+    long-lived parent (span 100, 500 edge entries); c1.. are short-lived
+    children (span 10), the first carrying child_entries; one module whose
+    departed_use holds folded_callers/folded_entries when nonzero."""
+    callers = [{"id": "c0", "first_seen_ns": 0, "last_seen_ns": 100}]
+    edges = [{"caller": "c0", "entries": {"count": 500}}]
+    for index in range(1, n_callers):
+        callers.append({"id": f"c{index}", "first_seen_ns": 0,
+                        "last_seen_ns": 10})
+        edges.append({"caller": f"c{index}", "entries": {
+            "count": child_entries if index == 1 else 0}})
+    departed = ({"callers": folded_callers,
+                 "entries": {"count": folded_entries}}
+                if folded_callers else None)
+    return {"callers": callers, "edges": edges,
+            "modules": [{"departed_use": departed}]}
+
+
 def substantive_inventory(schema="p11scope/inventory/v1"):
     """One small but fully typed inventory document used by typed doubles.
 
@@ -2473,17 +2492,33 @@ class UpgradeGate6PureTests(unittest.TestCase):
         for prefix, labels in committed["v072"].items():
             self.assertEqual(sorted(labels), sorted(committed["v071"][prefix]))
 
-    def test_admission_parity_fails_on_regression_counts(self):
-        ok, detail = self.gate6.admission_parity(11, 2)
-        self.assertFalse(ok)
-        self.assertIn("11", detail)
-        self.assertIn("2", detail)
+    def test_admission_parity_folded_counts_close(self):
+        old = parity_doc(n_callers=11, child_entries=0)
+        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9)
+        ok, detail = self.gate6.admission_parity(old, new)
+        self.assertTrue(ok, detail)
 
-    def test_admission_parity_passes_on_healthy_counts(self):
-        for old_n, new_n in ((11, 11), (11, 12), (12, 11), (2, 2), (1, 1)):
-            with self.subTest(old_n=old_n, new_n=new_n):
-                ok, _ = self.gate6.admission_parity(old_n, new_n)
-                self.assertTrue(ok)
+    def test_admission_parity_shortfall_names_missing(self):
+        old = parity_doc(n_callers=11, child_entries=0)
+        new = parity_doc(n_callers=2, child_entries=0, folded_callers=8)
+        ok, detail = self.gate6.admission_parity(old, new)
+        self.assertFalse(ok)
+        self.assertIn("missing=1", detail)
+
+    def test_admission_parity_entries_shortfall_fails(self):
+        old = parity_doc(n_callers=11, child_entries=10)
+        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
+                         folded_entries=5)
+        ok, detail = self.gate6.admission_parity(old, new)
+        self.assertFalse(ok)
+        self.assertIn("entries", detail)
+
+    def test_admission_parity_entries_up_passes(self):
+        old = parity_doc(n_callers=11, child_entries=0)
+        new = parity_doc(n_callers=2, child_entries=0, folded_callers=9,
+                         folded_entries=64)
+        ok, detail = self.gate6.admission_parity(old, new)
+        self.assertTrue(ok, detail)
 
     def test_b1_vocabularies_loader_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:

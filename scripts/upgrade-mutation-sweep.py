@@ -36,11 +36,25 @@ CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_sc
 
 MUTATIONS = [
     {
-        "site": "admission parity comparison",
+        "site": "admission caller shortfall refusal",
         "file": "scripts/upgrade-gate6.py",
-        "old": "    ok = new_count * 2 >= old_count",
-        "new": "    ok = True",
-        "killer": "UpgradeGate6PureTests.test_admission_parity_fails_on_regression_counts",
+        "old": "    if shortfall > 0:",
+        "new": "    if False:",
+        "killer": "UpgradeGate6PureTests.test_admission_parity_shortfall_names_missing",
+    },
+    {
+        "site": "admission entries shortfall refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    if new_entries < old_entries:",
+        "new": "    if False:",
+        "killer": "UpgradeGate6PureTests.test_admission_parity_entries_shortfall_fails",
+    },
+    {
+        "site": "admission folded caller aggregate",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        total += departed.get(\"callers\", 0)",
+        "new": "        total += 0",
+        "killer": "UpgradeGate6PureTests.test_admission_parity_folded_counts_close",
     },
     {
         "site": "b1 removed-vocab membership check",

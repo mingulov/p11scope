@@ -121,6 +121,12 @@ LEGACY_CELL_INTERMITTENT = frozenset({
 })
 PUBLIC_CLI_RUNNER = "cell:scripts/qualify-public-cli.sh"
 RUN_TREE_RUNNER = "cell:scripts/ci/run-run-tree.sh"
+#: Release-notes draft marker: a version whose notes carry this exact
+#: line (stripped, case-sensitive) is not released, so rows targeting
+#: it stay valid. Any other notes file — including an unreadable one —
+#: counts as a release and expires its rows. The match is deliberately
+#: exact: lookalikes and prose mentions of drafts never qualify.
+RELEASE_DRAFT_MARKER = "Status: draft (not released)"
 # Typed records nest at most this deep. Deeper inputs are refused as
 # too deep instead of crashing recursive validation or comparison.
 MAX_TYPED_DEPTH = 32
@@ -947,6 +953,26 @@ def validate_ignored_known_failing(root, rows):
     return problems
 
 
+def release_is_final(root, target):
+    """Whether ``target`` counts as released for row expiry.
+
+    A version counts as released only when its notes file exists and
+    carries no ``RELEASE_DRAFT_MARKER`` line: draft notes are not a
+    release. A missing file is unreleased (rows stay valid); an
+    unreadable or undecodable file fails closed as released,
+    preserving the pre-marker expiry behavior.
+    """
+    notes = root / "docs/releases" / f"v{target}.md"
+    if not notes.is_file():
+        return False
+    try:
+        text = notes.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return True
+    return all(line.strip() != RELEASE_DRAFT_MARKER
+               for line in text.splitlines())
+
+
 def validate_static(root, list_path, discover_executables=True):
     rows, problems = load_list(list_path)
     registry_present, registry, registry_problems = load_issue_registry(root)
@@ -976,9 +1002,9 @@ def validate_static(root, list_path, discover_executables=True):
         if key in seen_row_keys:
             problems.append(f"duplicate row for {row['runner']} {row['path']} {row['test']}: split composite cells instead")
         seen_row_keys.add(key)
-        if (root / "docs/releases" / f"v{row['target']}.md").is_file():
+        if release_is_final(root, row["target"]):
             problems.append(f"{row['test']}: target {row['target']} already released "
-                            f"(docs/releases/v{row['target']}.md exists): rows expire at their target release")
+                            f"(docs/releases/v{row['target']}.md is final): rows expire at their target release")
         candidate = root / row["path"]
         if not candidate.is_file():
             problems.append(f"{row['path']}: path does not exist for {row['test']}")

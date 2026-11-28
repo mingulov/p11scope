@@ -273,6 +273,54 @@ class StaticValidationTests(unittest.TestCase):
         result = f.run_checker()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_draft_marked_release_notes_keep_rows_valid(self):
+        checker = load_script(CHECKER, "known_failing_checker_draft_marker")
+        self.assertEqual(checker.RELEASE_DRAFT_MARKER, "Status: draft (not released)")
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(target="0.8.0")])
+        target_doc = f.root / "docs/releases/v0.8.0.md"
+        target_doc.parent.mkdir(parents=True, exist_ok=True)
+        target_doc.write_text(
+            "# p11scope v0.8.0 (draft notes)\n\nStatus: draft (not released)\n\n## [Unreleased]\n",
+            encoding="utf-8")
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_same_notes_without_the_marker_expire_rows(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(target="0.8.0")])
+        target_doc = f.root / "docs/releases/v0.8.0.md"
+        target_doc.parent.mkdir(parents=True, exist_ok=True)
+        target_doc.write_text(
+            "# p11scope v0.8.0 (draft notes)\n\n## [Unreleased]\n", encoding="utf-8")
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rows expire at their target release", result.stderr)
+
+    def test_release_notes_lookalikes_still_expire_rows(self):
+        lookalikes = {
+            "wrong_case": "Status: Draft (not released)",
+            "embedded": "Note: Status: draft (not released) for now",
+            "bare_word": "this is a draft",
+            "trailing_period": "Status: draft (not released).",
+        }
+        for label, line in lookalikes.items():
+            with self.subTest(label):
+                f = fixture(self)
+                f.registry()
+                f.python_suite()
+                f.rows([row(target="0.8.0")])
+                target_doc = f.root / "docs/releases/v0.8.0.md"
+                target_doc.parent.mkdir(parents=True, exist_ok=True)
+                target_doc.write_text(f"# p11scope v0.8.0\n\n{line}\n", encoding="utf-8")
+                result = f.run_checker()
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertIn("rows expire at their target release", result.stderr)
+
     def test_signature_cell_must_equal_the_row_cell(self):
         self.assert_bad_row(row(signature={"cell": "OTHER", "branch": "B"}), "signature cell must equal")
 
@@ -4948,7 +4996,7 @@ class MutationSweepTests(unittest.TestCase):
             "runner-vocabulary": ('if not valid_runner(raw["runner"]):', 'if False:'),
             "results-discovery-skip": ('discover_executables=args.results is None', 'discover_executables=True'),
             "generic-branch-refused": ('if isinstance(raw.get("signature"), dict) and type(raw["signature"].get("branch")) is str \\\n            and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:', 'if False:'),
-            "target-release-expiry": ('if (root / "docs/releases" / f"v{row[\'target\']}.md").is_file():', 'if False:'),
+            "target-release-expiry": ('if release_is_final(root, row["target"]):', 'if False:'),
             "bogus-host-refused": ('if not isinstance(host, str) or host not in HOSTS:', 'if False:'),
             "cell-judge-runner": ('if invocation.get("runner") != row["runner"]:', 'if False:'),
             "unparsable-checker-mention": ('if ("check-cell-results.py" in executable_script\n                            or "run-cell-script.sh" in executable_script):', 'if False:'),
@@ -4960,7 +5008,7 @@ class MutationSweepTests(unittest.TestCase):
                                      'data, problems = strict_json(text, str(path))\n    if data is None:\n        return problems'),
             "signature-branch-string": ('if isinstance(raw.get("signature"), dict) and "branch" in raw["signature"] \\\n            and type(raw["signature"].get("branch")) is not str:', 'if False:'),
         }
-        green_to_red = {"results-discovery-skip"}
+        green_to_red = {"results-discovery-skip", "draft-marker-recognized"}
 
         def pass_item(name="Sample.test_control"):
             return {"path": "tests/python/test_sample.py", "test": name,
@@ -5083,6 +5131,16 @@ class MutationSweepTests(unittest.TestCase):
                 target_doc = f.root / "docs/releases/v0.7.3.md"
                 target_doc.parent.mkdir(parents=True, exist_ok=True)
                 target_doc.write_text("# p11scope v0.7.3\n", encoding="utf-8")
+                return None
+            if name == "draft-marker-recognized":
+                f.registry()
+                f.python_suite()
+                f.rows([row(target="0.8.0")])
+                target_doc = f.root / "docs/releases/v0.8.0.md"
+                target_doc.parent.mkdir(parents=True, exist_ok=True)
+                target_doc.write_text(
+                    "# p11scope v0.8.0 (draft notes)\n\nStatus: draft (not released)\n\n## [Unreleased]\n",
+                    encoding="utf-8")
                 return None
             if name == "bogus-host-refused":
                 f.registry()

@@ -2073,7 +2073,9 @@ class WorkflowScanTests(unittest.TestCase):
         checker = load_script(CHECKER, "known_failing_checker_scan_count")
         invocations, problems = checker.workflow_invocations(ROOT)
         self.assertEqual(problems, [])
-        self.assertEqual(len(invocations), 14)
+        # 15: the 14 known-failing-era invocations plus the package-preview
+        # container-image cell (typed with the verify-container-image runner).
+        self.assertEqual(len(invocations), 15)
 
     def test_yaml_workflow_scans_like_yml(self):
         checker = load_script(CHECKER, "known_failing_checker_yaml_pair")

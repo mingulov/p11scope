@@ -153,9 +153,15 @@ class Store:
 
 
 class Validator:
-    def __init__(self, schema, schema_path: Path):
+    def __init__(self, schema, schema_path: Path, strict: bool = False):
         self.store = Store()
         self.schema_path = schema_path.resolve()
+        # Strict mode fails closed: an object whose schema enumerates
+        # known fields (properties/patternProperties) but sets no explicit
+        # additionalProperties allows no undeclared properties. Explicit
+        # additionalProperties and bare combinator/required-only nodes are
+        # respected as written in both modes.
+        self.strict = strict
         self.store.add(self.schema_path, schema)
         self.root_key = self.store._file_key(self.schema_path)
 
@@ -180,6 +186,11 @@ class Validator:
             return
         if not isinstance(schema, dict):
             raise SchemaError(f"schema at {base} is not an object or boolean")
+        for keyword in ("$dynamicRef", "$recursiveRef", "dependentSchemas",
+                        "unevaluatedProperties", "unevaluatedItems",
+                        "contentSchema"):
+            if keyword in schema:
+                raise SchemaError(f"unsupported keyword {keyword!r} at {path}")
 
         ref = schema.get("$ref")
         if isinstance(ref, str):
@@ -255,7 +266,14 @@ class Validator:
                         yield from self._validate(
                             value, subschema, base, base_key, f"{path}.{key}", active
                         )
-        additional = schema.get("additionalProperties", True)
+        # Strict closes the world only where the schema enumerates known
+        # fields (properties/patternProperties). Bare combinators (anyOf and
+        # friends), required-only and propertyNames-only nodes keep the default
+        # open world so shape stays delegated to their own keywords.
+        declares = "properties" in schema or "patternProperties" in schema
+        additional = schema.get(
+            "additionalProperties", False if (self.strict and declares) else True
+        )
         defined = set(properties) if isinstance(properties, dict) else set()
         for key, value in instance.items():
             if key in defined or key in matched:
@@ -457,9 +475,9 @@ class Validator:
                 yield from self._validate(instance, branch, base, base_key, path, active)
 
 
-def validate(instance, schema, schema_path: Path, resources=()) -> list[str]:
+def validate(instance, schema, schema_path: Path, resources=(), strict: bool = False) -> list[str]:
     """Validate *instance* and return deterministic human-readable errors."""
-    validator = Validator(schema, schema_path)
+    validator = Validator(schema, schema_path, strict=strict)
     for resource in resources:
         validator.add_resource(Path(resource))
     return validator.validate(instance)
@@ -472,7 +490,7 @@ def load_schema(path: Path):
         raise SchemaError(f"cannot load schema {path}: {exc}") from exc
 
 
-def validate_file(instance_path: Path, schema_path: Path, resources=()) -> list[str]:
+def validate_file(instance_path: Path, schema_path: Path, resources=(), strict: bool = False) -> list[str]:
     try:
         instance = json.loads(instance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -482,7 +500,7 @@ def validate_file(instance_path: Path, schema_path: Path, resources=()) -> list[
     except SchemaError as exc:
         return [f"$: {exc}"]
     try:
-        return validate(instance, schema, schema_path, resources)
+        return validate(instance, schema, schema_path, resources, strict)
     except SchemaError as exc:
         return [f"$: schema error: {exc}"]
 

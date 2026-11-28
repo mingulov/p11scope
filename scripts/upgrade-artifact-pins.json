@@ -1,0 +1,26 @@
+{
+  "_comment": "Pinned sha256 of every external artifact the upgrade gates consume. Each entry is checked by the named gate immediately before use; a mismatch is a typed refusal, never a silent pass. Two downloads are intentionally absent: the observer tarball (the workflow verifies it against the release SHA256SUMS at download; the extracted binary below is what the gate executes and pins) and the discover helper tarball (unverifiable from here: no local copy, release download hangs; the workflow still SHA256SUMS-checks it).",
+  "artifacts": {
+    "v071-deb": {
+      "file": "p11scope_0.7.1_amd64.deb",
+      "sha256": "f7bf841286c7308fe9b998f04a5158ea2b95c2a5912171d51487208fc5ce74a6",
+      "checked_by": "gate5 verifies --old before install"
+    },
+    "v071-rpm": {
+      "file": "p11scope-0.7.1-1.x86_64.rpm",
+      "sha256": "fac6918c0bb01100d295e71a8cac0c65a6d28b12a1d8041bf8b25b7636ef8fd3",
+      "checked_by": "gate5 verifies --old before install"
+    },
+    "v071-observer-binary": {
+      "extracted_from": "v071-observer-tarball",
+      "path_in_tarball": "p11scope",
+      "sha256": "36a0f57e4ad4d425bdf5cfb4ef5277937beeda3f5f87bf180545d5e7068fa17e",
+      "checked_by": "gate6 verifies --old-binary before capture"
+    },
+    "v071-profile-fixture": {
+      "path": "tests/fixtures/upgrade/v071-observed-profile.json",
+      "sha256": "50d3c8276231131cffb339508007d943663e112d48c48e974b0944adc0db6766",
+      "checked_by": "gate6 verifies fixture bytes before use"
+    }
+  }
+}

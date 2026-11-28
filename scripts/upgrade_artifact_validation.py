@@ -84,14 +84,59 @@ def decimal_string(value) -> bool:
     return isinstance(value, str) and value.isdigit()
 
 
+OBJECT_OBSERVATION_SCHEMA_FILES = {
+    version: (
+        SCHEMA_ROOT / "inventory-v1-object-observations.schema.json"
+        if version == 1
+        else SCHEMA_ROOT / f"inventory-v1-object-observations-v{version}.schema.json"
+    )
+    for version in range(1, 10)
+}
+
+
 def product_schema_errors(document, schema_file: Path, artifact: str) -> list[str]:
-    """Validate one artifact against the product schema, with offline references."""
+    """Validate one artifact against the product schema in strict mode.
+
+    Strict fails closed: the artifact must carry the exact schema id the
+    schema requires and no undeclared fields. Anything else is a typed
+    refusal, never a silent pass.
+    """
     try:
         schema = json_schema.load_schema(schema_file)
-        errors = json_schema.validate(document, schema, schema_file)
+        errors = json_schema.validate(document, schema, schema_file, strict=True)
     except (json_schema.SchemaError, OSError, ValueError) as exc:
         return [f"{artifact} schema validation unavailable: {exc}"]
     return [f"{artifact} schema: {error}" for error in errors]
+
+
+def object_observations_schema_errors(section) -> list[str]:
+    """Validate an object_observations section against its versioned schema."""
+    if not isinstance(section, dict):
+        return ["inventory object_observations section is not an object"]
+    version = section.get("version")
+    if not is_int(version) or version not in OBJECT_OBSERVATION_SCHEMA_FILES:
+        return [
+            "refused: inventory object_observations version "
+            f"{version!r} has no shipped product schema"
+        ]
+    return product_schema_errors(
+        section, OBJECT_OBSERVATION_SCHEMA_FILES[version], "inventory object_observations"
+    )
+
+
+CBOM_FORMAT = "CycloneDX"
+CBOM_SPEC_VERSION = "1.6"
+
+
+def cbom_format_errors(document) -> list[str]:
+    """Exact format/version refusal: the CycloneDX schema allows other
+    spec versions, but this gate only accepts the shipped 1.6 contract."""
+    errors = []
+    if document.get("bomFormat") != CBOM_FORMAT:
+        errors.append(f"refused: cbom bomFormat {document.get('bomFormat')!r} is not 'CycloneDX'")
+    if document.get("specVersion") != CBOM_SPEC_VERSION:
+        errors.append(f"refused: cbom specVersion {document.get('specVersion')!r} is not '1.6'")
+    return errors
 
 
 def inventory_positive_errors(document) -> list[str]:
@@ -154,23 +199,173 @@ def cbom_positive_errors(document, profile_input: bool = False) -> list[str]:
     return errors
 
 
-def diff_positive_errors(document) -> list[str]:
-    """The diff positive rule: at least one compared caller row on each side."""
+def _snapshot_evidence(document, side):
+    snapshot = document.get(side) if isinstance(document, dict) else None
+    if not isinstance(snapshot, dict):
+        return None
+    evidence = snapshot.get("evidence")
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _check_ref_list(errors, refs, pool, owner, pool_kind, side) -> None:
+    if not isinstance(refs, list) or pool is None:
+        return
+    for ref in refs:
+        if not is_int(ref) or ref < 0 or ref >= len(pool):
+            errors.append(
+                f"diff {owner} reference {ref!r} does not resolve "
+                f"within the {side} {pool_kind} pool"
+            )
+
+
+def diff_reference_errors(document) -> list[str]:
+    """Every projection and population reference resolves inside its pools."""
     errors: list[str] = []
+    if not isinstance(document, dict):
+        return errors
+    pools = {}
     for side in ("before", "after"):
-        snapshot = document.get(side) if isinstance(document, dict) else None
-        evidence = snapshot.get("evidence") if isinstance(snapshot, dict) else None
-        occurrences = evidence.get("caller_occurrences") if isinstance(evidence, dict) else None
+        evidence = _snapshot_evidence(document, side)
+        if evidence is None:
+            continue
+        pools[side] = {}
+        for kind in ("callers", "modules", "edges"):
+            rows = evidence.get(kind)
+            pools[side][kind] = rows if isinstance(rows, list) else None
+    comparison = document.get("comparison")
+    paths = comparison.get("application_paths") if isinstance(comparison, dict) else None
+    if not isinstance(paths, list):
+        paths = None
+    for owner in ("application_changes", "module_contents"):
+        rows = document.get(owner)
+        if not isinstance(rows, list):
+            continue
+        edge_pool = "edges" if owner == "application_changes" else "modules"
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            for key, side in (("before", "before"), ("after", "after")):
+                pool = (pools.get(side) or {}).get(edge_pool)
+                _check_ref_list(errors, row.get(key), pool,
+                                f"{owner}[{index}].{key}", edge_pool, side)
+            if owner == "application_changes":
+                for key, side in (("before_population", "before"),
+                                  ("after_population", "after")):
+                    population = row.get(key)
+                    if not isinstance(population, dict):
+                        continue
+                    for kind in ("callers", "modules"):
+                        pool = (pools.get(side) or {}).get(kind)
+                        _check_ref_list(errors, population.get(kind), pool,
+                                        f"{owner}[{index}].{key}.{kind}",
+                                        kind, side)
+                key = row.get("key")
+                if isinstance(key, dict) and paths is not None:
+                    ref = key.get("exe_path_ref")
+                    if not is_int(ref) or ref < 0 or ref >= len(paths):
+                        errors.append(
+                            f"diff application_changes[{index}].key.exe_path_ref "
+                            f"{ref!r} does not resolve to a compared application path"
+                        )
+    return errors
+
+
+def _sorted_ints(value) -> bool:
+    return isinstance(value, list) and all(is_int(row) for row in value)
+
+
+def _sorted_strings(value) -> bool:
+    return isinstance(value, list) and all(isinstance(row, str) for row in value)
+
+
+def diff_ordering_errors(document) -> list[str]:
+    """Contractual ordering: sorted occurrences, references, paths, changes."""
+    errors: list[str] = []
+    if not isinstance(document, dict):
+        return errors
+    for side in ("before", "after"):
+        evidence = _snapshot_evidence(document, side)
+        if evidence is None:
+            continue
+        for pool in ("caller_occurrences", "module_occurrences", "edge_occurrences"):
+            rows = evidence.get(pool)
+            if _sorted_ints(rows) and rows != sorted(rows):
+                errors.append(f"diff {side}.evidence.{pool} is not sorted")
+    comparison = document.get("comparison")
+    paths = comparison.get("application_paths") if isinstance(comparison, dict) else None
+    if _sorted_strings(paths) and paths != sorted(paths):
+        errors.append("diff comparison.application_paths is not sorted")
+    for owner in ("application_changes", "module_contents"):
+        rows = document.get(owner)
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            for key in ("before", "after"):
+                refs = row.get(key)
+                if _sorted_ints(refs) and refs != sorted(refs):
+                    errors.append(f"diff {owner}[{index}].{key} references are not sorted")
+            changes = row.get("changes")
+            if _sorted_strings(changes) and changes != sorted(changes):
+                errors.append(f"diff {owner}[{index}].changes are not sorted")
+            for key in ("before_population", "after_population"):
+                population = row.get(key)
+                if not isinstance(population, dict):
+                    continue
+                for kind in ("callers", "modules"):
+                    refs = population.get(kind)
+                    if _sorted_ints(refs) and refs != sorted(refs):
+                        errors.append(
+                            f"diff {owner}[{index}].{key}.{kind} references are not sorted"
+                        )
+    return errors
+
+
+def diff_positive_errors(document) -> list[str]:
+    """Compared-group evidence backed by resolving rows, plus populated pools.
+
+    The compared proof reads the typed comparison accounting (nonzero
+    compared groups with at least one projection row backed on both sides),
+    never the occurrence pools alone: occurrences count source rows, including
+    unresolved ones, so they cannot prove a comparison happened. The per-side
+    occurrence clauses remain as shape/cardinality checks.
+    """
+    errors: list[str] = []
+    summary = document.get("summary") if isinstance(document, dict) else None
+    compared = summary.get("application_groups_compared") if isinstance(summary, dict) else None
+    if not is_int(compared) or compared < 1:
+        errors.append("diff positive payload: fewer than one compared application group")
+    backed = False
+    if isinstance(document, dict):
+        for owner in ("application_changes", "module_contents"):
+            rows = document.get(owner)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                before = row.get("before")
+                after = row.get("after")
+                if isinstance(before, list) and before and isinstance(after, list) and after:
+                    backed = True
+    if not backed:
+        errors.append("diff positive payload: no compared group backed by rows on both sides")
+    for side in ("before", "after"):
+        evidence = _snapshot_evidence(document, side)
+        occurrences = evidence.get("caller_occurrences") if evidence is not None else None
         if not isinstance(occurrences, list) or not occurrences:
-            errors.append(f"diff positive payload: fewer than one compared caller row on {side}")
+            errors.append(f"diff positive payload: fewer than one caller occurrence on {side}")
     return errors
 
 
 def inventory_errors(document) -> list[str]:
-    """Product-schema shape plus the positive payload rule for an inventory."""
+    """Strict product-schema shape, versioned object observations, positive rule."""
     if not isinstance(document, dict):
         return [f"inventory root is {type_name(document)}, expected object"]
     errors = product_schema_errors(document, INVENTORY_SCHEMA_FILE, "inventory")
+    if not errors:
+        errors.extend(object_observations_schema_errors(document.get("object_observations")))
     errors.extend(inventory_positive_errors(document))
     return errors
 
@@ -251,6 +446,9 @@ def cbom_inventory_errors(document, source) -> list[str]:
     """Exact inventory-to-cbom flow-through plus schema shape and positive payload."""
     if not isinstance(document, dict):
         return [f"cbom root is {type_name(document)}, expected object"]
+    format_errors = cbom_format_errors(document)
+    if format_errors:
+        return format_errors
     source_errors = inventory_errors(source)
     if source_errors:
         return [f"inventory source: {error}" for error in source_errors]
@@ -300,6 +498,9 @@ def cbom_profile_errors(document, profile) -> list[str]:
     """Exact profile-to-cbom flow-through plus schema shape and positive payload."""
     if not isinstance(document, dict):
         return [f"cbom root is {type_name(document)}, expected object"]
+    format_errors = cbom_format_errors(document)
+    if format_errors:
+        return format_errors
     if not isinstance(profile, dict):
         return [f"profile source is {type_name(profile)}, expected object"]
     capture = profile.get("capture") if isinstance(profile.get("capture"), dict) else {}
@@ -356,6 +557,18 @@ def diff_source_consistency(snapshot, source, side: str, errors: list[str]) -> N
             f"diff {side}.suppressed_gaps is {snapshot['suppressed_gaps']}, "
             f"expected {source['gaps_suppressed']}"
         )
+    evidence = snapshot.get("evidence") if isinstance(snapshot.get("evidence"), dict) else {}
+    for pool, kind in (("caller_occurrences", "callers"),
+                       ("module_occurrences", "modules"),
+                       ("edge_occurrences", "edges")):
+        occurrences = evidence.get(pool)
+        rows = source.get(kind)
+        if isinstance(occurrences, list) and isinstance(rows, list):
+            if len(occurrences) != len(rows):
+                errors.append(
+                    f"diff {side}.evidence.{pool} has {len(occurrences)} references "
+                    f"for {len(rows)} source {kind}"
+                )
 
 
 def diff_errors(document, before_source=None, after_source=None) -> list[str]:
@@ -367,6 +580,9 @@ def diff_errors(document, before_source=None, after_source=None) -> list[str]:
     diff_source_consistency(document.get("after"), after_source, "after", errors)
     if not errors:
         errors.extend(product_schema_errors(document, DIFF_SCHEMA_FILE, "diff"))
+    if not errors:
+        errors.extend(diff_reference_errors(document))
+        errors.extend(diff_ordering_errors(document))
     errors.extend(diff_positive_errors(document))
     return errors
 

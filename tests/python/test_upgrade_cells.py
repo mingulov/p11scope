@@ -42,6 +42,12 @@ def load_gate6():
     return module
 
 
+def artifact_pin(name):
+    """Read one committed sha256 pin (single source: the manifest file)."""
+    manifest = json.loads((ROOT / "scripts/upgrade-artifact-pins.json").read_text())
+    return manifest["artifacts"][name]["sha256"]
+
+
 def load_artifact_validation():
     spec = importlib.util.spec_from_file_location(
         "upgrade_artifact_validation_under_test",
@@ -67,162 +73,16 @@ def write_executable(path: Path, content: str) -> None:
 
 
 def substantive_inventory(schema="p11scope/inventory/v1"):
-    """One small but fully typed inventory document used by typed doubles."""
-    return {
-        "schema": schema,
-        "scope": "system",
-        "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
-        "observation": {
-            "started_ns": 100,
-            "ended_ns": 200,
-            "passes": 1,
-            "usage_feed": False,
-            "semantic_capture": {},
-            "native_witnesses": {
-                "rows": 0,
-                "bound": 0,
-                "unbound": 0,
-                "pending": 0,
-                "integrity": 0,
-                "unbound_reasons": {},
-                "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
-            },
-        },
-        "pid_namespace": {"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
-        "budgets": {
-            "callers": {"limit": 4096, "occupied": 1, "refused": 0},
-            "modules": {"limit": 4096, "occupied": 1, "refused": 0},
-            "edges": {"limit": 32768, "occupied": 1, "refused": 0},
-            "instances": {"limit": 4096, "occupied": 0, "refused": 0},
-            "endpoints": {"limit": 1048576, "occupied": 1, "refused": 0},
-            "inventory_endpoints": {"limit": 32768, "occupied": 1, "refused": 0},
-            "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
-            "counters": {
-                "cap": 18446744073709551615,
-                "observed_edges": 1,
-                "saturated_edges": 0,
-            },
-            "semantic_state": {
-                "limit": 32768,
-                "occupied": 0,
-                "status": "withheld",
-                "unknown_edges": 1,
-                "refused": 0,
-            },
-            "retained_history": {"limit": 8192, "retained": 1, "suppressed": 0},
-            "native_preadmission": None,
-        },
-        "callers": [
-            {
-                "id": "c0",
-                "pid": 4242,
-                "start_time": 987654,
-                "start_time_unit": "clock_ticks_since_boot",
-                "incarnation": 0,
-                "image": {
-                    "authority": "scan_pinned",
-                    "task_cookie": None,
-                    "exec_id": None,
-                    "exe": {
-                        "dev": 8,
-                        "ino": 12345,
-                        "mtime_secs": 1700000000,
-                        "mtime_nanos": 0,
-                        "path": "/driver",
-                    },
-                    "exec_observed": True,
-                },
-                "lifecycle": "mapped",
-                "lifecycle_reason": None,
-                "first_seen_ns": 110,
-                "last_seen_ns": 190,
-                "retired": False,
-            }
-        ],
-        "modules": [
-            {
-                "id": "m0",
-                "paths": ["/provider.so"],
-                "identity": {
-                    "device": {"major": 8, "minor": 1},
-                    "inode": 23456,
-                    "sha256": "a" * 64,
-                    "build_id": None,
-                    "source": "mountinfo",
-                },
-                "admission": {
-                    "state": "admitted",
-                    "class": "exact",
-                    "endpoints": 1,
-                    "reasons": [],
-                    "note": "scan-only admission: manifest corroboration was not consulted",
-                    "history": [],
-                },
-                "lifecycle": "mapped",
-                "unloaded_observed": False,
-                "unbound_use": None,
-            }
-        ],
-        "edges": [
-            {
-                "caller": "c0",
-                "module": "m0",
-                "mapping": {
-                    "state": "mapped",
-                    "evidence": "deep_scan",
-                    "reason": None,
-                    "first_seen_ns": 110,
-                    "last_seen_ns": 190,
-                    "interruptions": 0,
-                },
-                "entries": {
-                    "count": 0,
-                    "saturated": False,
-                    "cap": 18446744073709551615,
-                    "first_seen_ns": None,
-                    "last_seen_ns": None,
-                    "in_flight": False,
-                    "observation": "unknown (usage observation unavailable)",
-                    "coverage": {
-                        "state": "unknown",
-                        "since_ns": None,
-                        "until_ns": None,
-                        "first_ns": None,
-                        "lossy": None,
-                        "reason": "scan_only",
-                        "detail": None,
-                    },
-                },
-                "semantics": "unknown (semantic capture withheld)",
-                "mechanisms": None,
-                "operations": None,
-            }
-        ],
-        "object_observations": {
-            "version": 1,
-            "revision": 1,
-            "status": "unavailable",
-            "reason": "journal_unavailable",
-            "budgets": {},
-            "gaps": {"rows": [], "suppressed": 0},
-            "key_operations": [],
-            "objects": [],
-            "sessions": [],
-            "unknown_key_operations": [],
-        },
-        "gaps": [
-            {
-                "caller": None,
-                "module": None,
-                "pid": None,
-                "subject": "exact image authority unavailable",
-                "reason": "no BPF image identity; scan-lane incarnation pinning",
-                "budget": None,
-                "repeats": 1,
-            }
-        ],
-        "gaps_suppressed": 0,
-    }
+    """One small but fully typed inventory document used by typed doubles.
+
+    The body lives in tests/fixtures/upgrade/valid-inventory.json so the
+    gate5 simulation mock (a separate script) consumes the identical bytes.
+    """
+    document = json.loads(
+        (ROOT / "tests/fixtures/upgrade/valid-inventory.json").read_text()
+    )
+    document["schema"] = schema
+    return document
 
 
 def inventory_cbom_properties(document):
@@ -264,7 +124,117 @@ def inventory_cbom_properties(document):
 
 
 def diff_snapshot(source):
-    """One substantive typed diff snapshot projection for harness documents."""
+    """One substantive typed diff snapshot projection for harness documents.
+
+    Snapshots and evidence pools are projections, not copies: label
+    references become pool indices, coverage moves out of entries, and
+    report-only rows (ids, incarnations, launched_by, initialize,
+    mechanisms/operations details) are dropped, mirroring the producer.
+    """
+    caller_index = {row["id"]: pos for pos, row in enumerate(source["callers"])}
+    module_index = {row["id"]: pos for pos, row in enumerate(source["modules"])}
+    callers = []
+    for row in source["callers"]:
+        callers.append({
+            "pid": row["pid"],
+            "start_time": row["start_time"],
+            "start_time_unit": row["start_time_unit"],
+            "image": {
+                "authority": row["image"]["authority"],
+                "exe": copy.deepcopy(row["image"]["exe"]),
+                "exec_observed": row["image"]["exec_observed"],
+            },
+            "lifecycle": row["lifecycle"],
+            "lifecycle_reason": row.get("lifecycle_reason"),
+            "first_seen_ns": row["first_seen_ns"],
+            "last_seen_ns": row["last_seen_ns"],
+            "retired": row["retired"],
+        })
+    modules = []
+    for row in source["modules"]:
+        # Pool departed rows are flattened aggregates, not copies: counts and
+        # reason maps only. The gate never relates pool aggregates back to
+        # the report fold, so the double carries minimal valid content.
+        departed = row.get("departed_use")
+        pool_departed = None
+        if departed is not None:
+            pool_departed = {
+                "callers": 1,
+                "edges": 1,
+                "entries": {
+                    "count": 0, "counted": 0, "forwarding": 0, "in_flight": 0,
+                    "logical": 0, "lossy": 0, "observation": {},
+                    "pid_exit": 0, "saturated": 0, "unknown": {},
+                    "watched_no_use": 0, "witnessed": 0,
+                },
+                "identities": [],
+                "identities_dropped": 0,
+                "identities_saturated": False,
+                "instances": {
+                    "api_returns": 0, "api_returns_saturated_rows": 0,
+                    "folded": 0, "historical_only_returns": 0,
+                    "loss_reasons": {}, "lossy_rows": 0, "null_reasons": 0,
+                    "observed": 0, "reasons": {}, "retired": 0,
+                    "settled_live": 0, "uncertain": 0,
+                },
+                "mapping": {
+                    "deep_scan": 0, "ended": 0, "interruptions": 0,
+                    "mapped": 0, "maps_match": 0, "reasons": {},
+                    "reasons_overflow": 0, "uncertain": 0,
+                },
+                "mechanisms": [],
+                "mechs_overflow": 0,
+                "mechs_overflow_calls": 0,
+                "mechs_overflow_errors": 0,
+                "operations": None,
+                "semantic_labels": {},
+            }
+        modules.append({
+            "paths": list(row["paths"]),
+            "identity": copy.deepcopy(row["identity"]),
+            "admission": copy.deepcopy(row["admission"]),
+            "lifecycle": row["lifecycle"],
+            "unloaded_observed": row["unloaded_observed"],
+            "unbound_use": copy.deepcopy(row["unbound_use"]),
+            "departed_use": pool_departed,
+        })
+    edges = []
+    for row in source["edges"]:
+        entries = copy.deepcopy(row["entries"])
+        coverage = entries.pop("coverage")
+        edges.append({
+            "caller": caller_index[row["caller"]],
+            "module": module_index[row["module"]],
+            "mapping": copy.deepcopy(row["mapping"]),
+            "entries": entries,
+            "coverage": coverage,
+            "semantics": row["semantics"],
+        })
+    gaps = []
+    for row in source["gaps"]:
+        gaps.append({
+            "caller": None if row["caller"] is None else caller_index[row["caller"]],
+            "module": None if row["module"] is None else module_index[row["module"]],
+            "pid": row["pid"],
+            "subject": row["subject"],
+            "reason": row["reason"],
+            "budget": copy.deepcopy(row["budget"]),
+            "repeats": row["repeats"],
+        })
+    budgets = {
+        key: {
+            subkey: source["budgets"][key][subkey]
+            for subkey in ("limit", "occupied", "refused")
+        }
+        for key in (
+            "callers", "modules", "edges", "endpoints", "inventory_endpoints",
+            "inventory_attach_modules",
+        )
+    }
+    budgets.update({
+        key: copy.deepcopy(source["budgets"][key])
+        for key in ("counters", "semantic_state", "retained_history", "native_preadmission")
+    })
     return {
         "scope": source["scope"],
         "clock": dict(source["clock"]),
@@ -273,28 +243,60 @@ def diff_snapshot(source):
             "ended_ns": source["observation"]["ended_ns"],
             "passes": source["observation"]["passes"],
             "usage_feed": source["observation"]["usage_feed"],
-            "lane": None,
-            "settlement": None,
-            "retirement": None,
-            "attach": None,
-            "lifecycle": None,
+            "lane": "native",
+            "settlement": "unsettled",
+            "retirement": "closed",
+            "attach": {
+                "selection": "auto",
+                "mechanism": "uprobe-multi",
+                "fallback": None,
+                "scope_filter": "bpf-cgroup",
+            },
+            "lifecycle": {
+                "records": 0,
+                "ring_loss": 0,
+                "malformed": 0,
+                "failed_quanta": 0,
+                "recovery_rescans": 0,
+            },
             "native_witnesses": dict(source["observation"]["native_witnesses"]),
         },
         "pid_namespace": dict(source["pid_namespace"]),
         "scope_completeness": "unknown",
         "reported_gaps": len(source["gaps"]),
         "suppressed_gaps": source["gaps_suppressed"],
-        "refusals": {"reported_budget_gaps": 0, "budget_counters": {}},
-        "budgets": dict(source["budgets"]),
-        "loss_evidence": {"lifecycle": None, "native_witnesses": dict(source["observation"]["native_witnesses"])},
-        "gaps": copy.deepcopy(source["gaps"]),
+        "refusals": {
+            "reported_budget_gaps": 0,
+            "budget_counters": {
+                "callers": 0,
+                "edges": 0,
+                "endpoints": 0,
+                "inventory_attach_modules": 0,
+                "inventory_endpoints": 0,
+                "modules": 0,
+                "native_preadmission": 0,
+                "semantic_state": 0,
+            },
+        },
+        "budgets": budgets,
+        "loss_evidence": {
+            "lifecycle": {
+                "records": 0,
+                "ring_loss": 0,
+                "malformed": 0,
+                "failed_quanta": 0,
+                "recovery_rescans": 0,
+            },
+            "native_witnesses": dict(source["observation"]["native_witnesses"]),
+        },
+        "gaps": gaps,
         "evidence": {
-            "callers": copy.deepcopy(source["callers"]),
-            "modules": copy.deepcopy(source["modules"]),
-            "edges": copy.deepcopy(source["edges"]),
-            "caller_occurrences": [0],
-            "module_occurrences": [0],
-            "edge_occurrences": [0],
+            "callers": callers,
+            "modules": modules,
+            "edges": edges,
+            "caller_occurrences": list(range(len(source["callers"]))),
+            "module_occurrences": list(range(len(source["modules"]))),
+            "edge_occurrences": list(range(len(source["edges"]))),
         },
     }
 
@@ -406,122 +408,8 @@ def install_package(package):
         binary.unlink(missing_ok=True)
     else:
         binary.parent.mkdir(parents=True, exist_ok=True)
-        inventory = {
-            "schema": "p11scope/inventory/v1",
-            "scope": "system",
-            "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
-            "observation": {
-                "started_ns": 100,
-                "ended_ns": 200,
-                "passes": 1,
-                "usage_feed": False,
-                "semantic_capture": {},
-                "native_witnesses": {
-                    "rows": 0,
-                    "bound": 0,
-                    "unbound": 0,
-                    "pending": 0,
-                    "integrity": 0,
-                    "unbound_reasons": {},
-                    "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
-                },
-            },
-            "pid_namespace": {"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
-            "budgets": {
-                "callers": {"limit": 4096, "occupied": 1, "refused": 0},
-                "modules": {"limit": 4096, "occupied": 1, "refused": 0},
-                "edges": {"limit": 32768, "occupied": 1, "refused": 0},
-                "instances": {"limit": 4096, "occupied": 0, "refused": 0},
-                "endpoints": {"limit": 1048576, "occupied": 1, "refused": 0},
-                "inventory_endpoints": {"limit": 32768, "occupied": 1, "refused": 0},
-                "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
-                "counters": {"cap": 18446744073709551615, "observed_edges": 1, "saturated_edges": 0},
-                "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
-                "retained_history": {"limit": 8192, "retained": 1, "suppressed": 0},
-                "native_preadmission": None,
-            },
-            "callers": [{
-                "id": "c0",
-                "pid": 4242,
-                "start_time": 987654,
-                "start_time_unit": "clock_ticks_since_boot",
-                "incarnation": 0,
-                "image": {
-                    "authority": "scan_pinned",
-                    "task_cookie": None,
-                    "exec_id": None,
-                    "exe": {"dev": 8, "ino": 12345, "mtime_secs": 1700000000, "mtime_nanos": 0, "path": "/driver"},
-                    "exec_observed": True,
-                },
-                "lifecycle": "mapped",
-                "lifecycle_reason": None,
-                "first_seen_ns": 110,
-                "last_seen_ns": 190,
-                "retired": False,
-            }],
-            "modules": [{
-                "id": "m0",
-                "paths": ["/provider.so"],
-                "identity": {
-                    "device": {"major": 8, "minor": 1},
-                    "inode": 23456,
-                    "sha256": "a" * 64,
-                    "build_id": None,
-                    "source": "mountinfo",
-                },
-                "admission": {
-                    "state": "admitted",
-                    "class": "exact",
-                    "endpoints": 1,
-                    "reasons": [],
-                    "note": "scan-only admission: manifest corroboration was not consulted",
-                    "history": [],
-                },
-                "lifecycle": "mapped",
-                "unloaded_observed": False,
-                "unbound_use": None,
-            }],
-            "edges": [{
-                "caller": "c0",
-                "module": "m0",
-                "mapping": {"state": "mapped", "evidence": "deep_scan", "reason": None, "first_seen_ns": 110, "last_seen_ns": 190, "interruptions": 0},
-                "entries": {
-                    "count": 0,
-                    "saturated": False,
-                    "cap": 18446744073709551615,
-                    "first_seen_ns": None,
-                    "last_seen_ns": None,
-                    "in_flight": False,
-                    "observation": "unknown (usage observation unavailable)",
-                    "coverage": {"state": "unknown", "since_ns": None, "until_ns": None, "first_ns": None, "lossy": None, "reason": "scan_only", "detail": None},
-                },
-                "semantics": "unknown (semantic capture withheld)",
-                "mechanisms": None,
-                "operations": None,
-            }],
-            "object_observations": {
-                "version": 1,
-                "revision": 1,
-                "status": "unavailable",
-                "reason": "journal_unavailable",
-                "budgets": {},
-                "gaps": {"rows": [], "suppressed": 0},
-                "key_operations": [],
-                "objects": [],
-                "sessions": [],
-                "unknown_key_operations": [],
-            },
-            "gaps": [{
-                "caller": None,
-                "module": None,
-                "pid": None,
-                "subject": "exact image authority unavailable",
-                "reason": "no BPF image identity; scan-lane incarnation pinning",
-                "budget": None,
-                "repeats": 1,
-            }],
-            "gaps_suppressed": 0,
-        }
+        fixture = Path(os.environ["SIM_FIXTURE_DIR"]) / "valid-inventory.json"
+        inventory = json.loads(fixture.read_text())
         correct_inventory = json.dumps(inventory, separators=(",", ":"))
         wrong_inventory = json.dumps({**inventory, "schema": "wrong/schema"}, separators=(",", ":"))
         script = """#!/bin/sh
@@ -697,6 +585,12 @@ import sys
 from pathlib import Path
 
 path = sys.argv[1]
+old_pkg = os.environ.get("SIM_OLD_PKG", "")
+if old_pkg and path == old_pkg:
+    tampered = (Path(os.environ["SIM_STATE_DIR"]) / "tamper-old-package").exists()
+    digest = "0" * 64 if tampered else os.environ["SIM_OLD_PIN"]
+    print(digest + "  " + path)
+    raise SystemExit(0)
 state = Path(os.environ["SIM_STATE_DIR"])
 try:
     installed = (state / "installed-version").read_text().strip()
@@ -768,6 +662,9 @@ def run_gate5_simulation(format_name="deb", old_version="0.7.1", new_version="0.
             f"export SIM_RECOVERY_DIR={shlex.quote(str(recovery))}\n"
             f"export SIM_P11SCOPE_BIN={shlex.quote(str(binary))}\n"
             f"export SIM_FAKE_ROOT={shlex.quote(str(fakeroot))}\n"
+            f"export SIM_FIXTURE_DIR={shlex.quote(str(ROOT / 'tests/fixtures/upgrade'))}\n"
+            f"export SIM_OLD_PKG={shlex.quote(str(old))}\n"
+            f"export SIM_OLD_PIN={shlex.quote(artifact_pin(f'v071-{format_name}'))}\n"
             f"export SIM_FORMAT={shlex.quote(format_name)}\n"
             "P11SCOPE_GATE5_SOURCE_ONLY=1\n"
             f". {shlex.quote(str(GATE5))}\n"
@@ -821,7 +718,88 @@ class UpgradeGate6Harness:
             "pair_dropped_rows": 0,
             "pair_prune_overflow": 0,
         }
-        doc["modules"][0]["departed_use"] = {}
+        doc["modules"][0]["departed_use"] = {
+            "callers": 1,
+            "edges": 1,
+            "entries": {
+                "count": 0,
+                "coverage": {
+                    "counted": 0,
+                    "first_min_ns": None,
+                    "lossy": 0,
+                    "pid_exit": 0,
+                    "since_min_ns": None,
+                    "unknown": {},
+                    "until_max_ns": None,
+                    "watched_no_use": 0,
+                    "witnessed": 0,
+                },
+                "first_min_ns": None,
+                "forwarding": 0,
+                "in_flight": 0,
+                "last_max_ns": None,
+                "logical": 0,
+                "observation": {},
+                "saturated": 0,
+            },
+            "first_ns": 100,
+            "folded_instances": [],
+            "folded_instances_dropped": 0,
+            "folded_instances_saturated": False,
+            "identities": [
+                {
+                    "authority": "scan_pinned",
+                    "caller": "c99",
+                    "exe": {
+                        "dev": 8,
+                        "ino": 999,
+                        "mtime_secs": 1700000000,
+                        "mtime_nanos": 0,
+                        "path": "/driver",
+                    },
+                    "exec_observed": True,
+                    "first_seen_ns": 110,
+                    "incarnation": 0,
+                    "last_seen_ns": 190,
+                    "lifecycle": "exited",
+                    "lifecycle_reason": "process exited (pid names no live process)",
+                    "metadata_status": None,
+                    "pid": 4243,
+                    "start_time": 987700,
+                }
+            ],
+            "identities_dropped": 0,
+            "identities_saturated": False,
+            "instances": {
+                "api_returns": 0,
+                "api_returns_saturated_rows": 0,
+                "first_min_ns": None,
+                "folded": 0,
+                "historical_only_returns": 0,
+                "last_max_ns": None,
+                "loss_reasons": {},
+                "lossy_rows": 0,
+                "null_reasons": 0,
+                "observed": 0,
+                "reasons": {},
+                "retired": 0,
+                "settled_live": 0,
+                "uncertain": 0,
+            },
+            "mapping": {
+                "evidence": {"deep_scan": 0, "maps_match": 0},
+                "first_min_ns": 0,
+                "interruptions": 0,
+                "last_max_ns": 0,
+                "reasons": {},
+                "reasons_overflow": 0,
+                "state": {"ended": 0, "mapped": 0, "uncertain": 0},
+            },
+            "mechanisms": None,
+            "mechanisms_overflow": {"calls": 0, "errors": 0, "mechs": 0},
+            "operations": None,
+            "semantics": {"labels": {}},
+        }
         doc["observation"]["semantic_capture"].update(
             {"length_insert_failures": 0, "length_stash_mismatches": 0}
         )
@@ -829,8 +807,10 @@ class UpgradeGate6Harness:
 
     @staticmethod
     def object_schema(live):
+        # Wiring double only (explicitly open): strict shape is proven by
+        # validator-level tests and the live gate on real schemas.
         reasons = ["none"] + ([LIVE_TEST_REASON] if live else [])
-        return {"properties": {"reason": {"enum": reasons}}}
+        return {"properties": {"reason": {"enum": reasons}}, "additionalProperties": True}
 
     @classmethod
     def object_schema_sets(cls, old_live=False, new_live=True):
@@ -842,7 +822,10 @@ class UpgradeGate6Harness:
 
     @staticmethod
     def profile_schemas():
-        old = {"properties": {"evidence": {"required": ["completeness"]}}, "allOf": []}
+        # Wiring doubles only (explicitly open): strict shape is proven by
+        # validator-level tests and the live gate on real schemas.
+        old = {"properties": {"evidence": {"required": ["completeness"]}}, "allOf": [],
+               "additionalProperties": True}
         new = {
             "properties": {
                 "evidence": {
@@ -870,6 +853,7 @@ class UpgradeGate6Harness:
                     }
                 }
             ],
+            "additionalProperties": True,
         }
         return old, new
 
@@ -1083,6 +1067,8 @@ class UpgradeGate6Harness:
         object_new_live=True,
         profile_schema_mutator=None,
         profile_fixture_shape_valid=True,
+        verify_pins=False,
+        tamper_fixture=False,
     ):
         gate6 = self.gate6
         old_doc = copy.deepcopy(old_doc) if old_doc is not None else self.good_old_doc()
@@ -1119,6 +1105,11 @@ class UpgradeGate6Harness:
                 fixture_doc["capture"]["modules"] = []
                 fixture_path = base / "v071-observed-profile.json"
                 fixture_path.write_text(json.dumps(fixture_doc))
+            if tamper_fixture:
+                fixture_path = base / "v071-observed-profile.json"
+                fixture_path.write_text(
+                    gate6.PROFILE_FIXTURE.read_text() + " "
+                )
 
             def fake_run(command, timeout=120, **kwargs):
                 if fault:
@@ -1146,6 +1137,10 @@ class UpgradeGate6Harness:
                 ),
                 mock.patch.object(gate6, "PROFILE_FIXTURE", fixture_path),
             ]
+            if not verify_pins:
+                patches.append(
+                    mock.patch.object(gate6, "verify_artifact_pin", return_value="")
+                )
             with contextlib.ExitStack() as stack:
                 for patcher in patches:
                     stack.enter_context(patcher)
@@ -1441,7 +1436,7 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "old capture sparse",
                 {},
                 {"capture-old-sparse": ""},
-                "old capture report failed typed validation: inventory schema: $: required property 'scope' is missing",
+                "old capture report failed typed validation: inventory schema: $: required property 'budgets' is missing",
             ),
             (
                 "empty recovery hash before",
@@ -1501,7 +1496,7 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 "new capture sparse",
                 {},
                 {"capture-new-sparse": ""},
-                "new capture report failed typed validation: inventory schema: $: required property 'scope' is missing",
+                "new capture report failed typed validation: inventory schema: $: required property 'budgets' is missing",
             ),
             (
                 "empty recovery hash after",
@@ -1557,6 +1552,13 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 {"leftover-file-new": ""},
                 "new uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
             ),
+            (
+                "old package tampered",
+                {},
+                {"tamper-old-package": ""},
+                f"refused: old deb package sha256 mismatch: got {'0' * 64}, "
+                f"want {artifact_pin('v071-deb')}",
+            ),
         ]
         for name, kwargs, controls, expected_reason in scenarios:
             with self.subTest(name=name):
@@ -1601,6 +1603,12 @@ class UpgradeGate5SimulationTests(unittest.TestCase):
                 {"leftover-file-new": ""},
                 "new uninstall left unexpected content: /usr/share/doc/p11scope/STRAY",
             ),
+            (
+                "old package tampered",
+                {"tamper-old-package": ""},
+                f"refused: old rpm package sha256 mismatch: got {'0' * 64}, "
+                f"want {artifact_pin('v071-rpm')}",
+            ),
         ]
         for name, controls, expected_reason in scenarios:
             with self.subTest(name=name):
@@ -1621,7 +1629,7 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
 
     def test_inventory_validator_rejects_schema_only_document_typed_exactly(self):
         errors = self.validation.inventory_errors({"schema": "p11scope/inventory/v1"})
-        self.assertEqual(errors[0], "inventory schema: $: required property 'scope' is missing")
+        self.assertEqual(errors[0], "inventory schema: $: required property 'budgets' is missing")
         self.assertIn("inventory schema: $: required property 'gaps_suppressed' is missing", errors)
 
     def test_inventory_positive_payload_rejects_hollow_typed_rows(self):
@@ -1638,6 +1646,47 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         errors = self.validation.inventory_errors(document)
         self.assertIn("inventory positive payload: fewer than one typed caller-provider edge", errors)
 
+    def test_artifact_pins_manifest_matches_recorded_hashes(self):
+        manifest = json.loads(
+            (ROOT / "scripts/upgrade-artifact-pins.json").read_text()
+        )
+        self.assertEqual(
+            set(manifest["artifacts"]),
+            {"v071-deb", "v071-rpm", "v071-observer-binary", "v071-profile-fixture"},
+        )
+        self.assertEqual(
+            manifest["artifacts"]["v071-deb"]["sha256"],
+            "f7bf841286c7308fe9b998f04a5158ea2b95c2a5912171d51487208fc5ce74a6",
+        )
+        self.assertEqual(
+            manifest["artifacts"]["v071-rpm"]["sha256"],
+            "fac6918c0bb01100d295e71a8cac0c65a6d28b12a1d8041bf8b25b7636ef8fd3",
+        )
+        self.assertEqual(
+            manifest["artifacts"]["v071-observer-binary"]["sha256"],
+            "36a0f57e4ad4d425bdf5cfb4ef5277937beeda3f5f87bf180545d5e7068fa17e",
+        )
+        self.assertEqual(
+            manifest["artifacts"]["v071-profile-fixture"]["sha256"],
+            "50d3c8276231131cffb339508007d943663e112d48c48e974b0944adc0db6766",
+        )
+
+    def test_cbom_exact_format_and_version_refusals(self):
+        source = substantive_inventory()
+        document = UpgradeGate6Harness.cbom(inventory_cbom_properties(source))
+        bad_format = copy.deepcopy(document)
+        bad_format["bomFormat"] = "SPDX"
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_format, source),
+            ["refused: cbom bomFormat 'SPDX' is not 'CycloneDX'"],
+        )
+        bad_version = copy.deepcopy(document)
+        bad_version["specVersion"] = "1.5"
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_version, source),
+            ["refused: cbom specVersion '1.5' is not '1.6'"],
+        )
+
     def test_diff_positive_payload_rejects_hollow_caller_projections(self):
         before = substantive_inventory()
         after = substantive_inventory()
@@ -1646,12 +1695,12 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
             hollow = copy.deepcopy(document)
             hollow[side]["evidence"]["caller_occurrences"] = []
             errors = self.validation.diff_errors(hollow, before, after)
-            self.assertIn(f"diff positive payload: fewer than one compared caller row on {side}", errors)
+            self.assertIn(f"diff positive payload: fewer than one caller occurrence on {side}", errors)
 
     def test_inventory_validator_rejects_each_required_root_field(self):
         schema = json.loads((ROOT / "docs/schema/inventory-v1.schema.json").read_text())
         required = schema["required"]
-        self.assertEqual(len(required), 12)
+        self.assertEqual(len(required), 17)
         for key in required:
             with self.subTest(key=key):
                 document = substantive_inventory()
@@ -1696,7 +1745,7 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
         sparse = {"bomFormat": "CycloneDX", "metadata": {"properties": []}}
         self.assertEqual(
             self.validation.cbom_inventory_errors(sparse, source)[0],
-            "cbom property 'p11scope:source_schema' is None, expected 'p11scope/inventory/v1'",
+            "refused: cbom specVersion None is not '1.6'",
         )
 
     def test_cbom_inventory_validator_rejects_schema_violations(self):
@@ -1775,6 +1824,380 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
             "diff before.observation.started_ns is 101, expected 100",
             self.validation.diff_errors(document, before, after),
         )
+
+    def test_inventory_strict_mode_refuses_extra_wrongid_missing(self):
+        document = substantive_inventory()
+        extra = copy.deepcopy(document)
+        extra["zzz_extra"] = 1
+        self.assertIn(
+            "inventory schema: $: additional property 'zzz_extra' is not allowed",
+            self.validation.inventory_errors(extra),
+        )
+        nested = copy.deepcopy(document)
+        nested["callers"][0]["zzz_extra"] = 1
+        self.assertIn(
+            "inventory schema: $.callers[0]: additional property 'zzz_extra' is not allowed",
+            self.validation.inventory_errors(nested),
+        )
+        wrong_id = copy.deepcopy(document)
+        wrong_id["schema"] = "wrong/schema"
+        self.assertIn(
+            "inventory schema: $.schema: value 'wrong/schema' is not const 'p11scope/inventory/v1'",
+            self.validation.inventory_errors(wrong_id),
+        )
+        missing = copy.deepcopy(document)
+        del missing["callers"][0]["pid"]
+        self.assertIn(
+            "inventory schema: $.callers[0]: required property 'pid' is missing",
+            self.validation.inventory_errors(missing),
+        )
+
+    def test_object_observations_dispatch_refuses_unknown_version(self):
+        self.assertIn(
+            "refused: inventory object_observations version 99 has no shipped product schema",
+            self.validation.object_observations_schema_errors({"version": 99}),
+        )
+        self.assertIn(
+            "refused: inventory object_observations version 'x' has no shipped product schema",
+            self.validation.object_observations_schema_errors({"version": "x"}),
+        )
+
+    def test_inventory_strict_mode_rejects_mistyped_nested_contract_fields(self):
+        document = substantive_inventory()
+        document["callers"][0]["image"]["exe"]["path"] = 42
+        self.assertTrue(self.validation.inventory_errors(document))
+        document = substantive_inventory()
+        document["edges"][0]["entries"]["coverage"] = "x"
+        self.assertTrue(self.validation.inventory_errors(document))
+        document = substantive_inventory()
+        document["object_observations"]["objects"] = ["x"]
+        errors = self.validation.inventory_errors(document)
+        self.assertTrue(errors)
+        self.assertTrue(
+            any("object_observations" in error for error in errors), errors
+        )
+
+    def test_diff_strict_mode_refuses_extra_wrongid_missing(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        document = valid_diff_document(before, after)
+        extra = copy.deepcopy(document)
+        extra["zzz_extra"] = 1
+        self.assertIn(
+            "diff schema: $: additional property 'zzz_extra' is not allowed",
+            self.validation.diff_errors(extra, before, after),
+        )
+        nested = copy.deepcopy(document)
+        nested["before"]["scope_completeness"] = "zzz"
+        self.assertTrue(self.validation.diff_errors(nested, before, after))
+        wrong_id = copy.deepcopy(document)
+        wrong_id["schema"] = "wrong/schema"
+        self.assertIn(
+            "diff schema: $.schema: value 'wrong/schema' is not const 'p11scope/inventory-diff/v1'",
+            self.validation.diff_errors(wrong_id, before, after),
+        )
+        missing = copy.deepcopy(document)
+        del missing["comparison"]
+        self.assertIn(
+            "diff schema: $: required property 'comparison' is missing",
+            self.validation.diff_errors(missing, before, after),
+        )
+
+    def test_diff_references_must_resolve_inside_pools(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        after["scope"] = "cgroup:/other"
+        oob_app = copy.deepcopy(valid_diff_document(before, after))
+        oob_app["application_changes"][0]["before"] = [99]
+        self.assertIn(
+            "diff application_changes[0].before reference 99 does not resolve within the before edges pool",
+            self.validation.diff_errors(oob_app, before, after),
+        )
+        oob_module = copy.deepcopy(valid_diff_document(before, after))
+        oob_module["module_contents"][0]["after"] = [7]
+        self.assertIn(
+            "diff module_contents[0].after reference 7 does not resolve within the after modules pool",
+            self.validation.diff_errors(oob_module, before, after),
+        )
+        oob_pop = copy.deepcopy(valid_diff_document(before, after))
+        oob_pop["application_changes"][0]["before_population"]["callers"] = [5]
+        self.assertIn(
+            "diff application_changes[0].before_population.callers reference 5 "
+            "does not resolve within the before callers pool",
+            self.validation.diff_errors(oob_pop, before, after),
+        )
+        oob_path = copy.deepcopy(valid_diff_document(before, after))
+        oob_path["application_changes"][0]["key"]["exe_path_ref"] = 3
+        self.assertIn(
+            "diff application_changes[0].key.exe_path_ref 3 "
+            "does not resolve to a compared application path",
+            self.validation.diff_errors(oob_path, before, after),
+        )
+
+    def test_diff_ordering_must_hold(self):
+        before = substantive_inventory()
+        second = copy.deepcopy(before["callers"][0])
+        second["id"] = "c1"
+        second["pid"] = 4243
+        before["callers"].append(second)
+        after = substantive_inventory()
+        unsorted_occ = copy.deepcopy(valid_diff_document(before, after))
+        unsorted_occ["before"]["evidence"]["caller_occurrences"] = [1, 0]
+        self.assertIn(
+            "diff before.evidence.caller_occurrences is not sorted",
+            self.validation.diff_errors(unsorted_occ, before, after),
+        )
+        unsorted_refs = copy.deepcopy(valid_diff_document(before, after))
+        unsorted_refs["module_contents"][0]["after"] = [1, 0]
+        self.assertIn(
+            "diff module_contents[0].after references are not sorted",
+            self.validation.diff_errors(unsorted_refs, before, after),
+        )
+        unsorted_paths = copy.deepcopy(valid_diff_document(before, after))
+        unsorted_paths["comparison"]["application_paths"] = ["/b", "/a"]
+        self.assertIn(
+            "diff comparison.application_paths is not sorted",
+            self.validation.diff_errors(unsorted_paths, before, after),
+        )
+        dup_paths = copy.deepcopy(valid_diff_document(before, after))
+        dup_paths["comparison"]["application_paths"] = ["/a", "/a"]
+        self.assertIn(
+            "diff schema: $.comparison.application_paths: item 1 duplicates an earlier item",
+            self.validation.diff_errors(dup_paths, before, after),
+        )
+        unsorted_changes = copy.deepcopy(valid_diff_document(before, after))
+        unsorted_changes["application_changes"][0]["changes"] = ["entries", "caller_population"]
+        self.assertIn(
+            "diff application_changes[0].changes are not sorted",
+            self.validation.diff_errors(unsorted_changes, before, after),
+        )
+        dup_changes = copy.deepcopy(valid_diff_document(before, after))
+        dup_changes["application_changes"][0]["changes"] = ["entries", "entries"]
+        self.assertIn(
+            "diff schema: $.application_changes[0].changes: item 1 duplicates an earlier item",
+            self.validation.diff_errors(dup_changes, before, after),
+        )
+
+    def test_diff_occurrence_cardinality_matches_sources(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        document = valid_diff_document(before, after)
+        document["before"]["evidence"]["caller_occurrences"] = [0, 0]
+        self.assertIn(
+            "diff before.evidence.caller_occurrences has 2 references for 1 source callers",
+            self.validation.diff_errors(document, before, after),
+        )
+
+    def test_diff_compared_group_positive_rule(self):
+        before = substantive_inventory()
+        after = substantive_inventory()
+        unresolved_only = copy.deepcopy(valid_diff_document(before, after))
+        unresolved_only["summary"]["application_groups_compared"] = 0
+        unresolved_only["application_changes"] = []
+        unresolved_only["module_contents"] = []
+        unresolved_only["unresolved"] = [
+            {"side": "before", "kind": "caller", "reasons": ["comparison skipped"]}
+        ]
+        self.assertIn(
+            "diff positive payload: fewer than one compared application group",
+            self.validation.diff_errors(unresolved_only, before, after),
+        )
+        lying = copy.deepcopy(valid_diff_document(before, after))
+        lying["application_changes"] = []
+        lying["module_contents"] = []
+        self.assertIn(
+            "diff positive payload: no compared group backed by rows on both sides",
+            self.validation.diff_errors(lying, before, after),
+        )
+
+    def test_cbom_exact_format_and_version(self):
+        source = substantive_inventory()
+        cbom = UpgradeGate6Harness.cbom(inventory_cbom_properties(source))
+        bad_format = copy.deepcopy(cbom)
+        bad_format["bomFormat"] = "SPDX"
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_format, source),
+            ["refused: cbom bomFormat 'SPDX' is not 'CycloneDX'"],
+        )
+        bad_version = copy.deepcopy(cbom)
+        bad_version["specVersion"] = "1.5"
+        self.assertEqual(
+            self.validation.cbom_inventory_errors(bad_version, source),
+            ["refused: cbom specVersion '1.5' is not '1.6'"],
+        )
+        nested_extra = copy.deepcopy(cbom)
+        nested_extra["components"][0]["zzz_extra"] = 1
+        self.assertIn(
+            "cbom schema: $.components[0]: additional property 'zzz_extra' is not allowed",
+            self.validation.cbom_inventory_errors(nested_extra, source),
+        )
+        missing_ref = copy.deepcopy(cbom)
+        missing_ref["dependencies"] = [{"dependsOn": []}]
+        self.assertTrue(self.validation.cbom_inventory_errors(missing_ref, source))
+
+
+class UpgradeJsonSchemaConformanceTests(unittest.TestCase):
+    """Compact conformance matrix for the stdlib schema evaluator.
+
+    Covers every keyword the shipped schemas use (plus strict mode and the
+    draft-07 $ref-sibling rule). Each row is (name, schema, instance,
+    strict, expect_pass).
+    """
+
+    CASES = [
+        ("type-string-pass", {"type": "string"}, "x", False, True),
+        ("type-string-fail", {"type": "string"}, 1, False, False),
+        ("type-integer-pass", {"type": "integer"}, 3, False, True),
+        ("type-integer-bool-fail", {"type": "integer"}, True, False, False),
+        ("type-boolean-bool-pass", {"type": "boolean"}, False, False, True),
+        ("type-boolean-int-fail", {"type": "boolean"}, 1, False, False),
+        ("type-null-pass", {"type": "null"}, None, False, True),
+        ("type-null-fail", {"type": "null"}, 0, False, False),
+        ("type-object-pass", {"type": "object"}, {"a": 1}, False, True),
+        ("type-array-pass", {"type": "array"}, [1], False, True),
+        ("required-pass", {"required": ["a"]}, {"a": 1, "b": 2}, False, True),
+        ("required-fail", {"required": ["a"]}, {"b": 2}, False, False),
+        ("properties-pass", {"properties": {"a": {"type": "integer"}}}, {"a": 1}, False, True),
+        ("properties-fail", {"properties": {"a": {"type": "integer"}}}, {"a": "x"}, False, False),
+        ("pattern-pass", {"patternProperties": {"^x-": {"type": "integer"}}}, {"x-a": 1}, False, True),
+        ("pattern-fail", {"patternProperties": {"^x-": {"type": "integer"}}}, {"x-a": "s"}, False, False),
+        ("pattern-nomatch", {"patternProperties": {"^x-": {"type": "integer"}}}, {"y": "s"}, False, True),
+        ("additional-true", {"properties": {"a": {}}, "additionalProperties": True}, {"a": 1, "b": 2}, False, True),
+        ("additional-false", {"properties": {"a": {}}, "additionalProperties": False}, {"a": 1, "b": 2}, False, False),
+        ("additional-dict", {"properties": {"a": {}}, "additionalProperties": {"type": "integer"}}, {"a": 1, "b": "x"}, False, False),
+        ("pattern-str-pass", {"pattern": "^[a-f0-9]+$"}, "ab12", False, True),
+        ("pattern-str-fail", {"pattern": "^[a-f0-9]+$"}, "zz", False, False),
+        ("const-pass", {"const": "v1"}, "v1", False, True),
+        ("const-fail", {"const": "v1"}, "v2", False, False),
+        ("const-type-strict", {"const": 1}, True, False, False),
+        ("enum-pass", {"enum": ["a", "b"]}, "b", False, True),
+        ("enum-fail", {"enum": ["a", "b"]}, "c", False, False),
+        ("minimum-pass", {"minimum": 2}, 2, False, True),
+        ("minimum-fail", {"minimum": 2}, 1, False, False),
+        ("maximum-fail", {"maximum": 2}, 3, False, False),
+        ("minLength-fail", {"minLength": 2}, "x", False, False),
+        ("maxLength-fail", {"maxLength": 2}, "xyz", False, False),
+        ("items-pass", {"items": {"type": "integer"}}, [1, 2], False, True),
+        ("items-fail", {"items": {"type": "integer"}}, [1, "x"], False, False),
+        ("prefixItems-pass", {"prefixItems": [{"type": "integer"}]}, [1, "x"], False, True),
+        ("prefixItems-fail", {"prefixItems": [{"type": "integer"}]}, ["x"], False, False),
+        ("additionalItems-fail", {"prefixItems": [{"type": "integer"}], "additionalItems": {"type": "integer"}}, [1, "x"], False, False),
+        ("dependentRequired-pass", {"dependentRequired": {"a": ["b"]}}, {"a": 1, "b": 2}, False, True),
+        ("dependentRequired-fail", {"dependentRequired": {"a": ["b"]}}, {"a": 1}, False, False),
+        ("contains-pass", {"contains": {"type": "integer"}}, ["x", 1], False, True),
+        ("contains-fail", {"contains": {"type": "integer"}}, ["x"], False, False),
+        ("exclusiveMinimum-fail", {"exclusiveMinimum": 2}, 2, False, False),
+        ("multipleOf-fail", {"multipleOf": 2}, 3, False, False),
+        ("uniqueItems-pass", {"uniqueItems": True}, [1, 2], False, True),
+        ("uniqueItems-fail", {"uniqueItems": True}, [1, 1], False, False),
+        ("allOf-pass", {"allOf": [{"type": "integer"}, {"minimum": 2}]}, 3, False, True),
+        ("allOf-fail", {"allOf": [{"type": "integer"}, {"minimum": 2}]}, 1, False, False),
+        ("anyOf-pass", {"anyOf": [{"type": "integer"}, {"type": "string"}]}, "x", False, True),
+        ("anyOf-fail", {"anyOf": [{"type": "integer"}, {"type": "string"}]}, None, False, False),
+        ("oneOf-pass", {"oneOf": [{"type": "integer"}, {"minimum": 5}]}, 3, False, True),
+        ("oneOf-fail", {"oneOf": [{"type": "integer"}, {"minimum": 5}]}, 7, False, False),
+        ("not-pass", {"not": {"type": "string"}}, 1, False, True),
+        ("not-fail", {"not": {"type": "string"}}, "x", False, False),
+        ("if-then-pass", {"if": {"properties": {"k": {"const": 1}}}, "then": {"required": ["v"]}}, {"k": 1, "v": 2}, False, True),
+        ("if-then-fail", {"if": {"properties": {"k": {"const": 1}}}, "then": {"required": ["v"]}}, {"k": 1}, False, False),
+        ("if-nomatch-skip", {"if": {"properties": {"k": {"const": 1}}}, "then": {"required": ["v"]}}, {"k": 2}, False, True),
+        ("if-else-fail", {"if": {"properties": {"k": {"const": 1}}}, "else": {"required": ["v"]}}, {"k": 2}, False, False),
+        ("ref-local", {"$defs": {"x": {"type": "integer"}}, "$ref": "#/$defs/x"}, 4, False, True),
+        ("ref-local-fail", {"$defs": {"x": {"type": "integer"}}, "$ref": "#/$defs/x"}, "x", False, False),
+        ("propertyNames-pass", {"propertyNames": {"enum": ["a"]}}, {"a": 1}, False, True),
+        ("propertyNames-fail", {"propertyNames": {"enum": ["a"]}}, {"b": 1}, False, False),
+        ("format-datetime-pass", {"format": "date-time"}, "2026-01-01T00:00:00Z", False, True),
+        ("format-datetime-fail", {"format": "date-time"}, "not-a-date", False, False),
+        ("format-unknown-ignored", {"format": "idn-email"}, "anything", False, True),
+        ("strict-extra-fail", {"properties": {"a": {}}}, {"a": 1, "b": 2}, True, False),
+        ("strict-extra-pass-nonstrict", {"properties": {"a": {}}}, {"a": 1, "b": 2}, False, True),
+        ("strict-respects-explicit", {"properties": {"a": {}}, "additionalProperties": True}, {"a": 1, "b": 2}, True, True),
+        ("strict-combinator-open", {"anyOf": [{"type": "object"}]}, {"a": 1}, True, True),
+        ("ref-sibling-ignored", {"$ref": "#/$defs/x", "type": "string", "$defs": {"x": {"type": "integer"}}}, 5, False, True),
+    ]
+
+    def test_conformance_matrix(self):
+        validation = load_artifact_validation()
+        validate = validation.json_schema.validate
+        for name, schema, instance, strict, expect_pass in self.CASES:
+            with self.subTest(name=name):
+                errors = validate(instance, schema, Path("conformance.json"), strict=strict)
+                self.assertEqual(errors == [], expect_pass, errors[:1])
+
+    def test_rejects_unsupported_keywords(self):
+        validation = load_artifact_validation()
+        validate = validation.json_schema.validate
+        with self.assertRaises(validation.json_schema.SchemaError):
+            validate({}, {"$dynamicRef": "#x"}, Path("conformance.json"))
+
+
+class UpgradeTagSchemaMatrixTests(unittest.TestCase):
+    """Real tag-vs-HEAD profile matrix (suite-only: needs the git history).
+
+    Deliberately excluded from the mutation-sweep control set, which runs
+    from a plain file copy without .git. The sweep's schema mutants are
+    killed by the validator-level tests above instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate6 = load_gate6()
+        cls.validation = load_artifact_validation()
+
+    def test_fixture_passes_tag_schema(self):
+        old_prof, _ = self.gate6.load_profile_schemas()
+        document = json.loads(self.gate6.PROFILE_FIXTURE.read_text())
+        errors = self.validation.json_schema.validate(
+            document, old_prof,
+            Path("v0.7.1:docs/schema/observed-profile-v3.schema.json"),
+            strict=False,
+        )
+        self.assertEqual(errors, [])
+
+    def test_tag_schema_refuses_wrongid_missing(self):
+        old_prof, _ = self.gate6.load_profile_schemas()
+        validate = self.validation.json_schema.validate
+        tag_path = Path("v0.7.1:docs/schema/observed-profile-v3.schema.json")
+        document = json.loads(self.gate6.PROFILE_FIXTURE.read_text())
+        wrong_id = copy.deepcopy(document)
+        wrong_id["schema"] = "wrong/schema"
+        self.assertTrue(validate(wrong_id, old_prof, tag_path, strict=False))
+        missing = copy.deepcopy(document)
+        del missing["evidence"]
+        self.assertTrue(validate(missing, old_prof, tag_path, strict=False))
+
+    def test_head_schema_expected_failure_shape(self):
+        _, new_prof = self.gate6.load_profile_schemas()
+        document = json.loads(self.gate6.PROFILE_FIXTURE.read_text())
+        errors = self.validation.json_schema.validate(
+            document, new_prof,
+            Path("docs/schema/observed-profile-v3.schema.json"),
+            strict=False,
+        )
+        self.assertEqual(
+            sorted(errors),
+            sorted(
+                f"$.evidence: required property '{name}' is missing"
+                for name in (
+                    "coverage_retired_slots",
+                    "pid_descendant_gaps_admitted",
+                    "member_stop_attached",
+                    "member_stop_unattached",
+                )
+            ),
+        )
+
+    def test_head_schema_refuses_wrongid_missing(self):
+        _, new_prof = self.gate6.load_profile_schemas()
+        validate = self.validation.json_schema.validate
+        head_path = Path("docs/schema/observed-profile-v3.schema.json")
+        document = json.loads(self.gate6.PROFILE_FIXTURE.read_text())
+        wrong_id = copy.deepcopy(document)
+        wrong_id["schema"] = "wrong/schema"
+        self.assertTrue(validate(wrong_id, new_prof, head_path, strict=False))
+        missing = copy.deepcopy(document)
+        del missing["evidence"]
+        self.assertTrue(validate(missing, new_prof, head_path, strict=False))
 
 
 class UpgradeGate6PureTests(unittest.TestCase):
@@ -2104,13 +2527,11 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         missing_b1 = self.harness.good_new_doc()
         del missing_b1["budgets"]["edges"]["folded"]
         unexpected = self.harness.good_new_doc()
-        unexpected["modules"][0]["surprise"] = 1
+        unexpected["modules"][0]["departed_use"]["mapping"]["reasons"]["zzz_new_reason"] = 1
         removed = self.harness.good_new_doc()
-        del removed["callers"][0]["incarnation"]
+        del removed["callers"][0]["app_hint"]
         old_departed = self.harness.good_old_doc()
-        new_departed = self.harness.good_new_doc()
-        old_departed["departed_use"] = {}
-        new_departed["departed_use"] = {}
+        old_departed["modules"][0]["departed_use"] = None
 
         def then_missing(old, new):
             required = new["allOf"][0]["then"]["properties"]["evidence"]["required"]
@@ -2140,7 +2561,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             ("b1_no_removed", {"new_doc": removed}),
             ("b1_all_present", {"new_doc": missing_b1}),
             ("b1_exact", {"new_doc": unexpected}),
-            ("b1_old_absent", {"old_doc": old_departed, "new_doc": new_departed}),
+            ("b1_old_absent", {"old_doc": old_departed}),
             ("b2_old_absent", {"object_old_live": True}),
             ("b2_new_present", {"object_new_live": False}),
             ("b2_reader_accepts", {"fault": "b2-wrong-render"}),
@@ -2163,6 +2584,47 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
             "diff schema: $.schema: value 'other' is not const 'p11scope/inventory-diff/v1'",
             result["checks"]["diff_old_old_zero"]["detail"],
         )
+
+    def test_verify_artifact_pin_match_mismatch_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.bin"
+            path.write_bytes(b"bytes")
+            self.assertEqual(
+                self.gate6.verify_artifact_pin("v071-profile-fixture", path),
+                "refused: artifact 'v071-profile-fixture' sha256 mismatch: got "
+                "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9, "
+                "want 50d3c8276231131cffb339508007d943663e112d48c48e974b0944adc0db6766",
+            )
+            self.assertEqual(
+                self.gate6.verify_artifact_pin(
+                    "v071-profile-fixture", self.gate6.PROFILE_FIXTURE
+                ),
+                "",
+            )
+            self.assertIn(
+                "refused: artifact pin 'no-such-entry' unavailable",
+                self.gate6.verify_artifact_pin("no-such-entry", path),
+            )
+            self.assertIn(
+                "refused: artifact 'v071-profile-fixture' unreadable",
+                self.gate6.verify_artifact_pin(
+                    "v071-profile-fixture", Path(tmp) / "absent.bin"
+                ),
+            )
+
+    def test_inputs_present_refuses_tampered_fixture(self):
+        result = self.assert_gate_failure(
+            "inputs_present", verify_pins=True, tamper_fixture=True
+        )
+        detail = result["checks"]["inputs_present"]["detail"]
+        self.assertIn("refused: artifact 'v071-profile-fixture' sha256 mismatch", detail)
+        self.assertIn("refused: artifact 'v071-observer-binary' sha256 mismatch", detail)
+
+    def test_inputs_present_refuses_unpinned_binary(self):
+        result = self.assert_gate_failure("inputs_present", verify_pins=True)
+        detail = result["checks"]["inputs_present"]["detail"]
+        self.assertIn("refused: artifact 'v071-observer-binary' sha256 mismatch", detail)
+        self.assertNotIn("v071-profile-fixture", detail)
 
     def test_v071_profile_fixture_is_real_old_shaped_and_substantive(self):
         path = ROOT / "tests/fixtures/upgrade/v071-observed-profile.json"
@@ -2253,6 +2715,18 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         self.assertEqual(
             validation.cbom_profile_errors(bad_name, profile),
             ["cbom schema: $.components[0].name: is integer, expected string"],
+        )
+        bad_format = copy.deepcopy(document)
+        bad_format["bomFormat"] = "SPDX"
+        self.assertEqual(
+            validation.cbom_profile_errors(bad_format, profile),
+            ["refused: cbom bomFormat 'SPDX' is not 'CycloneDX'"],
+        )
+        bad_version = copy.deepcopy(document)
+        bad_version["specVersion"] = "1.5"
+        self.assertEqual(
+            validation.cbom_profile_errors(bad_version, profile),
+            ["refused: cbom specVersion '1.5' is not '1.6'"],
         )
 
 

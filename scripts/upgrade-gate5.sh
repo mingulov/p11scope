@@ -380,7 +380,18 @@ EOF
   if [ "$phase" = old ]; then OLD_LEFTOVER_DIRS="$leftovers"; else NEW_LEFTOVER_DIRS="$leftovers"; fi
 }
 
+verify_old_package_pin() {
+  entry="v071-$FORMAT"
+  manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/upgrade-artifact-pins.json" || fail "refused: artifact pin manifest unavailable"
+  want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifacts"][sys.argv[2]]["sha256"])' "$manifest" "$entry" 2>/dev/null)" || fail "refused: artifact pin '$entry' unavailable"
+  [ -n "$want" ] || fail "refused: artifact pin '$entry' unavailable"
+  got="$(sha256sum "$OLD" 2>/dev/null | cut -d' ' -f1)" || fail "refused: old $FORMAT package unreadable"
+  [ -n "$got" ] || fail "refused: old $FORMAT package unreadable"
+  [ "$got" = "$want" ] || fail "refused: old $FORMAT package sha256 mismatch: got $got, want $want"
+}
+
 run_gate_body() {
+  verify_old_package_pin
   OLD_PACKAGE_VERSION="$(package_version "$OLD")" || fail "cannot read old package metadata"
   NEW_PACKAGE_VERSION="$(package_version "$NEW")" || fail "cannot read new package metadata"
   [ -n "$OLD_PACKAGE_VERSION" ] || fail "old package metadata version empty"

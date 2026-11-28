@@ -266,6 +266,10 @@ jobs:
           test "$resolved" = /usr/local/bin/p11scope
           /usr/local/bin/p11scope --version | grep -F '0.7.1'
           /usr/bin/p11scope --version | grep -F '0.7.2'
+          sudo_resolved="$(sudo -n command -v p11scope)"
+          echo "sudo_resolved=$sudo_resolved"
+          sudo -n p11scope --version
+          test "$sudo_resolved" = /usr/local/bin/p11scope
           set +e
           sudo p11scope doctor >"$RUNNER_TEMP/shadow-doctor.txt" 2>&1
           doctor_rc=$?

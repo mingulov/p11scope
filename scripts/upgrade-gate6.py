@@ -44,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -465,6 +466,29 @@ def generate_manifest(helper: Path, module: str, output: Path) -> str:
     return ""
 
 
+PINS_MANIFEST = SCRIPT_DIR / "upgrade-artifact-pins.json"
+
+
+def verify_artifact_pin(name: str, path: Path) -> str:
+    """Check a consumed external artifact against the committed sha256 pins.
+
+    Returns "" on match, else a typed refusal. Missing manifest entries,
+    unreadable files and hash mismatches all refuse (fail closed).
+    """
+    try:
+        manifest = json.loads(PINS_MANIFEST.read_text())
+        want = manifest["artifacts"][name]["sha256"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"refused: artifact pin {name!r} unavailable: {exc}"
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"refused: artifact {name!r} unreadable: {exc}"
+    if digest != want:
+        return f"refused: artifact {name!r} sha256 mismatch: got {digest}, want {want}"
+    return ""
+
+
 def output_owner_arguments(output: Path) -> list[str]:
     """Root handover arguments when the output directory belongs to a user."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -557,14 +581,21 @@ def generate_scan_report(binary: Path, output: Path, module: str) -> str:
 
 
 def run_gate(args, workdir: Path, result: dict) -> int:
+    pin_errors = [
+        verify_artifact_pin("v071-observer-binary", args.old_binary),
+        verify_artifact_pin("v071-profile-fixture", PROFILE_FIXTURE),
+    ]
+    pin_detail = "; ".join(error for error in pin_errors if error)
     check(
         result,
         "inputs_present",
         args.old_binary.is_file()
         and os.access(args.old_binary, os.X_OK)
         and args.new_binary.is_file()
-        and os.access(args.new_binary, os.X_OK),
-        f"old={args.old_binary} new={args.new_binary}",
+        and os.access(args.new_binary, os.X_OK)
+        and not pin_detail,
+        f"old={args.old_binary} new={args.new_binary}"
+        + (f"; {pin_detail}" if pin_detail else ""),
     )
 
     # 1. Generate old + new inventory churn reports from live targets.
@@ -775,15 +806,23 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     # schema file shipped at tag v0.7.1.  Until lane v072-compat-071 lands,
     # validating that same artifact against HEAD is a named expected failure,
     # never a compatibility pass.
-    old_schema_path = workdir / "observed-profile-v3-v071.schema.json"
-    old_schema_path.write_text(json.dumps(old_prof, indent=2, sort_keys=True) + "\n")
+    # The tag schema is read from the tree's own history and validated from
+    # memory; it is never copied to a file. The logical path only anchors
+    # relative $ref resolution (this schema has no external references, so a
+    # future one would fail loudly instead of resolving somewhere stale).
+    old_schema_path = Path("v0.7.1:docs/schema/observed-profile-v3.schema.json")
     new_schema_path = ROOT / "docs/schema/observed-profile-v3.schema.json"
+    # Both profile schemas are legacy loose contracts (partial subschemas
+    # plus lane-gated conditionals): strict would refuse the product's own
+    # output and break if-matching, so the matrix stays non-strict. Strict
+    # fail-closed applies to the current complete schemas (inventory, diff,
+    # CBOM, object observations). The old fixture bytes are pinned by sha256.
     try:
         old_schema_errors = artifact_validation.json_schema.validate(
-            profile_doc, old_prof, old_schema_path
+            profile_doc, old_prof, old_schema_path, strict=False
         )
         head_schema_errors = artifact_validation.json_schema.validate(
-            profile_doc, new_prof, new_schema_path
+            profile_doc, new_prof, new_schema_path, strict=False
         )
     except artifact_validation.json_schema.SchemaError as exc:
         check(result, "b3_schema_matrix", False, f"schema validation error: {exc}")

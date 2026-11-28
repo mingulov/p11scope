@@ -29,6 +29,7 @@ SPDX-License-Identifier = "GPL-3.0-or-later"
 path = [
     "docs/schema/*.schema.json",
     "scripts/ci-test-weights.json",
+    "scripts/upgrade-artifact-pins.json",
     "tests/bpf-verifier-budgets.json",
     "tests/counter-bpf-verifier-budgets.json",
     "tests/ignored-tests.json",

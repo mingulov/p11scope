@@ -3130,6 +3130,31 @@ fn discovery_evidence_refuses_an_exact_note_with_a_divergent_claimant() {
     );
 }
 
+/// Projection exact attach: a learned note under the adopted key
+/// attaches to the planned row even though the scan object carries
+/// no split proof — the exact arm needs no split to cross.
+#[test]
+fn discovery_evidence_attaches_an_exact_note_for_an_unproven_scan_object() {
+    let (engine, scan_id, _, maps_key) = split_terminal_state();
+    let learned = BTreeMap::from([(maps_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1, "the adopted row projects");
+    assert!(
+        evidence.modules[0].first_loaded_by.is_some(),
+        "the exact note attaches without split proof"
+    );
+    assert_eq!(
+        engine.plan.modules[0].object, scan_id,
+        "the test adopts the scan object"
+    );
+}
+
 /// No-data-loss twin: a note for a genuinely different file never
 /// attaches to the planned row.
 #[test]

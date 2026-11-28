@@ -2358,6 +2358,65 @@ pub(crate) struct RecoveryStaging {
     fail_write_with: Option<i32>,
 }
 
+/// One recovery-file candidate name: timestamped in production; a
+/// fixed name under the creation fault (so faulted failure text is
+/// deterministic) or the fixed-name hook (so copy/finish failure
+/// text is deterministic). The fault takes precedence: it never runs
+/// beside the fixed-name hook in one twin.
+fn staging_candidate_name(ext: &str, timestamp: &str, pid: u32, seq: u32) -> String {
+    #[cfg(test)]
+    if test_staging_fail_create().is_some() {
+        return format!("p11scope-test-create-fault.{ext}");
+    }
+    #[cfg(test)]
+    if test_staging_fixed_name() {
+        return format!("p11scope-test-staging.{ext}");
+    }
+    if seq == 0 {
+        format!("p11scope-{timestamp}-{pid}.{ext}")
+    } else {
+        format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
+    }
+}
+
+/// Opens one candidate recovery file (`O_WRONLY|O_CREAT|O_EXCL|
+/// `O_NOFOLLOW`, `0600`). A test creation fault skips the syscall
+/// and fails with the injected errno instead, so faulted failures
+/// execute the same error construction as real ones.
+fn open_candidate_file(dir: &std::fs::File, name: &CString) -> std::io::Result<std::fs::File> {
+    #[cfg(test)]
+    if let Some(errno) = test_staging_fail_create() {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    // SAFETY: the dir fd and the NUL-terminated name outlive the call;
+    // the returned fd is owned below on success.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat succeeded, so the fd is owned.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Opens an `O_PATH` probe of a held recovery dir: a valid fd whose
+/// `fsync` fails EBADF, so sync faults execute the production error
+/// branches. Test-only.
+#[cfg(test)]
+fn o_path_probe(path: &Path) -> std::fs::File {
+    let probe = CString::new(path.as_os_str().as_bytes()).expect("no NUL in recovery path");
+    let fd = unsafe { libc::open(probe.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    assert!(fd >= 0, "an O_PATH probe must open");
+    // SAFETY: open succeeded, so the fd is owned.
+    unsafe { std::fs::File::from_raw_fd(fd) }
+}
+
 impl RecoveryStaging {
     /// Creates an empty private staging file for `dest` (whose
     /// extension names the bounded suffix, `json` when absent) in the
@@ -2380,66 +2439,30 @@ impl RecoveryStaging {
         let timestamp = fallback_timestamp();
         let pid = std::process::id();
         for seq in 0..128u32 {
-            // Test-only creation fault: fail file creation with
-            // `errno` under a fixed candidate name, so the failure
-            // text is deterministic. An `EEXIST` fault collides on
-            // every attempt, pinning the name-exhaustion path.
+            // Test-only creation fault: an `EEXIST` fault collides on
+            // every attempt, pinning the name-exhaustion path without
+            // touching the filesystem. Any other faulted errno is
+            // injected at the open boundary below, so faulted and
+            // real failures share the single error construction.
             #[cfg(test)]
-            if let Some(errno) = test_staging_fail_create() {
-                if errno == libc::EEXIST {
-                    continue;
-                }
-                let name = format!("p11scope-test-create-fault.{ext}");
-                return Err(RecoveryAttemptError::new(
-                    actual.clone(),
-                    format!(
-                        "creating recovery file {name} in {} failed: {}",
-                        actual.display(),
-                        std::io::Error::from_raw_os_error(errno)
-                    ),
-                ));
+            if test_staging_fail_create() == Some(libc::EEXIST) {
+                continue;
             }
-            #[cfg(test)]
-            let fixed = test_staging_fixed_name();
-            #[cfg(not(test))]
-            let fixed = false;
-            let name = if fixed {
-                format!("p11scope-test-staging.{ext}")
-            } else if seq == 0 {
-                format!("p11scope-{timestamp}-{pid}.{ext}")
-            } else {
-                format!("p11scope-{timestamp}-{pid}.{seq}.{ext}")
-            };
+            let name = staging_candidate_name(&ext, &timestamp, pid, seq);
             let c_name = CString::new(name.clone()).expect("generated recovery name has no NUL");
-            // SAFETY: the dir fd and the NUL-terminated name outlive the call;
-            // the returned fd is owned below on success.
-            let fd = unsafe {
-                libc::openat(
-                    dir.as_raw_fd(),
-                    c_name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EEXIST) {
-                    continue;
+            let file = match open_candidate_file(&dir, &c_name) {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(error) => {
+                    return Err(RecoveryAttemptError::new(
+                        actual.clone(),
+                        format!(
+                            "creating recovery file {name} in {} failed: {error}",
+                            actual.display()
+                        ),
+                    ));
                 }
-                return Err(RecoveryAttemptError::new(
-                    actual.clone(),
-                    format!(
-                        "creating recovery file {name} in {} failed: {error}",
-                        actual.display()
-                    ),
-                ));
-            }
-            // SAFETY: openat succeeded, so the fd is owned.
-            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            };
             let path = actual.join(&name);
             #[cfg(test)]
             let fail_write_with = TEST_STAGING_FAIL_WRITE.with(|flag| flag.get());
@@ -2477,6 +2500,25 @@ impl RecoveryStaging {
             .to_str()
             .expect("generated recovery name is UTF-8")
             .to_string();
+        // Test-only sync fault: swap the targeted fd for an `O_PATH`
+        // probe so the real `fsync` below fails (EBADF) through the
+        // production error branch. A swapped dir cannot unlink, so a
+        // held rescue dup does that cleanup instead.
+        #[cfg(test)]
+        let rescue_dir = if test_staging_fail_sync() == Some(StagingSyncFault::Dir) {
+            let rescue = self
+                .dir
+                .try_clone()
+                .expect("a held recovery dir duplicates");
+            self.dir = o_path_probe(&self.actual);
+            Some(rescue)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if test_staging_fail_sync() == Some(StagingSyncFault::File) {
+            self.file = o_path_probe(&self.actual);
+        }
         if let Err(error) = self.file.sync_all() {
             let _ = unlinkat(&self.dir, &self.name);
             self.finished = true;
@@ -2486,7 +2528,11 @@ impl RecoveryStaging {
             ));
         }
         if let Err(error) = self.dir.sync_all() {
-            let _ = unlinkat(&self.dir, &self.name);
+            #[cfg(test)]
+            let unlink_dir = rescue_dir.as_ref().unwrap_or(&self.dir);
+            #[cfg(not(test))]
+            let unlink_dir = &self.dir;
+            let _ = unlinkat(unlink_dir, &self.name);
             self.finished = true;
             return Err(format!(
                 "syncing recovery directory {} failed: {error}",

@@ -106,7 +106,7 @@
               },
               "sha256": {
                 "type": "string",
-                "pattern": "^[a-f0-9]{64}$"
+                "pattern": "^$|^[a-f0-9]{64}$"
               }
             },
             "additionalProperties": false,
@@ -141,8 +141,7 @@
         "application_paths": {
           "type": "array",
           "items": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           },
           "uniqueItems": true
         },
@@ -228,7 +227,7 @@
             "properties": {
               "sha256": {
                 "type": "string",
-                "pattern": "^[a-f0-9]{64}$"
+                "pattern": "^$|^[a-f0-9]{64}$"
               }
             },
             "additionalProperties": false,
@@ -266,7 +265,7 @@
                 "sha256": {
                   "anyOf": [
                     {
-                      "pattern": "^[a-f0-9]{64}$",
+                      "pattern": "^$|^[a-f0-9]{64}$",
                       "type": "string"
                     },
                     {
@@ -287,7 +286,7 @@
                 "sha256": {
                   "anyOf": [
                     {
-                      "pattern": "^[a-f0-9]{64}$",
+                      "pattern": "^$|^[a-f0-9]{64}$",
                       "type": "string"
                     },
                     {
@@ -310,7 +309,6 @@
             "additionalProperties": false,
             "properties": {
               "path": {
-                "minLength": 1,
                 "type": "string"
               }
             },
@@ -536,43 +534,60 @@
               ]
             },
             "inventory_attach_modules": {
-              "type": "object",
-              "properties": {
-                "limit": {
-                  "type": "integer"
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "occupied": {
+                      "type": "integer"
+                    },
+                    "refused": {
+                      "type": "integer"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "limit",
+                    "occupied",
+                    "refused"
+                  ]
                 },
-                "occupied": {
-                  "type": "integer"
-                },
-                "refused": {
-                  "type": "integer"
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "limit",
-                "occupied",
-                "refused"
               ]
             },
             "inventory_endpoints": {
-              "type": "object",
-              "properties": {
-                "limit": {
-                  "type": "integer"
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "occupied": {
+                      "type": "integer"
+                    },
+                    "refused": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "limit",
+                    "occupied",
+                    "refused"
+                  ]
                 },
-                "occupied": {
-                  "type": "integer"
-                },
-                "refused": {
-                  "type": "integer"
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "limit",
-                "occupied",
-                "refused"
               ]
             },
             "modules": {
@@ -822,7 +837,7 @@
                     ]
                   },
                   "start_time_unit": {
-                    "const": "clock_ticks_since_boot"
+                    "type": "string"
                   }
                 },
                 "additionalProperties": false,
@@ -990,9 +1005,16 @@
                     "type": "object",
                     "properties": {
                       "evidence": {
-                        "enum": [
-                          "deep_scan",
-                          "maps_match"
+                        "anyOf": [
+                          {
+                            "enum": [
+                              "deep_scan",
+                              "maps_match"
+                            ]
+                          },
+                          {
+                            "type": "null"
+                          }
                         ]
                       },
                       "first_seen_ns": {
@@ -1243,13 +1265,22 @@
                                   "pattern": "^c[0-9]+$"
                                 },
                                 "exe_dev": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 },
                                 "exe_ino": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 },
                                 "exe_path": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "exec_observed": {
                                   "type": "boolean"
@@ -1261,7 +1292,10 @@
                                   "type": "string"
                                 },
                                 "lifecycle_reason": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "metadata_status": {
                                   "type": [
@@ -1273,7 +1307,10 @@
                                   "type": "integer"
                                 },
                                 "start_time": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 }
                               },
                               "additionalProperties": false,
@@ -1415,7 +1452,62 @@
                           },
                           "mechanisms": {
                             "type": "array",
-                            "items": true
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "mechanism": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "name": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "operations": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "calls": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "errors": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "functions": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "returns": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "truncated": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "additionalProperties": false,
+                              "required": [
+                                "mechanism",
+                                "name",
+                                "operations",
+                                "calls",
+                                "errors",
+                                "functions",
+                                "returns",
+                                "truncated"
+                              ]
+                            }
                           },
                           "mechs_overflow": {
                             "type": "integer"
@@ -1427,7 +1519,120 @@
                             "type": "integer"
                           },
                           "operations": {
-                            "type": "null"
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "calls": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "started": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "completed": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "cancelled": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "failed": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "unknown": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "orphans": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "dropped": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "evidence": {
+                                    "type": "object",
+                                    "patternProperties": {
+                                      "^.*$": {
+                                        "type": "integer",
+                                        "minimum": 0
+                                      }
+                                    },
+                                    "additionalProperties": false
+                                  },
+                                  "settled_machines": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_pending": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_detached": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_open": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_active_overflow": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_active": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "category": {
+                                          "type": "string"
+                                        },
+                                        "state": {
+                                          "type": "string"
+                                        },
+                                        "count": {
+                                          "type": "integer",
+                                          "minimum": 0
+                                        }
+                                      },
+                                      "additionalProperties": false,
+                                      "required": [
+                                        "category",
+                                        "state",
+                                        "count"
+                                      ]
+                                    }
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "required": [
+                                  "calls",
+                                  "cancelled",
+                                  "completed",
+                                  "dropped",
+                                  "evidence",
+                                  "failed",
+                                  "orphans",
+                                  "settled_active",
+                                  "settled_active_overflow",
+                                  "settled_detached",
+                                  "settled_machines",
+                                  "settled_open",
+                                  "settled_pending",
+                                  "started",
+                                  "unknown"
+                                ]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           },
                           "semantic_labels": {
                             "type": "object",
@@ -1562,7 +1767,10 @@
                                   "type": "integer"
                                 },
                                 "exe": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "first_call_ns": {
                                   "type": "integer"
@@ -1684,7 +1892,33 @@
             "type": "object",
             "properties": {
               "budget": {
-                "type": "null"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "resource": {
+                        "type": "string"
+                      },
+                      "limit": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "requested": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "resource",
+                      "limit",
+                      "requested"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "caller": {
                 "type": [
@@ -1730,119 +1964,133 @@
           "type": "object",
           "properties": {
             "lifecycle": {
-              "type": "object",
-              "properties": {
-                "failed_quanta": {
-                  "type": "integer"
-                },
-                "malformed": {
-                  "type": "integer"
-                },
-                "records": {
-                  "type": "integer"
-                },
-                "recovery_rescans": {
-                  "type": "integer"
-                },
-                "ring_loss": {
-                  "type": "integer"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "failed_quanta",
-                "malformed",
-                "records",
-                "recovery_rescans",
-                "ring_loss"
-              ]
-            },
-            "native_witnesses": {
-              "type": "object",
-              "properties": {
-                "bound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "identity_budget_exhausted": {
-                  "type": "boolean"
-                },
-                "identity_unavailable": {
-                  "type": "integer"
-                },
-                "integrity": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "pending": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "placement": {
+              "anyOf": [
+                {
                   "type": "object",
                   "properties": {
-                    "ambiguous": {
-                      "type": "integer",
-                      "minimum": 0
+                    "failed_quanta": {
+                      "type": "integer"
                     },
-                    "edge": {
-                      "type": "integer",
-                      "minimum": 0
+                    "malformed": {
+                      "type": "integer"
                     },
-                    "module": {
-                      "type": "integer",
-                      "minimum": 0
+                    "records": {
+                      "type": "integer"
                     },
-                    "unresolved": {
-                      "type": "integer",
-                      "minimum": 0
+                    "recovery_rescans": {
+                      "type": "integer"
+                    },
+                    "ring_loss": {
+                      "type": "integer"
                     }
                   },
                   "additionalProperties": false,
                   "required": [
-                    "ambiguous",
-                    "edge",
-                    "module",
-                    "unresolved"
+                    "failed_quanta",
+                    "malformed",
+                    "records",
+                    "recovery_rescans",
+                    "ring_loss"
                   ]
                 },
-                "rows": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound_images": {
-                  "type": "integer"
-                },
-                "unbound_images_saturated": {
-                  "type": "boolean"
-                },
-                "unbound_reasons": {
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "native_witnesses": {
+              "anyOf": [
+                {
                   "type": "object",
-                  "patternProperties": {
-                    "^.*$": {
+                  "properties": {
+                    "bound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "identity_budget_exhausted": {
+                      "type": "boolean"
+                    },
+                    "identity_unavailable": {
                       "type": "integer"
+                    },
+                    "integrity": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "pending": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "placement": {
+                      "type": "object",
+                      "properties": {
+                        "ambiguous": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "edge": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "module": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "unresolved": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "ambiguous",
+                        "edge",
+                        "module",
+                        "unresolved"
+                      ]
+                    },
+                    "rows": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound_images": {
+                      "type": "integer"
+                    },
+                    "unbound_images_saturated": {
+                      "type": "boolean"
+                    },
+                    "unbound_reasons": {
+                      "type": "object",
+                      "patternProperties": {
+                        "^.*$": {
+                          "type": "integer"
+                        }
+                      },
+                      "additionalProperties": false
                     }
                   },
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "required": [
+                    "bound",
+                    "identity_budget_exhausted",
+                    "identity_unavailable",
+                    "integrity",
+                    "pending",
+                    "placement",
+                    "rows",
+                    "unbound",
+                    "unbound_images",
+                    "unbound_images_saturated",
+                    "unbound_reasons"
+                  ]
+                },
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "bound",
-                "identity_budget_exhausted",
-                "identity_unavailable",
-                "integrity",
-                "pending",
-                "placement",
-                "rows",
-                "unbound",
-                "unbound_images",
-                "unbound_images_saturated",
-                "unbound_reasons"
               ]
             }
           },
@@ -1856,159 +2104,195 @@
           "type": "object",
           "properties": {
             "attach": {
-              "type": "object",
-              "properties": {
-                "fallback": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "fallback": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mechanism": {
+                      "type": "string"
+                    },
+                    "scope_filter": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "selection": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "fallback",
+                    "mechanism",
+                    "scope_filter",
+                    "selection"
+                  ]
+                },
+                {
                   "type": "null"
-                },
-                "mechanism": {
-                  "type": "string"
-                },
-                "scope_filter": {
-                  "type": "string"
-                },
-                "selection": {
-                  "type": "string"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "fallback",
-                "mechanism",
-                "scope_filter",
-                "selection"
               ]
             },
             "ended_ns": {
               "type": "integer"
             },
             "lane": {
-              "type": "string"
-            },
-            "lifecycle": {
-              "type": "object",
-              "properties": {
-                "failed_quanta": {
-                  "type": "integer"
-                },
-                "malformed": {
-                  "type": "integer"
-                },
-                "records": {
-                  "type": "integer"
-                },
-                "recovery_rescans": {
-                  "type": "integer"
-                },
-                "ring_loss": {
-                  "type": "integer"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "failed_quanta",
-                "malformed",
-                "records",
-                "recovery_rescans",
-                "ring_loss"
+              "type": [
+                "string",
+                "null"
               ]
             },
-            "native_witnesses": {
-              "type": "object",
-              "properties": {
-                "bound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "identity_budget_exhausted": {
-                  "type": "boolean"
-                },
-                "identity_unavailable": {
-                  "type": "integer"
-                },
-                "integrity": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "pending": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "placement": {
+            "lifecycle": {
+              "anyOf": [
+                {
                   "type": "object",
                   "properties": {
-                    "ambiguous": {
-                      "type": "integer",
-                      "minimum": 0
+                    "failed_quanta": {
+                      "type": "integer"
                     },
-                    "edge": {
-                      "type": "integer",
-                      "minimum": 0
+                    "malformed": {
+                      "type": "integer"
                     },
-                    "module": {
-                      "type": "integer",
-                      "minimum": 0
+                    "records": {
+                      "type": "integer"
                     },
-                    "unresolved": {
-                      "type": "integer",
-                      "minimum": 0
+                    "recovery_rescans": {
+                      "type": "integer"
+                    },
+                    "ring_loss": {
+                      "type": "integer"
                     }
                   },
                   "additionalProperties": false,
                   "required": [
-                    "ambiguous",
-                    "edge",
-                    "module",
-                    "unresolved"
+                    "failed_quanta",
+                    "malformed",
+                    "records",
+                    "recovery_rescans",
+                    "ring_loss"
                   ]
                 },
-                "rows": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound_images": {
-                  "type": "integer"
-                },
-                "unbound_images_saturated": {
-                  "type": "boolean"
-                },
-                "unbound_reasons": {
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "native_witnesses": {
+              "anyOf": [
+                {
                   "type": "object",
-                  "patternProperties": {
-                    "^.*$": {
+                  "properties": {
+                    "bound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "identity_budget_exhausted": {
+                      "type": "boolean"
+                    },
+                    "identity_unavailable": {
                       "type": "integer"
+                    },
+                    "integrity": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "pending": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "placement": {
+                      "type": "object",
+                      "properties": {
+                        "ambiguous": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "edge": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "module": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "unresolved": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "ambiguous",
+                        "edge",
+                        "module",
+                        "unresolved"
+                      ]
+                    },
+                    "rows": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound_images": {
+                      "type": "integer"
+                    },
+                    "unbound_images_saturated": {
+                      "type": "boolean"
+                    },
+                    "unbound_reasons": {
+                      "type": "object",
+                      "patternProperties": {
+                        "^.*$": {
+                          "type": "integer"
+                        }
+                      },
+                      "additionalProperties": false
                     }
                   },
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "required": [
+                    "bound",
+                    "identity_budget_exhausted",
+                    "identity_unavailable",
+                    "integrity",
+                    "pending",
+                    "placement",
+                    "rows",
+                    "unbound",
+                    "unbound_images",
+                    "unbound_images_saturated",
+                    "unbound_reasons"
+                  ]
+                },
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "bound",
-                "identity_budget_exhausted",
-                "identity_unavailable",
-                "integrity",
-                "pending",
-                "placement",
-                "rows",
-                "unbound",
-                "unbound_images",
-                "unbound_images_saturated",
-                "unbound_reasons"
               ]
             },
             "passes": {
               "type": "integer"
             },
             "retirement": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "settlement": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "started_ns": {
               "type": "integer"
@@ -2032,23 +2316,30 @@
           ]
         },
         "pid_namespace": {
-          "type": "object",
-          "properties": {
-            "kernel_pids": {
-              "type": "string"
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kernel_pids": {
+                  "type": "string"
+                },
+                "observer": {
+                  "type": "string"
+                },
+                "proc_pids": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "kernel_pids",
+                "observer",
+                "proc_pids"
+              ]
             },
-            "observer": {
-              "type": "string"
-            },
-            "proc_pids": {
-              "type": "string"
+            {
+              "type": "null"
             }
-          },
-          "additionalProperties": false,
-          "required": [
-            "kernel_pids",
-            "observer",
-            "proc_pids"
           ]
         },
         "refusals": {
@@ -2058,28 +2349,52 @@
               "type": "object",
               "properties": {
                 "callers": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "edges": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "endpoints": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "inventory_attach_modules": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "inventory_endpoints": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "modules": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "native_preadmission": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "semantic_state": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               },
               "additionalProperties": false,
@@ -2220,43 +2535,60 @@
               ]
             },
             "inventory_attach_modules": {
-              "type": "object",
-              "properties": {
-                "limit": {
-                  "type": "integer"
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "occupied": {
+                      "type": "integer"
+                    },
+                    "refused": {
+                      "type": "integer"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "limit",
+                    "occupied",
+                    "refused"
+                  ]
                 },
-                "occupied": {
-                  "type": "integer"
-                },
-                "refused": {
-                  "type": "integer"
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "limit",
-                "occupied",
-                "refused"
               ]
             },
             "inventory_endpoints": {
-              "type": "object",
-              "properties": {
-                "limit": {
-                  "type": "integer"
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "occupied": {
+                      "type": "integer"
+                    },
+                    "refused": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "limit",
+                    "occupied",
+                    "refused"
+                  ]
                 },
-                "occupied": {
-                  "type": "integer"
-                },
-                "refused": {
-                  "type": "integer"
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "limit",
-                "occupied",
-                "refused"
               ]
             },
             "modules": {
@@ -2506,7 +2838,7 @@
                     ]
                   },
                   "start_time_unit": {
-                    "const": "clock_ticks_since_boot"
+                    "type": "string"
                   }
                 },
                 "additionalProperties": false,
@@ -2674,9 +3006,16 @@
                     "type": "object",
                     "properties": {
                       "evidence": {
-                        "enum": [
-                          "deep_scan",
-                          "maps_match"
+                        "anyOf": [
+                          {
+                            "enum": [
+                              "deep_scan",
+                              "maps_match"
+                            ]
+                          },
+                          {
+                            "type": "null"
+                          }
                         ]
                       },
                       "first_seen_ns": {
@@ -2927,13 +3266,22 @@
                                   "pattern": "^c[0-9]+$"
                                 },
                                 "exe_dev": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 },
                                 "exe_ino": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 },
                                 "exe_path": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "exec_observed": {
                                   "type": "boolean"
@@ -2945,7 +3293,10 @@
                                   "type": "string"
                                 },
                                 "lifecycle_reason": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "metadata_status": {
                                   "type": [
@@ -2957,7 +3308,10 @@
                                   "type": "integer"
                                 },
                                 "start_time": {
-                                  "type": "integer"
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
                                 }
                               },
                               "additionalProperties": false,
@@ -3099,7 +3453,62 @@
                           },
                           "mechanisms": {
                             "type": "array",
-                            "items": true
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "mechanism": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "name": {
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "operations": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "calls": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "errors": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                },
+                                "functions": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "returns": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "truncated": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "additionalProperties": false,
+                              "required": [
+                                "mechanism",
+                                "name",
+                                "operations",
+                                "calls",
+                                "errors",
+                                "functions",
+                                "returns",
+                                "truncated"
+                              ]
+                            }
                           },
                           "mechs_overflow": {
                             "type": "integer"
@@ -3111,7 +3520,120 @@
                             "type": "integer"
                           },
                           "operations": {
-                            "type": "null"
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "calls": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "started": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "completed": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "cancelled": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "failed": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "unknown": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "orphans": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "dropped": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "evidence": {
+                                    "type": "object",
+                                    "patternProperties": {
+                                      "^.*$": {
+                                        "type": "integer",
+                                        "minimum": 0
+                                      }
+                                    },
+                                    "additionalProperties": false
+                                  },
+                                  "settled_machines": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_pending": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_detached": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_open": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_active_overflow": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  },
+                                  "settled_active": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "object",
+                                      "properties": {
+                                        "category": {
+                                          "type": "string"
+                                        },
+                                        "state": {
+                                          "type": "string"
+                                        },
+                                        "count": {
+                                          "type": "integer",
+                                          "minimum": 0
+                                        }
+                                      },
+                                      "additionalProperties": false,
+                                      "required": [
+                                        "category",
+                                        "state",
+                                        "count"
+                                      ]
+                                    }
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "required": [
+                                  "calls",
+                                  "cancelled",
+                                  "completed",
+                                  "dropped",
+                                  "evidence",
+                                  "failed",
+                                  "orphans",
+                                  "settled_active",
+                                  "settled_active_overflow",
+                                  "settled_detached",
+                                  "settled_machines",
+                                  "settled_open",
+                                  "settled_pending",
+                                  "started",
+                                  "unknown"
+                                ]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
                           },
                           "semantic_labels": {
                             "type": "object",
@@ -3246,7 +3768,10 @@
                                   "type": "integer"
                                 },
                                 "exe": {
-                                  "type": "string"
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
                                 },
                                 "first_call_ns": {
                                   "type": "integer"
@@ -3368,7 +3893,33 @@
             "type": "object",
             "properties": {
               "budget": {
-                "type": "null"
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "resource": {
+                        "type": "string"
+                      },
+                      "limit": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "requested": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "resource",
+                      "limit",
+                      "requested"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "caller": {
                 "type": [
@@ -3414,119 +3965,133 @@
           "type": "object",
           "properties": {
             "lifecycle": {
-              "type": "object",
-              "properties": {
-                "failed_quanta": {
-                  "type": "integer"
-                },
-                "malformed": {
-                  "type": "integer"
-                },
-                "records": {
-                  "type": "integer"
-                },
-                "recovery_rescans": {
-                  "type": "integer"
-                },
-                "ring_loss": {
-                  "type": "integer"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "failed_quanta",
-                "malformed",
-                "records",
-                "recovery_rescans",
-                "ring_loss"
-              ]
-            },
-            "native_witnesses": {
-              "type": "object",
-              "properties": {
-                "bound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "identity_budget_exhausted": {
-                  "type": "boolean"
-                },
-                "identity_unavailable": {
-                  "type": "integer"
-                },
-                "integrity": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "pending": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "placement": {
+              "anyOf": [
+                {
                   "type": "object",
                   "properties": {
-                    "ambiguous": {
-                      "type": "integer",
-                      "minimum": 0
+                    "failed_quanta": {
+                      "type": "integer"
                     },
-                    "edge": {
-                      "type": "integer",
-                      "minimum": 0
+                    "malformed": {
+                      "type": "integer"
                     },
-                    "module": {
-                      "type": "integer",
-                      "minimum": 0
+                    "records": {
+                      "type": "integer"
                     },
-                    "unresolved": {
-                      "type": "integer",
-                      "minimum": 0
+                    "recovery_rescans": {
+                      "type": "integer"
+                    },
+                    "ring_loss": {
+                      "type": "integer"
                     }
                   },
                   "additionalProperties": false,
                   "required": [
-                    "ambiguous",
-                    "edge",
-                    "module",
-                    "unresolved"
+                    "failed_quanta",
+                    "malformed",
+                    "records",
+                    "recovery_rescans",
+                    "ring_loss"
                   ]
                 },
-                "rows": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound_images": {
-                  "type": "integer"
-                },
-                "unbound_images_saturated": {
-                  "type": "boolean"
-                },
-                "unbound_reasons": {
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "native_witnesses": {
+              "anyOf": [
+                {
                   "type": "object",
-                  "patternProperties": {
-                    "^.*$": {
+                  "properties": {
+                    "bound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "identity_budget_exhausted": {
+                      "type": "boolean"
+                    },
+                    "identity_unavailable": {
                       "type": "integer"
+                    },
+                    "integrity": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "pending": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "placement": {
+                      "type": "object",
+                      "properties": {
+                        "ambiguous": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "edge": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "module": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "unresolved": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "ambiguous",
+                        "edge",
+                        "module",
+                        "unresolved"
+                      ]
+                    },
+                    "rows": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound_images": {
+                      "type": "integer"
+                    },
+                    "unbound_images_saturated": {
+                      "type": "boolean"
+                    },
+                    "unbound_reasons": {
+                      "type": "object",
+                      "patternProperties": {
+                        "^.*$": {
+                          "type": "integer"
+                        }
+                      },
+                      "additionalProperties": false
                     }
                   },
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "required": [
+                    "bound",
+                    "identity_budget_exhausted",
+                    "identity_unavailable",
+                    "integrity",
+                    "pending",
+                    "placement",
+                    "rows",
+                    "unbound",
+                    "unbound_images",
+                    "unbound_images_saturated",
+                    "unbound_reasons"
+                  ]
+                },
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "bound",
-                "identity_budget_exhausted",
-                "identity_unavailable",
-                "integrity",
-                "pending",
-                "placement",
-                "rows",
-                "unbound",
-                "unbound_images",
-                "unbound_images_saturated",
-                "unbound_reasons"
               ]
             }
           },
@@ -3540,159 +4105,195 @@
           "type": "object",
           "properties": {
             "attach": {
-              "type": "object",
-              "properties": {
-                "fallback": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "fallback": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mechanism": {
+                      "type": "string"
+                    },
+                    "scope_filter": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "selection": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "fallback",
+                    "mechanism",
+                    "scope_filter",
+                    "selection"
+                  ]
+                },
+                {
                   "type": "null"
-                },
-                "mechanism": {
-                  "type": "string"
-                },
-                "scope_filter": {
-                  "type": "string"
-                },
-                "selection": {
-                  "type": "string"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "fallback",
-                "mechanism",
-                "scope_filter",
-                "selection"
               ]
             },
             "ended_ns": {
               "type": "integer"
             },
             "lane": {
-              "type": "string"
-            },
-            "lifecycle": {
-              "type": "object",
-              "properties": {
-                "failed_quanta": {
-                  "type": "integer"
-                },
-                "malformed": {
-                  "type": "integer"
-                },
-                "records": {
-                  "type": "integer"
-                },
-                "recovery_rescans": {
-                  "type": "integer"
-                },
-                "ring_loss": {
-                  "type": "integer"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "failed_quanta",
-                "malformed",
-                "records",
-                "recovery_rescans",
-                "ring_loss"
+              "type": [
+                "string",
+                "null"
               ]
             },
-            "native_witnesses": {
-              "type": "object",
-              "properties": {
-                "bound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "identity_budget_exhausted": {
-                  "type": "boolean"
-                },
-                "identity_unavailable": {
-                  "type": "integer"
-                },
-                "integrity": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "pending": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "placement": {
+            "lifecycle": {
+              "anyOf": [
+                {
                   "type": "object",
                   "properties": {
-                    "ambiguous": {
-                      "type": "integer",
-                      "minimum": 0
+                    "failed_quanta": {
+                      "type": "integer"
                     },
-                    "edge": {
-                      "type": "integer",
-                      "minimum": 0
+                    "malformed": {
+                      "type": "integer"
                     },
-                    "module": {
-                      "type": "integer",
-                      "minimum": 0
+                    "records": {
+                      "type": "integer"
                     },
-                    "unresolved": {
-                      "type": "integer",
-                      "minimum": 0
+                    "recovery_rescans": {
+                      "type": "integer"
+                    },
+                    "ring_loss": {
+                      "type": "integer"
                     }
                   },
                   "additionalProperties": false,
                   "required": [
-                    "ambiguous",
-                    "edge",
-                    "module",
-                    "unresolved"
+                    "failed_quanta",
+                    "malformed",
+                    "records",
+                    "recovery_rescans",
+                    "ring_loss"
                   ]
                 },
-                "rows": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "unbound_images": {
-                  "type": "integer"
-                },
-                "unbound_images_saturated": {
-                  "type": "boolean"
-                },
-                "unbound_reasons": {
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "native_witnesses": {
+              "anyOf": [
+                {
                   "type": "object",
-                  "patternProperties": {
-                    "^.*$": {
+                  "properties": {
+                    "bound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "identity_budget_exhausted": {
+                      "type": "boolean"
+                    },
+                    "identity_unavailable": {
                       "type": "integer"
+                    },
+                    "integrity": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "pending": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "placement": {
+                      "type": "object",
+                      "properties": {
+                        "ambiguous": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "edge": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "module": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "unresolved": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "ambiguous",
+                        "edge",
+                        "module",
+                        "unresolved"
+                      ]
+                    },
+                    "rows": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "unbound_images": {
+                      "type": "integer"
+                    },
+                    "unbound_images_saturated": {
+                      "type": "boolean"
+                    },
+                    "unbound_reasons": {
+                      "type": "object",
+                      "patternProperties": {
+                        "^.*$": {
+                          "type": "integer"
+                        }
+                      },
+                      "additionalProperties": false
                     }
                   },
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "required": [
+                    "bound",
+                    "identity_budget_exhausted",
+                    "identity_unavailable",
+                    "integrity",
+                    "pending",
+                    "placement",
+                    "rows",
+                    "unbound",
+                    "unbound_images",
+                    "unbound_images_saturated",
+                    "unbound_reasons"
+                  ]
+                },
+                {
+                  "type": "null"
                 }
-              },
-              "additionalProperties": false,
-              "required": [
-                "bound",
-                "identity_budget_exhausted",
-                "identity_unavailable",
-                "integrity",
-                "pending",
-                "placement",
-                "rows",
-                "unbound",
-                "unbound_images",
-                "unbound_images_saturated",
-                "unbound_reasons"
               ]
             },
             "passes": {
               "type": "integer"
             },
             "retirement": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "settlement": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "started_ns": {
               "type": "integer"
@@ -3716,23 +4317,30 @@
           ]
         },
         "pid_namespace": {
-          "type": "object",
-          "properties": {
-            "kernel_pids": {
-              "type": "string"
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kernel_pids": {
+                  "type": "string"
+                },
+                "observer": {
+                  "type": "string"
+                },
+                "proc_pids": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "kernel_pids",
+                "observer",
+                "proc_pids"
+              ]
             },
-            "observer": {
-              "type": "string"
-            },
-            "proc_pids": {
-              "type": "string"
+            {
+              "type": "null"
             }
-          },
-          "additionalProperties": false,
-          "required": [
-            "kernel_pids",
-            "observer",
-            "proc_pids"
           ]
         },
         "refusals": {
@@ -3742,28 +4350,52 @@
               "type": "object",
               "properties": {
                 "callers": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "edges": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "endpoints": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "inventory_attach_modules": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "inventory_endpoints": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "modules": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "native_preadmission": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "semantic_state": {
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               },
               "additionalProperties": false,

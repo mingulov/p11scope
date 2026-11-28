@@ -36,6 +36,47 @@ CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_sc
 
 MUTATIONS = [
     {
+        "site": "inventory schema launched_by_gap null branch",
+        "file": "docs/schema/inventory-v1.schema.json",
+        "old": """              {
+                "type": "null"
+              }
+            ]
+          },
+          "launched_by_origin": {""",
+        "new": """              {
+                "type": "object",
+                "required": ["zzz_no_such_key"]
+              }
+            ]
+          },
+          "launched_by_origin": {""",
+        "killer": "UpgradeArtifactValidationTests.test_inventory_accepts_producer_grounded_nulls_and_conditionals",
+    },
+    {
+        "site": "inventory schema unobserved late_discovery reason",
+        "file": "docs/schema/inventory-v1.schema.json",
+        "old": """                    "late_discovery",
+""",
+        "new": "",
+        "killer": "UpgradeArtifactValidationTests.test_inventory_accepts_producer_grounded_nulls_and_conditionals",
+    },
+    {
+        "site": "inventory schema ancestor folded key",
+        "file": "docs/schema/inventory-v1.schema.json",
+        "old": """                "exe_gap": {
+                  "type": "string"
+                },
+                "folded": {
+                  "type": "integer",
+                  "minimum": 1
+                }""",
+        "new": """                "exe_gap": {
+                  "type": "string"
+                }""",
+        "killer": "UpgradeArtifactValidationTests.test_inventory_accepts_producer_grounded_nulls_and_conditionals",
+    },
+    {
         "site": "jsonschema required keyword",
         "file": "scripts/json_schema.py",
         "old": "        required = schema.get(\"required\", [])",

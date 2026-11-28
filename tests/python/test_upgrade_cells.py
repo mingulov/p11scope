@@ -1862,6 +1862,59 @@ class UpgradeArtifactValidationTests(unittest.TestCase):
             self.validation.object_observations_schema_errors({"version": "x"}),
         )
 
+    def test_inventory_accepts_producer_grounded_nulls_and_conditionals(self):
+        document = substantive_inventory()
+        caller = document["callers"][0]
+        caller["launched_by_gap"] = None
+        caller["launched_by_unit"] = "user@1000.service"
+        caller["launched_by"][0]["exe_gap"] = "exe unreadable"
+        caller["launched_by"][0]["folded"] = 2
+        caller["metadata"] = {
+            "status": "pending", "reason": None, "revision": "0",
+            "sample_started_ns": None, "sample_ended_ns": None, "validity": None,
+            "cgroup": {"status": "unknown", "source": None, "directory_inode": None,
+                       "mount_context": None, "reason": None},
+            "container": {"status": "unknown", "source": None, "runtime": None,
+                          "id": None, "reason": None},
+            "pod": {"status": "unknown", "source": None, "uid": None, "reason": None},
+        }
+        module = document["modules"][0]
+        module["provider_info"] = {
+            "cryptoki_major": 2, "cryptoki_minor": 40,
+            "manufacturer": "SoftHSM", "description": None,
+            "flags": 0, "library_major": 2, "library_minor": 6,
+        }
+        module["initialize"]["last_error_rv"] = {"rv": 7, "rv_hex": "0x7", "name": None}
+        document["edges"][0]["mechanisms"] = [{
+            "mechanism": 1, "mechanism_hex": "0x1", "name": None,
+            "operations": ["sign"], "calls": 2, "errors": 0, "last_seen_ns": 9,
+            "evidence": {"functions": ["C_Sign"],
+                         "returns": [{"rv": 0, "rv_hex": "0x0", "name": None}],
+                         "truncated": False},
+        }]
+        document["edges"][0]["operations"] = {
+            "calls": 2, "started": 2, "completed": 2, "cancelled": 0,
+            "failed": 0, "unknown": 0, "orphans": 0, "dropped": 0,
+            "last_seen_ns": 9, "active": [],
+            "evidence": {"state_reconciliations": 0, "session_cancel_ambiguities": 0,
+                         "session_cancel_unknown_flags": 0, "operation_state_imports": 0,
+                         "auth_state_ambiguities": 0, "semantic_capture_failures": 0,
+                         "async_duplicates": 0, "async_evictions": 0,
+                         "unmatched_closes": 0},
+        }
+        document["provider_observations"] = {"version": 8, "tokens": [],
+                                             "mechanisms": [], "gaps": []}
+        document["excluded_modules"] = []
+        document["unmatched_modules"] = []
+        document["prearm"] = [{
+            "path": "/x.so",
+            "identity": {"device": {"major": 0, "minor": 0}, "inode": 1, "sha256": None},
+            "mapped": False, "attached_at_ns": None,
+            "watch": {"since_ns": None, "state": "armed"},
+            "unobserved_windows": [{"start_ns": 0, "end_ns": 1, "reason": "late_discovery"}],
+        }]
+        self.assertEqual(self.validation.inventory_errors(document), [])
+
     def test_inventory_strict_mode_rejects_mistyped_nested_contract_fields(self):
         document = substantive_inventory()
         document["callers"][0]["image"]["exe"]["path"] = 42
@@ -2067,6 +2120,8 @@ class UpgradeJsonSchemaConformanceTests(unittest.TestCase):
         ("additional-dict", {"properties": {"a": {}}, "additionalProperties": {"type": "integer"}}, {"a": 1, "b": "x"}, False, False),
         ("pattern-str-pass", {"pattern": "^[a-f0-9]+$"}, "ab12", False, True),
         ("pattern-str-fail", {"pattern": "^[a-f0-9]+$"}, "zz", False, False),
+        ("pattern-null-pass", {"type": ["null", "string"], "pattern": "^a+$"}, None, False, True),
+        ("minimum-null-pass", {"type": ["integer", "null"], "minimum": 0}, None, False, True),
         ("const-pass", {"const": "v1"}, "v1", False, True),
         ("const-fail", {"const": "v1"}, "v2", False, False),
         ("const-type-strict", {"const": 1}, True, False, False),

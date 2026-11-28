@@ -94114,6 +94114,55 @@ fn terminal_same_file_second_spelling_note_folds_onto_planned_row() {
     );
 }
 
+/// Exact-key note for an unproven scan object: scan pins never
+/// carry the pin-time proof, yet the adopted key joins its planned
+/// row — the exact arm needs no split to cross.
+#[test]
+fn terminal_exact_note_for_unproven_scan_object_folds_onto_planned_row() {
+    let (mut engine, _, _, maps_key) = split_terminal_state();
+    engine.learned_notes.insert(maps_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one adopted file stays one row"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the planned row gains the duplicate note"
+    );
+    assert!(
+        engine.plan.skipped.is_empty(),
+        "the fold files no gap: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Exact-key note with a stale noted row: a rendering under a
+/// retired module id that already carries the file's note ends the
+/// matter — no second row, no gap, no duplicate note.
+#[test]
+fn terminal_exact_note_with_stale_noted_row_stays_single() {
+    let (mut engine, _, _, maps_key) = split_merged_terminal_state();
+    engine.learned_notes.insert(maps_key, split_note());
+    let mut row = split_live_row(maps_key);
+    row.id = plan::ModuleId(99);
+    row.first_loaded_by = Some(split_note());
+    engine.discovery.modules = vec![row];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the stale noted row stays single"
+    );
+    assert!(
+        engine.plan.skipped.is_empty(),
+        "no gap files for an attached note: {:?}",
+        engine.plan.skipped
+    );
+}
+
 /// Terminal-flush duplicate through real staging: the file is adopted
 /// and projected (noteless row), then the shutdown flush stages the
 /// same file twice — fresh, then the duplicate arm — and the note

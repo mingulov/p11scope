@@ -21350,6 +21350,101 @@ mod tests {
         );
     }
 
+    /// Disagreeing votes refuse the join: a planned alias votes its
+    /// adoption while the same-file canonical pin's proof names a
+    /// second planned object, so no single target can take the note.
+    #[test]
+    fn split_note_with_disagreeing_votes_resolves_to_nothing() {
+        use super::test_fixture::{
+            backing_file, overlay, reback, repath_single_pin, split_scan_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let maps2_key = overlay(22);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        let mut late = split_prearm_pin(fd_key, maps2_key, SHA, 1);
+        reback(&mut late, &file);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        assert!(pins.absorb(late).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            2,
+            "the second spelling pair-files beside the merged object"
+        );
+        let mut second = split_scan_pin(maps2_key, fd_key, SHA, 1);
+        reback(&mut second, &file);
+        let (_, entry) = second.by_id.pop_first().expect("the scan entry");
+        let raw = entry.raw.clone();
+        let second_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(second_id, entry);
+        pins.raw_to_id.insert(raw, second_id);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id, second_id]),
+            None,
+            "disagreeing votes never resolve"
+        );
+    }
+
+    /// An unproven same-file member abstains without vetoing: the
+    /// planned alias votes its adoption, the canonical pin offers no
+    /// proof either way, and the note joins the voted object.
+    #[test]
+    fn split_note_with_unproven_same_file_member_still_joins() {
+        use super::test_fixture::{backing_file, overlay, reback, repath_single_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        let mut late = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut late, &file);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        for entry in late.by_id.values_mut() {
+            entry.probed_maps_key = None;
+        }
+        assert!(pins.absorb(late).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            2,
+            "the unproven spelling pair-files beside the merged object"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            Some(merged_id),
+            "an abstaining member never vetoes the voted join"
+        );
+    }
+
+    /// No canonical adoption under the note key refuses: the planned
+    /// object answers another key, so the exact arm has no owner to
+    /// join even though the file matches.
+    #[test]
+    fn exact_note_with_no_canonical_adoption_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay, reback, split_scan_pin};
+        let fd_key = overlay(41);
+        let maps2_key = overlay(22);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let mut other = split_scan_pin(maps2_key, fd_key, SHA, 1);
+        reback(&mut other, &file);
+        let (_, entry) = other.by_id.pop_first().expect("the scan entry");
+        let raw = entry.raw.clone();
+        let other_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(other_id, entry);
+        pins.raw_to_id.insert(raw, other_id);
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[other_id]),
+            None,
+            "no canonical adoption never resolves"
+        );
+    }
+
     /// Same file restaged under a second spelling merges: the exact
     /// note joins the one adopted object, and no second owner exists
     /// to force ambiguity.

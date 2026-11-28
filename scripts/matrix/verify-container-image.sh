@@ -38,6 +38,9 @@
 #                     SYS_ADMIN, Docker default seccomp): same oracles as
 #                     host-exact. Needs Docker 24+ (older defaults allow
 #                     bpf() only with CAP_SYS_ADMIN).
+#   recovery-var-tmp  inventory -o on a nearly-full /tmp tmpfs: exit 1,
+#                     exactly one recovery line, a complete validated
+#                     inventory report under /var/tmp, primary absent.
 # The target outlives every capture (go-file + finish-file), so a short-lived
 # target never donates discovery-unavailable skips to a clean oracle.
 #
@@ -684,46 +687,27 @@ stop_refusal_target() {
 
 leg_recovery_image() {
     echo "=== leg: recovery-var-tmp ==="
-    local name log hlog inner rc table_class recovered_dir recovered_report
+    local name log slog inner rc recovered_dir recovered_report
     name="p11scope-container-obs6-$RUN_ID"
     log="$OUT/recovery-observer.log"
-    hlog="$OUT/recovery-harness.log"
-    rm -f "$WORK/shared/go-rec" "$WORK/shared/fin-rec" || return 1
-    SOFTHSM2_CONF="$SOFTHSM2_CONF" "$WORK/harness" "$MODULE" \
-        "$WORK/shared/go-rec" "$WORK/shared/fin-rec" >"$hlog" 2>&1 &
-    HPID_REC=$!
-    local attempt
-    attempt=0
-    while [ "$attempt" -lt 200 ]; do
-        grep -Fq libsofthsm2.so "/proc/$HPID_REC/maps" 2>/dev/null && break
-        attempt=$((attempt + 1))
-        sleep 0.05
-    done
-    grep -Fq libsofthsm2.so "/proc/$HPID_REC/maps" 2>/dev/null || return 1
+    slog="$OUT/recovery-stdout.log"
     # Fill a small /tmp tmpfs almost completely before exec'ing the observer.
-    # The output write then fails with ENOSPC while /var/tmp stays writable,
-    # which is the shipped-image recovery case item 4 qualifies.
-    inner="/bin/busybox dd if=/dev/zero of=/tmp/fill bs=1024 count=120 2>/dev/null || true; exec /usr/local/bin/p11scope profile --pid $HPID_REC --mode metrics --duration $DURATION -o /tmp/full.json"
+    # Inventory buffers its whole report and commits atomically, so the -o
+    # write fails with ENOSPC while /var/tmp stays writable, and the shipped
+    # image must save the capture to the recovery dir with exactly one
+    # recovery line. (A streamed profile cannot take this path: its
+    # write-time failure rescues to stdout instead, so profile capture stays
+    # covered by the healthy legs above.)
+    inner="/bin/busybox dd if=/dev/zero of=/tmp/fill bs=1024 count=120 2>/dev/null || true; exec /usr/local/bin/p11scope inventory --system --capture scan --duration $DURATION --json -o /tmp/full.json"
     timeout --signal=TERM --kill-after=10s 90s docker run --name "$name" \
         --entrypoint /bin/sh --tmpfs /tmp:rw,nosuid,nodev,size=128k \
-        "${OBS_FLAGS[@]}" "$OBS_IMAGE" -c "$inner" >"$log" 2>&1 &
+        "${OBS_FLAGS[@]}" "$OBS_IMAGE" -c "$inner" >"$slog" 2>"$log" &
     OPID=$!
-    SPID=$OPID
-    wait_for_capture_ready "$log" aggregate-only metrics || {
-        kill_obs
-        docker rm -f "$name" >/dev/null 2>&1 || true
-        return 1
-    }
-    SPID=
-    touch "$WORK/shared/go-rec" || return 1
     rc=0
     wait "$OPID" || rc=$?
     OPID=
-    touch "$WORK/shared/fin-rec" || return 1
-    wait "$HPID_REC" || return 1
-    HPID_REC=
     [ "$rc" -eq 1 ] || {
-        echo "full-/tmp capture exited $rc, not the output failure's 1" >&2
+        echo "full-/tmp inventory exited $rc, not the output failure's 1" >&2
         docker rm -f "$name" >/dev/null 2>&1 || true
         return 1
     }
@@ -732,8 +716,8 @@ leg_recovery_image() {
         docker rm -f "$name" >/dev/null 2>&1 || true
         return 1
     }
-    ! grep -Fq 'the JSON report follows on stdout' "$log" || {
-        echo "a recovered capture was duplicated to stdout" >&2
+    grep -q 'p11scope/inventory/v1' "$slog" || {
+        echo "the stdout sink did not complete its report" >&2
         docker rm -f "$name" >/dev/null 2>&1 || true
         return 1
     }
@@ -759,21 +743,19 @@ PY
 )
     [ -n "$recovered_report" ] || return 1
     reclaim_root_output "$recovered_report" || return 1
-    python3 -I scripts/matrix/check-count-multiset.py "$recovered_report" spike/expected.txt \
-        >>"$OUT/recovery-oracle.log" 2>&1 || return 1
-    table_class=$(classify_provider_tables "$recovered_report" 2>>"$OUT/recovery-oracle.log") || return 1
-    echo "provider table class: $table_class" >>"$OUT/recovery-oracle.log"
-    case $table_class in
-        26)
-            python3 -I scripts/check-capture-evidence.py clean-metrics "$recovered_report" spike/expected.txt \
-                >>"$OUT/recovery-oracle.log" 2>&1 || return 1
-            ;;
-        27) ;;
-        *)
-            echo "unknown provider table shape: $table_class" >&2
-            return 1
-            ;;
-    esac
+    python3 -I - "$recovered_report" >>"$OUT/recovery-oracle.log" 2>&1 <<'PY' || return 1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    document = json.load(stream)
+assert document["schema"] == "p11scope/inventory/v1", document.get("schema")
+assert document["scope"] == "system", document.get("scope")
+observation = document["observation"]
+assert observation["passes"] >= 1, observation.get("passes")
+assert observation["ended_ns"] > observation["started_ns"], observation
+for key in ("modules", "callers", "edges", "gaps", "budgets", "instances"):
+    assert key in document, key
+print("recovered inventory report validates")
+PY
     return 0
 }
 
@@ -893,7 +875,7 @@ else
     FAILED=1
 fi
 if leg_recovery_image; then
-    record recovery-var-tmp 1 qualified "full /tmp output fails once and recovers a complete report under /var/tmp"
+    record recovery-var-tmp 1 qualified "inventory -o on a full /tmp fails once and recovers a complete report under /var/tmp"
 else
     record recovery-var-tmp 0 failed "see recovery-observer.log and recovery-oracle.log"
     FAILED=1

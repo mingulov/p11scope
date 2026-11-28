@@ -132,7 +132,7 @@ class PackageReleaseTests(unittest.TestCase):
                      "packages": [name], "license": "MIT" if name == "host" else "Apache-2.0"},
                 ] + ([
                     {"file": "licenses/dependency.txt", "text_sha256": digest(b"dependency license"),
-                     "packages": [name], "license": "MIT OR Apache-2.0"},
+                     "packages": [name], "license": "MIT OR BSD-3-Clause"},
                 ] if name == "host" else []),
                 "original_license_files": [{"file": "licenses/dependency.txt", "sha256": digest(b"dependency license"), "package": name}],
             } for name in ("host", "bpf")},
@@ -396,7 +396,7 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(
             license_text,
             "GPL-3.0-or-later AND GPL-2.0-only AND GPL-2.0-or-later"
-            " AND Apache-2.0 AND MIT AND (MIT OR Apache-2.0)\n")
+            " AND Apache-2.0 AND MIT AND (MIT OR BSD-3-Clause)\n")
         copyright_text = (payload / "usr/share/doc/p11scope/copyright").read_text()
         self.assertEqual(copyright_text, """Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: p11scope
@@ -422,7 +422,7 @@ License: GPL-2.0-or-later
 
 Files: third-party/*
 Copyright: many upstream authors
-License: Apache-2.0 and MIT and (MIT OR Apache-2.0)
+License: Apache-2.0 and MIT and (MIT OR BSD-3-Clause)
  The statically linked Rust and native runtime portions carry their own
  copyright notices and license texts under /usr/share/doc/p11scope/notices/.
 """)
@@ -453,11 +453,11 @@ License: Apache-2.0 and MIT and (MIT OR Apache-2.0)
             "crates/ebpf-common/Cargo.toml": "GPL-2.0-or-later",
         })
         self.assertEqual(rollup["third_party"],
-                         ["Apache-2.0", "MIT", "MIT OR Apache-2.0"])
+                         ["Apache-2.0", "MIT", "MIT OR BSD-3-Clause"])
         self.assertEqual(
             rollup["rpm_license"],
             "GPL-3.0-or-later AND GPL-2.0-only AND GPL-2.0-or-later"
-            " AND Apache-2.0 AND MIT AND (MIT OR Apache-2.0)")
+            " AND Apache-2.0 AND MIT AND (MIT OR BSD-3-Clause)")
 
     def test_first_party_boundaries_match_spdx_headers(self):
         self.assertIn("# SPDX-License-Identifier: GPL-2.0-or-later",

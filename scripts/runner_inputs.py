@@ -32,7 +32,14 @@ _WRAP = ("tests/fixtures/operator-output/prepare-diagnostics-wrap.py",
          "tests/fixtures/public-cli/demotion-ledger.c", _PIN)
 _CI = ("scripts/ci/build-counter-fixtures.sh", "scripts/ci/build-wrap-fixtures.sh",
        "scripts/ci/prepare-btrfs-tmpdir.sh", "scripts/ci/joint_stop_verdict.py")
-_LIB = _CI + _COUNTER + _WRAP
+# The ledger judgment the lib runner invokes through $REPO_ROOT when the CI
+# workflow sets P11SCOPE_KNOWN_FAILING_RESULTS/HOST: the selection/verdict
+# converter, the known-failing checker, and the ignored-test scanner the
+# converter loads. Genuine stage inputs; the checkers' validated-checkout
+# reads are OUTSIDE_STAGE/PROSE in the contract suite, never stage inputs.
+_LEDGER = ("scripts/check-known-failing.py", "scripts/ci/privileged-lib-results.py",
+           "scripts/check-ignored-tests.py")
+_LIB = _CI + _COUNTER + _WRAP + _LEDGER
 _PUBLIC = ("scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py", "scripts/system-scope-measure.py",
            "scripts/qualify_records.py", "scripts/release-matrix-contract.py", _PIN,
            "scripts/inventory-mt-oracle.py", "scripts/system-cell-census.py", "scripts/inventory-mt-gate.py",
@@ -97,7 +104,16 @@ _MATRIX_SELF_TEST = (
     "scripts/check-prepared-dependencies.py", "scripts/prepared-dependency-evidence.py",
     "scripts/prepared-dependency-snapshot.sh", "scripts/prepared-dependency-tools.sh",
     "scripts/merge-checksum-ledgers.py", "crates/discover/tests/fixture/provider.c",
-    "crates/discover/tests/fixture/helper.c")
+    "crates/discover/tests/fixture/helper.c",
+    # The ledger checkers' validated-checkout reads, named in the contract
+    # suite's OUTSIDE_STAGE/PROSE tables: the self-test closure walks
+    # those table literals and their transitives. Checkout-only (this
+    # tuple), never staged.
+    "scripts/run-python-suites.py", "scripts/typed-python-suite.py",
+    "scripts/ci/check-cell-results.py", "scripts/ci/run-cell-script.sh",
+    "scripts/check-live-discovery-evidence.py", "scripts/check-live-discovery-object.py",
+    "scripts/verify-live-discovery-preflight.sh", "tests/fixtures/live-discovery-driver.c",
+    "tests/fixtures/live-discovery-provider.c")
 
 # runner -> mode -> (where the mode runs, its inputs). A `stage` mode runs
 # from the checkout-free release stage; a `checkout` mode only from a

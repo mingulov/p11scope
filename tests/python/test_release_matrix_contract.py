@@ -618,6 +618,16 @@ class MatrixContract(unittest.TestCase):
         ("scripts/qualify-release-matrix.sh", ".release-rust-version"): "the host's compiler pin; the stage never reads it",
         ("scripts/qualify-release-matrix.sh", "scripts/fixtures/exec_churn.c"):
             "build_bins hashes it in the checkout; the stage carries it as artifacts/lib-source",
+        ("scripts/check-known-failing.py", "scripts/cargo.sh"):
+            "executes the validated checkout's wrapper (--root), never the stage",
+        ("scripts/check-known-failing.py", "scripts/typed-python-suite.py"):
+            "probes the validated checkout's suites (--root), never the stage",
+        ("scripts/check-known-failing.py", "scripts/run-python-suites.py"):
+            "parses the validated checkout's suite registry (--root), never the stage",
+        ("scripts/check-known-failing.py", "scripts/ci/check-cell-results.py"):
+            "matches workflow command tokens, never loads the file",
+        ("scripts/check-known-failing.py", "scripts/ci/run-cell-script.sh"):
+            "matches workflow command tokens, never loads the file",
     }
     # The contract's own literals are the staging declarations under test.
     DECLARATION = "scripts/release-matrix-contract.py"
@@ -698,8 +708,18 @@ class MatrixContract(unittest.TestCase):
         "scripts/ci/prepare-btrfs-tmpdir.sh": {"run"},
         "scripts/qualify-release-matrix.sh": {"stage", "checkout", "self-test"},
     }
-    # Text that names a file without reading it (an unscheduled cell's reason).
-    PROSE = set()
+    # Text that names a file without reading it from the stage: an
+    # unscheduled cell's reason, a workflow-token match, or a read from
+    # the validated checkout (--root) the checker qualifies. Never a
+    # stage input; every pair here has an OUTSIDE_STAGE row whose
+    # staleness guard fails if the reference goes away.
+    PROSE = {
+        ("scripts/check-known-failing.py", "scripts/cargo.sh"),
+        ("scripts/check-known-failing.py", "scripts/typed-python-suite.py"),
+        ("scripts/check-known-failing.py", "scripts/run-python-suites.py"),
+        ("scripts/check-known-failing.py", "scripts/ci/check-cell-results.py"),
+        ("scripts/check-known-failing.py", "scripts/ci/run-cell-script.sh"),
+    }
 
     def closure(self, owner, self_test=False):
         """Every repository file `owner` reads, file by file through the

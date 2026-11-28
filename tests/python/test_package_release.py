@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -37,8 +38,10 @@ class PackageReleaseTests(unittest.TestCase):
         self.root.mkdir()
         self.originals = {"third-party/archives/aya-0.14.0.crate": b"pinned upstream archive"}
         self.inputs = {
-            "Cargo.toml": b'[package]\nname="p11scope"\nversion="0.1.0"\n',
-            "crates/discover/Cargo.toml": b'[package]\nname="p11scope-discover"\nversion="0.1.0"\n',
+            "Cargo.toml": b'[package]\nname="p11scope"\nversion="0.1.0"\nlicense="GPL-3.0-or-later"\n',
+            "crates/discover/Cargo.toml": b'[package]\nname="p11scope-discover"\nversion="0.1.0"\nlicense="GPL-3.0-or-later"\n',
+            "crates/ebpf/Cargo.toml": b'[package]\nname="p11scope-ebpf"\nversion="0.0.0"\nlicense="GPL-2.0-only"\n',
+            "crates/ebpf-common/Cargo.toml": b'[package]\nname="p11scope-ebpf-common"\nversion="0.0.0"\nlicense="GPL-2.0-or-later"\n',
             "LICENSE": b"project license\n",
             "COPYRIGHT": b"project copyright notice\n",
             "LICENSES/GPL-2.0-only.txt": b"BPF license\n",
@@ -124,7 +127,13 @@ class PackageReleaseTests(unittest.TestCase):
                            for p in self.recipe["toolchains"]],
             "graphs": {name: {
                 "packages": [{"id": name}],
-                "notices": [{"file": "licenses/dependency.txt", "text_sha256": digest(b"dependency license"), "packages": [name]}],
+                "notices": [
+                    {"file": "licenses/dependency.txt", "text_sha256": digest(b"dependency license"),
+                     "packages": [name], "license": "MIT" if name == "host" else "Apache-2.0"},
+                ] + ([
+                    {"file": "licenses/dependency.txt", "text_sha256": digest(b"dependency license"),
+                     "packages": [name], "license": "MIT OR Apache-2.0"},
+                ] if name == "host" else []),
                 "original_license_files": [{"file": "licenses/dependency.txt", "sha256": digest(b"dependency license"), "package": name}],
             } for name in ("host", "bpf")},
         }
@@ -377,22 +386,92 @@ class PackageReleaseTests(unittest.TestCase):
                        check=True, capture_output=True, timeout=30)
         installed = sum(path.stat().st_size for path in payload.rglob("*") if path.is_file())
         self.assertIn(f"Installed-Size: {(installed + 1023) // 1024}\n", fields)
-        # One SPDX expression covers the userspace, BPF and statically
-        # linked portions; the Debian copyright file carries the same split.
+        # Both package formats render the same derived rollup: the owner
+        # boundaries (observer/helper GPL-3.0-or-later, BPF GPL-2.0-only,
+        # shared definitions GPL-2.0-or-later) plus the distinct notice
+        # inventory expressions. Compared byte-exact below.
         license_text = subprocess.run(
             ["rpm", "-qp", "--qf", "%{LICENSE}\n", str(rpm)],
             check=True, capture_output=True, text=True, timeout=30).stdout
-        self.assertEqual(license_text,
-                         "GPL-3.0-or-later AND GPL-2.0-only AND MIT AND Apache-2.0\n")
+        self.assertEqual(
+            license_text,
+            "GPL-3.0-or-later AND GPL-2.0-only AND GPL-2.0-or-later"
+            " AND Apache-2.0 AND MIT AND (MIT OR Apache-2.0)\n")
         copyright_text = (payload / "usr/share/doc/p11scope/copyright").read_text()
-        self.assertTrue(copyright_text.startswith(
-            "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"))
-        for stanza in ("License: GPL-3.0-or-later", "License: GPL-2.0-only",
-                       "License: MIT and Apache-2.0"):
-            self.assertIn(stanza, copyright_text)
+        self.assertEqual(copyright_text, """Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: p11scope
+Source: https://github.com/mingulov/p11scope
+
+Files: *
+Copyright: 2026 Denis Mingulov <denis@mingulov.com>
+License: GPL-3.0-or-later
+ The userspace observer and helper are free software under GPL-3.0-or-later.
+ The full text is installed under /usr/share/doc/p11scope/.
+
+Files: crates/ebpf/*
+Copyright: 2026 Denis Mingulov <denis@mingulov.com>
+License: GPL-2.0-only
+ The embedded eBPF programs are free software under GPL-2.0-only.
+ The full text is installed under /usr/share/doc/p11scope/.
+
+Files: crates/ebpf-common/*
+Copyright: 2026 Denis Mingulov <denis@mingulov.com>
+License: GPL-2.0-or-later
+ The shared BPF/userspace definitions are free software under GPL-2.0-or-later.
+ The full text is installed under /usr/share/doc/p11scope/.
+
+Files: third-party/*
+Copyright: many upstream authors
+License: Apache-2.0 and MIT and (MIT OR Apache-2.0)
+ The statically linked Rust and native runtime portions carry their own
+ copyright notices and license texts under /usr/share/doc/p11scope/notices/.
+""")
         rpm_files = subprocess.run(["rpm", "-qlp", str(rpm)], check=True,
                                    capture_output=True, text=True, timeout=30).stdout
         self.assertIn("/usr/share/doc/p11scope/copyright\n", rpm_files)
+
+    def test_license_rollup_matches_manifests_and_owner_boundaries(self):
+        rollup = PACKAGE.license_rollup(self.root, self.notice_manifest)
+        # Owner decision, pinned: observer/helper GPL-3.0-or-later, BPF
+        # programs GPL-2.0-only, shared definitions GPL-2.0-or-later.
+        self.assertEqual(rollup["first_party"], [
+            ("*", "GPL-3.0-or-later"),
+            ("crates/ebpf/*", "GPL-2.0-only"),
+            ("crates/ebpf-common/*", "GPL-2.0-or-later"),
+        ])
+        # The same values read straight from the manifests, independent of
+        # the rollup's own parsing.
+        expected = {}
+        for rel in ("Cargo.toml", "crates/discover/Cargo.toml", "crates/ebpf/Cargo.toml",
+                    "crates/ebpf-common/Cargo.toml"):
+            with open(self.root / rel, "rb") as stream:
+                expected[rel] = tomllib.load(stream)["package"]["license"]
+        self.assertEqual(expected, {
+            "Cargo.toml": "GPL-3.0-or-later",
+            "crates/discover/Cargo.toml": "GPL-3.0-or-later",
+            "crates/ebpf/Cargo.toml": "GPL-2.0-only",
+            "crates/ebpf-common/Cargo.toml": "GPL-2.0-or-later",
+        })
+        self.assertEqual(rollup["third_party"],
+                         ["Apache-2.0", "MIT", "MIT OR Apache-2.0"])
+        self.assertEqual(
+            rollup["rpm_license"],
+            "GPL-3.0-or-later AND GPL-2.0-only AND GPL-2.0-or-later"
+            " AND Apache-2.0 AND MIT AND (MIT OR Apache-2.0)")
+
+    def test_first_party_boundaries_match_spdx_headers(self):
+        self.assertIn("# SPDX-License-Identifier: GPL-2.0-or-later",
+                      (ROOT / "crates/ebpf-common/Cargo.toml").read_text())
+        self.assertIn("//! SPDX-License-Identifier: GPL-2.0-only",
+                      (ROOT / "crates/ebpf/src/counter_bank_proof.rs").read_text())
+        self.assertIn("SPDX-License-Identifier: GPL-3.0-or-later",
+                      (ROOT / "src/output.rs").read_text())
+
+    def test_notice_without_license_refuses_packaging(self):
+        manifest = json.loads(json.dumps(self.notice_manifest))
+        del manifest["graphs"]["host"]["notices"][0]["license"]
+        (self.notices / "notices.json").write_text(json.dumps(manifest))
+        self.refused("notice record without a license expression")
 
     def test_p0_artifacts_carry_distinct_names(self):
         (self.receipt / "facts.log").write_text(

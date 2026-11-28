@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 
 sys.dont_write_bytecode = True
 ARTIFACTS = ("p11scope", "p11scope-discover", "p11scope-discover-glibc", "p11scope-discover-musl")
@@ -230,7 +231,7 @@ def notices_payload(root: Path, directory: Path, head: str, tree: str):
     if actual != set(payload):
         raise ValueError("notice inventory differs from its manifest")
     validate_notice_contents(root, manifest, payload)
-    return payload, digest(manifest_bytes)
+    return payload, digest(manifest_bytes), manifest
 
 
 def source_archive(root: Path, path: Path, head: str):
@@ -390,30 +391,98 @@ def run_tool(arguments, epoch: int, what: str):
         raise ValueError(f"{what} failed with exit {result.returncode}: {detail}")
 
 
-def debian_copyright() -> bytes:
+def workspace_crate_licenses(root: Path):
+    """License field per Cargo manifest: the root package plus every crates/ member."""
+    found = {}
+    manifests = [root / "Cargo.toml", *sorted((root / "crates").glob("*/Cargo.toml"))]
+    for manifest_path in manifests:
+        try:
+            document = tomllib.loads(regular(manifest_path).decode("utf-8"))
+        except (ValueError, OSError, tomllib.TOMLDecodeError) as error:
+            raise ValueError(f"unreadable Cargo manifest: {manifest_path}") from error
+        package = document.get("package", {})
+        name = package.get("name", manifest_path.parent.name)
+        license = package.get("license", "")
+        if not license or any(ord(char) < 32 for char in license):
+            raise ValueError(f"missing or malformed license in {manifest_path}")
+        found[manifest_path] = (name, license)
+    return found
+
+
+def license_rollup(root: Path, manifest):
+    """One source of truth for package license fields.
+
+    First-party values come from the Cargo manifests (the root package
+    covers `*`; member crates with a differing license get their own
+    stanza). Third-party values are the distinct cargo-about license
+    expressions in this build's notice inventory. Both package formats
+    render from this rollup so they cannot drift apart.
+    """
+    crates = workspace_crate_licenses(root)
+    root_license = crates[root / "Cargo.toml"][1]
+    first_party = [("*", root_license)]
+    for manifest_path in sorted(crates):
+        if manifest_path == root / "Cargo.toml":
+            continue
+        _, license = crates[manifest_path]
+        if license != root_license:
+            glob = manifest_path.parent.relative_to(root).as_posix() + "/*"
+            first_party.append((glob, license))
+    third_party = set()
+    for graph in manifest["graphs"].values():
+        for record in graph.get("notices", []):
+            expression = record.get("license", "")
+            if not expression or any(ord(char) < 32 for char in expression):
+                raise ValueError("notice record without a license expression")
+            third_party.add(" ".join(expression.split()))
+    third_party = sorted(third_party)
+
+    def parenthesized(expression):
+        return f"({expression})" if " OR " in expression else expression
+
+    rpm = " AND ".join(
+        [license for _, license in first_party]
+        + [parenthesized(expression) for expression in third_party]
+    )
+    return {"first_party": first_party, "third_party": third_party, "rpm_license": rpm}
+
+
+def debian_copyright(rollup) -> bytes:
     """Machine-readable Debian copyright for the shipped binary bundle."""
-    return b"""Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: p11scope
-Source: https://github.com/mingulov/p11scope
-
-Files: *
-Copyright: 2026 Denis Mingulov <denis@mingulov.com>
-License: GPL-3.0-or-later
- The userspace observer and helper are free software under GPL-3.0-or-later.
- The full text is installed at /usr/share/doc/p11scope/LICENSE.
-
-Files: crates/ebpf/* crates/ebpf-common/*
-Copyright: 2026 Denis Mingulov <denis@mingulov.com>
-License: GPL-2.0-only
- The embedded eBPF programs are free software under GPL-2.0-only.
- The full text is installed at /usr/share/doc/p11scope/LICENSES/GPL-2.0-only.txt.
-
-Files: third-party/*
-Copyright: many upstream authors
-License: MIT and Apache-2.0
- The statically linked Rust and native runtime portions carry their own
- copyright notices and license texts under /usr/share/doc/p11scope/notices/.
-"""
+    descriptions = {
+        "*": "The userspace observer and helper are free software",
+        "crates/ebpf/*": "The embedded eBPF programs are free software",
+        "crates/ebpf-common/*": "The shared BPF/userspace definitions are free software",
+    }
+    lines = [
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+        "Upstream-Name: p11scope",
+        "Source: https://github.com/mingulov/p11scope",
+        "",
+    ]
+    for glob, license in rollup["first_party"]:
+        description = descriptions.get(glob, "Shipped code under this path is free software")
+        lines += [
+            f"Files: {glob}",
+            "Copyright: 2026 Denis Mingulov <denis@mingulov.com>",
+            f"License: {license}",
+            f" {description} under {license}.",
+            " The full text is installed under /usr/share/doc/p11scope/.",
+            "",
+        ]
+    third = " and ".join(
+        f"({expression})" if " OR " in expression else expression
+        for expression in rollup["third_party"]
+    )
+    lines += [
+        "Files: third-party/*",
+        "Copyright: many upstream authors",
+        f"License: {third}",
+        " The statically linked Rust and native runtime portions carry their own",
+        " copyright notices and license texts under /usr/share/doc/p11scope/notices/.",
+        "",
+    ]
+    return ("\n".join(lines)).encode()
 
 
 def command_first_line(arguments, what: str) -> str:
@@ -464,7 +533,7 @@ def build_deb(staging: Path, observer: bytes, helper: bytes, docs,
 
 
 def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
-              version: str, capture_mode: str, epoch: int) -> bytes:
+              version: str, capture_mode: str, epoch: int, license_expression: str) -> bytes:
     rpmbuild = shutil.which("rpmbuild")
     if not rpmbuild:
         raise ValueError("rpmbuild is required to build the RPM package")
@@ -485,7 +554,7 @@ def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
     doc_entries = "\n".join(f"/usr/share/doc/p11scope/{name}"
                             for name in sorted(docs))
     spec = (f"Name: p11scope\nVersion: {version}\nRelease: 1\n"
-            f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: GPL-3.0-or-later AND GPL-2.0-only AND MIT AND Apache-2.0\n"
+            f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: {license_expression}\n"
             f"URL: {SYSTEM_PACKAGE_URL}\nBuildArch: x86_64\n"
             "%global __os_install_post %{nil}\n"
             "%description\n"
@@ -533,7 +602,7 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     if facts.get("capture_mode") != capture_mode:
         raise ValueError("receipt capture mode does not match --capture-mode")
     hashes, binaries = artifacts(receipt, facts["release_artifacts_sha256"])
-    notices_files, notices_hash = notices_payload(root, notices, head, tree)
+    notices_files, notices_hash, notice_manifest = notices_payload(root, notices, head, tree)
     source_data = source_archive(root, source, head)
     artifact_version = version if capture_mode == "full" else f"{version}+p0"
     source_name = f"p11scope-{artifact_version}-source.tar.gz"
@@ -556,7 +625,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     licenses.update({"notices/" + name: (data, 0o644) for name, data in notices_files.items()})
     system_docs = dict(licenses)
     system_docs["RELEASE.json"] = (pre_public, 0o644)
-    system_docs["copyright"] = (debian_copyright(), 0o644)
+    rollup = license_rollup(root, notice_manifest)
+    system_docs["copyright"] = (debian_copyright(rollup), 0o644)
     epoch = commit_epoch(root)
     package_version = artifact_version
     deb_name = f"p11scope_{package_version}_amd64.deb"
@@ -567,7 +637,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         deb_data = build_deb(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
                              system_docs, package_version, capture_mode, epoch)
         rpm_data = build_rpm(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
-                             system_docs, package_version, capture_mode, epoch)
+                             system_docs, package_version, capture_mode, epoch,
+                             rollup["rpm_license"])
     provenance = dict(pre_provenance)
     provenance["packages"] = {
         "deb": {"file": deb_name, "sha256": digest(deb_data)},

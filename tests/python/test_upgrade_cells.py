@@ -2693,11 +2693,6 @@ class UpgradeGate6PureTests(unittest.TestCase):
         self.assertEqual(delta["removed"],
                          {"instances[0].caller", "semantic_edges[0].caller"})
 
-    def test_b1_vocabularies_are_fresh(self):
-        committed = json.loads(self.gate6.VOCABULARIES_MANIFEST.read_text())
-        fresh = load_vocab_generator().derive_reason_vocabularies()
-        self.assertEqual(fresh, committed)
-
     def test_reason_membership_uses_enum_not_description(self):
         schema = {
             "properties": {
@@ -3101,6 +3096,13 @@ class UpgradeSchemaDeltaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.gate6 = load_gate6()
+
+    def test_b1_vocabularies_are_fresh(self):
+        # History-dependent (reads the v0.7.1 tag); lives here, outside the
+        # sweep control set, with the other tag-comparison tests.
+        committed = json.loads(self.gate6.VOCABULARIES_MANIFEST.read_text())
+        fresh = load_vocab_generator().derive_reason_vocabularies()
+        self.assertEqual(fresh, committed)
 
     def git_show(self, rev, path):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}

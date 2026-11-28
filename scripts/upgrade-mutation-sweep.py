@@ -657,6 +657,7 @@ CONTROL_TESTS = [
     "UpgradeGate6ActivationTests",
     "UpgradeGate6PureTests",
     "UpgradeJsonSchemaConformanceTests",
+    "UpgradeWorkloadLoopTests",
 ]
 
 

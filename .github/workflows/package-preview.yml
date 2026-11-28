@@ -482,7 +482,10 @@ jobs:
           python3 -I scripts/ci/check-cell-results.py "$RUNNER_TEMP/cell/results.jsonl" \
             --require host-exact --require container-exact \
             --require refusal-pidns --require refusal-cap \
-            --require five-cap-exact --require recovery-var-tmp
+            --require five-cap-exact --require recovery-var-tmp \
+            --known-failing-results "$RUNNER_TEMP/cell/known-failing-results.json" \
+            --known-failing-runner cell:scripts/matrix/verify-container-image.sh \
+            --known-failing-host github
       - name: Save the smoke-tested image
         shell: bash
         run: |

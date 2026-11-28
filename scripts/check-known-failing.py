@@ -38,10 +38,10 @@ With `--results`, the checker judges schema
       "host": "github",
       "complete": true,
       "selection": [
-        {"path": "tests/python/test_x.py", "test": "C.test_x", "invocation": []}
+        {"path": "tests/python/test_<name>.py", "test": "C.test_x", "invocation": []}
       ],
       "results": [
-        {"path": "tests/python/test_x.py", "test": "C.test_x", "invocation": [],
+        {"path": "tests/python/test_<name>.py", "test": "C.test_x", "invocation": [],
          "state": "failed", "signature": {"cell": "X", "branch": "y"}}
       ]
     }

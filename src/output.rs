@@ -2034,7 +2034,9 @@ fn open_recovered_dir_or_sibling_fallback(
 /// next root the preflight could only replace the sibling attempt's
 /// error — which names the base and the failed fallback — with its
 /// own verdict.
-fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+fn open_recovered_dir_or_fallback(
+    base: &Path,
+) -> Result<(std::fs::File, PathBuf), RecoveryAttemptError> {
     let chain = recovery_base_chain(base);
     if chain.len() == 1 {
         return open_recovered_dir_or_sibling_fallback(&chain[0].0);
@@ -2058,9 +2060,9 @@ fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf
         }
         return result;
     }
-    Err(format!(
-        "no writable recovery parent: {}",
-        skipped.join("; ")
+    Err(RecoveryAttemptError::new(
+        base.to_path_buf(),
+        format!("no writable recovery parent: {}", skipped.join("; ")),
     ))
 }
 

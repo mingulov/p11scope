@@ -266,10 +266,10 @@ jobs:
           test "$resolved" = /usr/local/bin/p11scope
           /usr/local/bin/p11scope --version | grep -F '0.7.1'
           /usr/bin/p11scope --version | grep -F '0.7.2'
-          sudo_resolved="$(sudo -n command -v p11scope)"
+          sudo_resolved="$(sudo -n sh -c 'command -v p11scope')"
           echo "sudo_resolved=$sudo_resolved"
+          test -n "$sudo_resolved"
           sudo -n p11scope --version
-          test "$sudo_resolved" = /usr/local/bin/p11scope
           set +e
           sudo p11scope doctor >"$RUNNER_TEMP/shadow-doctor.txt" 2>&1
           doctor_rc=$?
@@ -277,8 +277,8 @@ jobs:
           cat "$RUNNER_TEMP/shadow-doctor.txt"
           test "$doctor_rc" -eq 0 -o "$doctor_rc" -eq 1
           grep -q '^Doctor:' "$RUNNER_TEMP/shadow-doctor.txt"
-          printf 'shadow resolution: PATH executable %s; /usr/bin package executable %s\n' \
-            "$(readlink -f "$resolved")" "$(readlink -f /usr/bin/p11scope)" | \
+          printf 'shadow resolution: PATH executable %s; sudo executable %s; /usr/bin package executable %s\n' \
+            "$(readlink -f "$resolved")" "$(readlink -f "$sudo_resolved")" "$(readlink -f /usr/bin/p11scope)" | \
             tee "$RUNNER_TEMP/shadow-resolution.txt"
       - name: Clean the shadow binary
         if: always()

@@ -124,9 +124,9 @@ jobs:
           printf '%s\n' "$pulls" | sort -u | xargs -r -I{} docker pull {}
           tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
           tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
-          docker build --network=none -f deploy/Dockerfile.observer-release \
+          docker build --network=none --provenance=false -f deploy/Dockerfile.observer-release \
             --build-arg "TARBALL=$tarball" --build-arg "TARBALL_SHA256=$tarball_sha256" \
-            --output type=docker,rewrite-timestamp=true \
+            --output type=docker,rewrite-timestamp=true,unpack=false \
             -t p11scope-observer:preview "$RUNNER_TEMP/container-publish-ctx"
           docker inspect --format '{{.Id}}' p11scope-observer:preview \
             | tee "$RUNNER_TEMP/image-id.txt"

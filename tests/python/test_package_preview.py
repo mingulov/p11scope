@@ -668,7 +668,8 @@ else:
                        "docker pull",
                        "docker build --network=none",
                        "SOURCE_DATE_EPOCH",
-                       "rewrite-timestamp=true",
+                       "rewrite-timestamp=true,unpack=false",
+                       "--provenance=false",
                        "scratch"):
             self.assertIn(marker, bodies, f"container-image must {marker}")
         # The image builds from the packaged tarball with the release

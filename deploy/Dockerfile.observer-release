@@ -15,10 +15,11 @@
 #
 # Built from a staged minimal context holding the tarball and the entry script:
 #   SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD) \
-#     docker build --network=none -f deploy/Dockerfile.observer-release \
+#     docker build --network=none --provenance=false \
+#     -f deploy/Dockerfile.observer-release \
 #     --build-arg TARBALL=p11scope-0.7.2-x86_64-linux-musl.tar.gz \
 #     --build-arg TARBALL_SHA256=<sha256 from SHA256SUMS> \
-#     --output type=docker,rewrite-timestamp=true \
+#     --output type=docker,rewrite-timestamp=true,unpack=false \
 #     -t <tag> "$CTX"
 # (CTX/<tarball>, CTX/scripts/k8s-profile-entry.sh).
 # container-publish downloads the release tarball, SHA256SUMS and RELEASE.json,
@@ -49,10 +50,12 @@
 # tests/artifact_contracts.rs (busybox_pin).
 # No curl/jq: the observer never talks to the Kubernetes API.
 # The base is pinned by digest (multi-arch index of busybox:1.37.0-musl as
-# published 2026-10-27); bump tag and digest together. Layer timestamps are
+# published 2026-10-27); bump tag and digest together. Timestamps are
 # pinned, not floating: builders export SOURCE_DATE_EPOCH (the release
-# commit time) and pass --output type=docker,rewrite-timestamp=true, so the
-# same tarball bytes rebuild the same image ID; the container-publish push
+# commit time), pass --output type=docker,rewrite-timestamp=true,unpack=false
+# (rewrite-timestamp conflicts with the docker exporter's unpack) and
+# --provenance=false (attestations carry build timestamps), so the same
+# tarball bytes rebuild the same image ID; the container-publish push
 # job still re-identifies the exact bytes by image ID instead of trusting
 # the tag.
 FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS src

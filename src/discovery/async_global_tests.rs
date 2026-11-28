@@ -3604,8 +3604,11 @@ fn cgroup_refresh_admit_first() -> (
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut session = ScriptedSession::with_records([], 0);
     let first = b1_softhsm_holder();
-    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", first.pid()))
-        .expect("a cgroup.procs");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", first.pid()),
+    )
+    .expect("a cgroup.procs");
     cgroup_refresh_until_cover(&mut engine, &mut session);
     assert!(
         engine.views.iter().any(|view| view.pid() == first.pid()),
@@ -3644,8 +3647,7 @@ fn cgroup_refresh_park() -> (
     std::collections::BTreeSet<crate::plan::ModuleId>,
     usize,
 ) {
-    let (mut engine, mut session, dir, retired, first, endpoints) =
-        cgroup_refresh_admit_first();
+    let (mut engine, mut session, dir, retired, first, endpoints) = cgroup_refresh_admit_first();
     first.close();
     std::fs::write(dir.path().join("cgroup.procs"), String::new()).expect("a cgroup.procs");
     refresh_inventory_with(&mut engine, &mut session);
@@ -3790,8 +3792,7 @@ fn cgroup_refresh_admit_and_reattach_promotes_parked_retire_closed_at_reattach()
 /// alone (1).
 #[test]
 fn cgroup_refresh_same_tick_exit_and_admit_discloses_until_reattach() {
-    let (mut engine, mut session, dir, retired, first, endpoints) =
-        cgroup_refresh_admit_first();
+    let (mut engine, mut session, dir, retired, first, endpoints) = cgroup_refresh_admit_first();
     let mapper = b1_softhsm_holder();
     let mapper_pid = mapper.pid();
     first.close();

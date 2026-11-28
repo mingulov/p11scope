@@ -39800,11 +39800,7 @@ fn manifest_getter_attach_with_two_attached_contexts_still_files_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues beside the ambiguity"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
     let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
@@ -39868,11 +39864,7 @@ fn manifest_getter_attach_with_unattached_contexts_and_mark_still_files_the_gap(
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues beside the unattached context"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let mut session = ScriptedSession::default();
     let mut additions_allowed = true;
     let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
@@ -39916,11 +39908,7 @@ fn manifest_getter_attach_with_deferred_rearm_mark_retries_then_attaches_without
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "the deferred arm's re-arm request queues"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let mut session = ScriptedSession::with_records([], 0);
     session.dynamic_attach_reports_added = true;
     let mut additions_allowed = true;
@@ -39958,11 +39946,7 @@ fn manifest_getter_attach_with_deferred_rearm_mark_retries_then_attaches_without
     let prepared = engine.loader_registry.preflight(spec).unwrap();
     let context = engine.loader_registry.prepare(prepared).unwrap();
     engine.loader_registry.mark_attached(context).unwrap();
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = None;
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = None;
     let outcome = engine.attach_manifest_getters(view, &mut session, &mut additions_allowed);
     assert_ne!(
         outcome,
@@ -97958,11 +97942,7 @@ fn export_attach_with_two_attached_contexts_still_files_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues beside the ambiguity"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.close();
     assert_eq!(outcome, (false, false, false, false));
@@ -98011,11 +97991,7 @@ fn export_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues beside the unattached context"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.close();
     assert_eq!(outcome, (false, false, false, false));
@@ -98041,11 +98017,7 @@ fn export_attach_with_foreign_deferred_mark_files_the_gap() {
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "a refresh queues"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(ProcessViewId(999));
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(ProcessViewId(999));
     assert_ne!(view, ProcessViewId(999), "the mark names another view");
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.close();
@@ -98075,11 +98047,7 @@ fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() 
         engine.request_refresh(pid, crate::attach::monotonic_ns()),
         "the deferred arm's re-arm request queues"
     );
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     assert_eq!(outcome, (false, false, true, false));
     assert!(
@@ -98114,11 +98082,7 @@ fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() 
     let prepared = engine.loader_registry.preflight(spec).unwrap();
     let context = engine.loader_registry.prepare(prepared).unwrap();
     engine.loader_registry.mark_attached(context).unwrap();
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = None;
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = None;
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
     child.close();
     assert_ne!(
@@ -98209,11 +98173,7 @@ fn deferred_rearm_mark_resets_on_consumed_requeue() {
     let pid = 424242u32;
     let view = ProcessViewId(7);
     assert!(engine.request_refresh(pid, None));
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     assert!(engine.request_refresh_consumed(pid, None));
     assert!(
         engine
@@ -98233,17 +98193,10 @@ fn deferred_rearm_mark_cleared_on_view_release() {
     let pid = 424243u32;
     let view = ProcessViewId(8);
     assert!(engine.request_refresh(pid, None));
-    engine
-        .refresh_queue
-        .get_mut(&pid)
-        .unwrap()
-        .deferred_rearm = Some(view);
+    engine.refresh_queue.get_mut(&pid).unwrap().deferred_rearm = Some(view);
     engine.release_view_id(view);
     let request = engine.refresh_queue.get(&pid).unwrap();
-    assert!(
-        request.deferred_rearm.is_none(),
-        "release clears the mark"
-    );
+    assert!(request.deferred_rearm.is_none(), "release clears the mark");
 }
 
 /// A tick stopped by queued retirements postpones nothing observable
@@ -106803,8 +106756,7 @@ fn member_stop_refresh_recovery_clears_first_build_rejection() {
     let pid1 = fixture1.child.id();
     let library1 = fixture1._dir.path().join("seed-provider.so");
     let (fixture2, view2, module2, _pins2) = loaded_seed_provider();
-    let child3 =
-        ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+    let child3 = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
     let pid3 = child3.pid();
     stop_member_for_test(pid1);
     let key = member_exec_key_for_test(pid1, &library1);
@@ -117114,8 +117066,7 @@ fn learned_staging_stops_requesting_refreshes_once_the_queue_is_full() {
     assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     let mut sleepers = Vec::new();
     for id in 0..10u32 {
-        let sleeper =
-            ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
+        let sleeper = ParkedSleep::spawn_parked(std::process::Command::new("sleep").arg("600"));
         engine.views.push(
             ProcessView::open(ProcessViewId(100 + id), sleeper.pid()).expect("retained view opens"),
         );

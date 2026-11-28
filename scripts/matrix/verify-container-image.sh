@@ -752,8 +752,15 @@ assert document["scope"] == "system", document.get("scope")
 observation = document["observation"]
 assert observation["passes"] >= 1, observation.get("passes")
 assert observation["ended_ns"] > observation["started_ns"], observation
-for key in ("modules", "callers", "edges", "gaps", "budgets", "instances"):
-    assert key in document, key
+for key in ("modules", "callers", "edges", "gaps", "instances"):
+    assert isinstance(document[key], list), (key, document.get(key))
+budgets = document["budgets"]
+assert isinstance(budgets, dict), type(budgets)
+for key in ("callers", "modules", "edges"):
+    table = budgets[key]
+    assert isinstance(table, dict), (key, budgets.get(key))
+    for sub in ("limit", "occupied", "refused"):
+        assert isinstance(table[sub], int), (key, sub, table.get(sub))
 print("recovered inventory report validates")
 PY
     return 0

@@ -23443,6 +23443,93 @@ pub(crate) mod tests {
         );
     }
 
+    /// Unclaimed activation deferrals skip the pass span too: an
+    /// endpoint with no recorded module deferred by an activation
+    /// receipt folds run-wide without bumping passes. Removing only
+    /// the unclaimed arm's gate renders `over 1 pass` and fails this
+    /// test. (A lane cannot produce this state: pre-arm absorption
+    /// always claims, and only in-module shrink can unclaim before the
+    /// activation note; production activation deferrals are claimed.)
+    #[test]
+    fn unclaimed_activation_deferral_skips_the_pass_span() {
+        use crate::attach::capture::ExtendReceipt;
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let pins = fx::pass_pins(&[(&a, "sha-a")]);
+        let mut coordinator = coordinator();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        // Evict the second endpoint before any receipt: the module
+        // re-lowers with only the kept endpoint.
+        let repolicy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &a, &fx::offsets(1))),
+                &pins,
+                repolicy,
+            ),
+            &pins,
+        );
+        let evicted = absorbed.delta.endpoints[1];
+        assert_eq!(
+            coordinator
+                .attach_set
+                .modules_with_member(evicted.id)
+                .count(),
+            0,
+            "the trigger is armed: the endpoint is unclaimed at note time"
+        );
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+        coordinator.note_extend_receipt(
+            &ExtendReceipt {
+                deferred: crate::discovery::inventory_attach_set::TargetDelta {
+                    endpoints: vec![evicted],
+                    objects: vec![evicted.object],
+                    info_revoked: vec![],
+                },
+                ..ExtendReceipt::default()
+            },
+            ReceiptKind::Activation,
+        );
+        coordinator.commit_batch(false).unwrap();
+        coordinator.end_capture_coverage(1000);
+        coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native endpoint attach deferred")
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            2,
+            "one run-wide row plus one run-wide summary: {:?}",
+            coordinator.registry.gaps()
+        );
+        let summary = gaps
+            .iter()
+            .find(|gap| is_deferral_folded_reason(&gap.reason))
+            .expect("the stop-only summary stages");
+        assert_eq!(
+            summary.reason,
+            "attach unfinished at stop: 1 endpoint(s) with no recorded module deferred at stop \
+             (1 still deferred at stop); counted uses are lower bounds"
+        );
+        assert_eq!(
+            summary.module, None,
+            "the unclaimed fold reports run-wide: {:?}",
+            summary
+        );
+    }
+
     /// Folds never mutate attach-set attribution: the memberships read
     /// before any receipt or stop note folds are identical after the
     /// stop summary consumes the folds.

@@ -2247,7 +2247,7 @@ Limits that matter in pods:
   concise line per module naming the distinct deferred total, the pass
   count (and the per-pass peak when it differs) and whether every
   endpoint had attached by stop (otherwise how many attached, failed
-  or were still deferred at stop), while `--json` keeps every per-pass
+  or were still deferred at stop), while `--json` keeps every per-receipt
   row plus the appended summary. Activation-only deferrals, which no
   pass receipt ever measured, summarize as `deferred at stop` instead,
   with no pass count or peak. Endpoints that failed to attach

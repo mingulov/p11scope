@@ -3517,6 +3517,117 @@ fn blocking_stop_folds_tick_info_and_multi_credit_backlog() {
     );
 }
 
+/// A lane with a real pass-formed backlog plus one tick's attached
+/// progress and INFO counts buffered since that pass: the stop about
+/// to run must forward the tick receipt before anything else.
+fn lane_with_buffered_tick_info(log: Log) -> (Log, ReceiptHost, NativeLane<ScriptedLane>) {
+    let mut host = ReceiptHost::with_delta(fabricated_delta(600));
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert_eq!(host.receipts[1], (512, 88));
+    lane.capture.extend_info = ScriptedExtendInfo {
+        deferred: 3,
+        refused_hazard: 2,
+        revoked: 5,
+        revoke_failed: 1,
+    };
+    lane.tick(&mut host);
+    lane.capture.extend_info = ScriptedExtendInfo::default();
+    assert_eq!(lane.backlog.endpoints.len(), 24);
+    (log, host, lane)
+}
+
+/// Drives a cooperative stop to completion with a generous slice.
+fn drive_cooperative_stop_to_completion<H>(lane: NativeLane<ScriptedLane>, host: &mut H)
+where
+    H: LaneHost<Pin>,
+{
+    let stop = lane
+        .into_finite_stop(NativeStopDisposition::Error, None)
+        .ok()
+        .expect("the error disposition is always admissible");
+    let keep_running = || false;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(60)),
+        stop: &keep_running,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut stop = stop;
+    let mut steps = 0u32;
+    loop {
+        steps += 1;
+        assert!(steps <= 10_000, "the cooperative stop finishes its phases");
+        let now = Instant::now();
+        match stop.step(host, now, now + Duration::from_secs(60), &clock) {
+            NativeStopProgress::Pending(next) => stop = next,
+            NativeStopProgress::Stopped(_) => break,
+        }
+    }
+}
+
+/// The cooperative stop forwards the buffered tick receipt on its first
+/// action: the real coordinator's join counts the tick's deferred and
+/// refused-hazard info returns, and the revocation failure reaches the
+/// registry gaps. Deleting the cooperative flush loses all of them.
+#[test]
+fn cooperative_stop_forwards_the_buffered_tick_receipt() {
+    let log = Log::default();
+    let (_log, _host, lane) = lane_with_buffered_tick_info(log);
+    // The lane stops against a coordinator that missed the pass
+    // receipts (host switch through public methods only — no private
+    // lane state is mutated), the only way to give a real coordinator
+    // an unfolded backlog: every same-host backlog is receipt-covered
+    // by construction (see the inventory schema).
+    let mut coordinator = info_coordinator();
+    coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
+    drive_cooperative_stop_to_completion(lane, &mut coordinator);
+    let (_, observations) = coordinator.provider_info_snapshot();
+    assert_eq!(
+        observations.gaps.return_deferred, 3,
+        "the cooperative flush forwards the tick's deferred info returns"
+    );
+    assert_eq!(
+        observations.gaps.return_refused_hazard, 2,
+        "the cooperative flush forwards the tick's refused-hazard info returns"
+    );
+    coordinator.commit_batch(false).unwrap();
+    let gaps = coordinator.registry().gaps();
+    assert!(
+        gaps.iter().any(|gap| gap.subject.contains("provider info")
+            && gap
+                .reason
+                .contains("info revocation failed for 1 endpoint(s)")),
+        "the cooperative flush forwards the tick's revocation failure: {gaps:?}"
+    );
+}
+
+/// The cooperative stop flush carries every attach-side INFO count the
+/// tick produced, in one forwarded receipt: deferred, refused-hazard,
+/// revoked and revoke-failed alike.
+#[test]
+fn cooperative_stop_flush_carries_every_tick_info_count() {
+    let log = Log::default();
+    let (_log, mut host, lane) = lane_with_buffered_tick_info(log);
+    drive_cooperative_stop_to_completion(lane, &mut host);
+    assert_eq!(
+        host.receipts,
+        vec![(0, 0), (512, 88), (64, 0)],
+        "activation, pass, then the cooperative flush: {:?}",
+        host.receipts
+    );
+    assert_eq!(
+        host.receipt_info,
+        vec![(0, 0, 0, 0), (0, 0, 0, 0), (3, 2, 5, 1)],
+        "the cooperative flush forwards the tick's INFO counts: {:?}",
+        host.receipt_info
+    );
+}
+
 /// Healthy twin: a stop with an empty backlog notes nothing — the
 /// terminal note fires only for endpoints still deferred when it lands.
 #[test]

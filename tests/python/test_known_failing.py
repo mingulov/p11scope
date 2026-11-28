@@ -1135,6 +1135,97 @@ class FallbackBranchTests(unittest.TestCase):
         self.assertIn("1 expected failures", judged.stdout)
 
 
+class ProductionBrowserLedgerTests(unittest.TestCase):
+    """The production browser rows judge exactly their typed signatures.
+
+    These tests read the live ledger rows (never a copy of the
+    signatures): deleting, widening or weakening a row fails them, and
+    any other failure of the same cells stays red by exact equality.
+    """
+
+    CELLS = (
+        "BrowserCells.test_ff_nomod_observes_nothing",
+        "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
+    )
+    GENERIC_BRANCHES = frozenset({
+        "failed", "error", "skipped", "unexpected_success", "not_run",
+        "passed", "not_applicable", "class_skip", "module_skip",
+    })
+
+    def production_rows(self):
+        ledger = json.loads((ROOT / "tests/known-failing.json").read_text())
+        rows = [row for row in ledger["rows"] if row["test"] in self.CELLS]
+        self.assertEqual(len(rows), 2, "both production browser rows must exist")
+        for row in rows:
+            self.assertEqual(row["path"], "tests/python/test_browser_cells.py")
+            self.assertEqual(row["runner"], "python-suite")
+            self.assertEqual(row["mode"], "intermittent")
+            self.assertNotIn(row["signature"]["branch"], self.GENERIC_BRANCHES)
+        return rows
+
+    def browser_fixture(self):
+        rows = self.production_rows()
+        f = fixture(self)
+        issues = sorted({issue for row in rows for issue in row["issues"]})
+        f.registry(issues=tuple((issue, True) for issue in issues))
+        (f.root / "scripts/run-python-suites.py").write_text(
+            "RUN = [('test_browser_cells.py', [])]\nDRIVEN = []\nEXCLUDED = {}\n",
+            encoding="utf-8")
+        suite = f.root / "tests/python/test_browser_cells.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text("import unittest\n", encoding="utf-8")
+        f.rows(rows)
+        return f, {row["test"]: row["signature"] for row in rows}
+
+    def browser_doc(self, signatures):
+        return result_doc([
+            {"path": "tests/python/test_browser_cells.py", "test": test,
+             "signature": signature}
+            for test, signature in signatures.items()
+        ])
+
+    def test_matching_browser_failures_are_covered(self):
+        f, signatures = self.browser_fixture()
+        result = f.run_checker("--results", str(f.results_file(self.browser_doc(signatures))))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 expected failures", result.stdout)
+
+    def test_ff_nomod_nonmatching_failure_stays_red(self):
+        f, signatures = self.browser_fixture()
+        variants = {
+            "generic_fallback": {"branch": "failed", "exception": "AssertionError",
+                                 "oracle": "unittest"},
+            "wrong_typed_branch": {"cell": "FF-NOMOD", "branch": "scan_unavailable"},
+        }
+        for label, signature in variants.items():
+            with self.subTest(label):
+                doc = self.browser_doc({
+                    **signatures,
+                    "BrowserCells.test_ff_nomod_observes_nothing": signature,
+                })
+                result = f.run_checker("--results", str(f.results_file(doc)))
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertIn("failure signature mismatch", result.stderr)
+
+    def test_cr_run_nodelay_nonmatching_failure_stays_red(self):
+        f, signatures = self.browser_fixture()
+        variants = {
+            "generic_fallback": {"branch": "failed", "exception": "AssertionError",
+                                 "oracle": "unittest"},
+            "wrong_typed_branch": {"cell": "CR-RUN-NODELAY",
+                                   "branch": "unproven_resume_intake"},
+        }
+        for label, signature in variants.items():
+            with self.subTest(label):
+                doc = self.browser_doc({
+                    **signatures,
+                    "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs": signature,
+                })
+                result = f.run_checker("--results", str(f.results_file(doc)))
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertIn("failure signature mismatch", result.stderr)
+
+
 class StaticWiringTests(unittest.TestCase):
     STATIC_RUN = "python3 -I scripts/check-known-failing.py"
     SUITES_RUN = "python3 -I scripts/run-python-suites.py"

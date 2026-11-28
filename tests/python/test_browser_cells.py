@@ -175,6 +175,91 @@ _SHA256_MECHANISM_ID = 0x00000250
 #: exactly against evidence.discovery[] paths (never a substring).
 _SOFTOKN_BASENAME = "libsoftokn3.so"
 
+#: Typed known-failure signatures the ledger rows match by exact
+#: equality (tests/known-failing.json; KI-01/KI-02 in
+#: docs/known-limitations.md). Only the named report shapes raise
+#: them; every other failure keeps the generic unittest signature and
+#: stays red. The ledger twins pin these constants against the rows.
+FF_NOMOD_KNOWN_SIGNATURE = {"cell": "FF-NOMOD", "branch": "unproven_resume_intake"}
+CR_RUN_NODELAY_KNOWN_SIGNATURE = {"cell": "CR-RUN-NODELAY", "branch": "scan_unavailable"}
+
+#: Skip records the member-stop unproven-resume intake race files on
+#: FF-NOMOD (KI-01): a stopped child exits before the proving read, so
+#: intake records a first-use gap instead of withdrawing the stop
+#: (src/discovery/member_stop.rs intake_member_stop). Both shapes keep
+#: the never-mapped property (zero rows, zero probes).
+FF_NOMOD_KNOWN_SKIPS = frozenset({
+    ("discovery subject", oracle.MID_FLIGHT_REASON),
+    ("learned provider file", oracle.LEARNED_FIRST_USE_REASON),
+})
+
+#: The one gap cause the CR-RUN-NODELAY post-scan exit race discloses
+#: (KI-02): the victim exits during the post-scan, its /proc mem open
+#: fails unreadable, and the engine latches scan_unavailable loud.
+CR_RUN_NODELAY_KNOWN_GAP = "scan_unavailable"
+
+
+class KnownFailure(AssertionError):
+    """A failure the typed known-failing ledger covers.
+
+    Carries the exact row signature in ``p11scope_signature`` so the
+    typed runner records it instead of the generic unittest shape.
+    The message stays human prose; the ledger never matches on it.
+    """
+
+    def __init__(self, message, signature):
+        super().__init__(message)
+        self.p11scope_signature = dict(signature)
+
+
+def known_failure_signature(cell, report, failures, allowed_gaps):
+    """The ledger signature for a known report shape, else None.
+
+    Pure classifier over the parsed report plus the assembled failure
+    list: a shape matches only when the cell property holds (zero rows
+    and zero probes for FF-NOMOD; exact signs for CR-RUN-NODELAY,
+    implied by the absence of any other failure) and EVERY failure is
+    the named disclosure. Any additional failure, however small,
+    returns None so the cell stays red. Unknown oracle wording also
+    fails closed (None) instead of guessing.
+    """
+    if cell == "FF-NOMOD":
+        if (oracle.evidence(report).get("attached_probes", 0) or 0) != 0:
+            return None
+        if len(report.get("functions") or []) != 0:
+            return None
+        skipped = oracle.evidence(report).get("skipped") or []
+        known = [record for record in skipped
+                 if ((record or {}).get("name"), (record or {}).get("reason"))
+                 in FF_NOMOD_KNOWN_SKIPS]
+        structural = [record for record in skipped
+                      if (record or {}).get("reason") in oracle.STRUCTURAL_SKIPPED_REASONS]
+        if not known or len(known) + len(structural) != len(skipped):
+            return None
+        expected = sorted(
+            f"skipped record {record.get('name')!r} reason {record.get('reason')!r}: "
+            f"possible coverage gap, want structural only"
+            for record in known)
+        if sorted(failures) != expected:
+            return None
+        return dict(FF_NOMOD_KNOWN_SIGNATURE)
+    if cell == "CR-RUN-NODELAY":
+        if len(failures) != 1:
+            return None
+        classes = oracle.evidence(report).get("gap_classes") or {}
+        observation = (classes.get("observation") or {}) if isinstance(classes, dict) else {}
+        causes = observation.get("causes") or []
+        allowed = set(allowed_gaps)
+        extra = [cause for cause in causes if cause not in allowed]
+        if extra != [CR_RUN_NODELAY_KNOWN_GAP]:
+            return None
+        want = (f"observation gap cause {CR_RUN_NODELAY_KNOWN_GAP!r} "
+                f"not allowed for this cell (allowed: {sorted(allowed)})")
+        if failures != [want]:
+            return None
+        return dict(CR_RUN_NODELAY_KNOWN_SIGNATURE)
+    return None
+
 
 def _stall_outcomes(server) -> str:
     """One-line handshake summary for PINBOUND failure messages."""
@@ -512,7 +597,11 @@ class BrowserCells(unittest.TestCase):
                 "flow": result.flow,
                 "observer_stderr": result.observer_stderr_tail,
             }
-            self.fail(f"{result.name} failed:\n{json.dumps(detail, indent=1)[:3000]}")
+            message = f"{result.name} failed:\n{json.dumps(detail, indent=1)[:3000]}"
+            signature = known_failure_signature(result.name, report, failures, allowed_gaps)
+            if signature is not None:
+                raise KnownFailure(message, signature)
+            self.fail(message)
         return report
 
     def assert_pinbound_stall(self, label, facts, server):
@@ -1913,6 +2002,197 @@ class BrowserCells(unittest.TestCase):
                     oracle.check_observation_gaps_nomod_qualified(
                         report, allowed), [])
 
+    def _ledger_row_signature(self, test_id):
+        """The production ledger signature for ``test_id`` (exactly one row)."""
+        ledger = json.loads((ROOT / "tests/known-failing.json").read_text())
+        matches = [row["signature"] for row in ledger["rows"]
+                   if row["test"] == test_id]
+        self.assertEqual(len(matches), 1,
+                         f"ledger must carry exactly one row for {test_id}")
+        return matches[0]
+
+    def _twin_nomod_known_result(self, name, skipped):
+        """Zero-row, zero-probe FF-NOMOD twin with allowed gaps throughout."""
+        evidence = self._twin_evidence(
+            attached_probes=0,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {
+                "status": "lossy",
+                "causes": sorted(_GAPS_NEVER_MAPPED_RUN),
+            }},
+            skipped=skipped,
+        )
+        return self._twin_nomod_result(name, [], evidence)
+
+    def _check_nomod_cell(self, result, store, sha):
+        """Run the FF-NOMOD oracle exactly as the live cell calls it."""
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            self.check_report(result, store, zero=True, attached=False,
+                              allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                              allowed_verdicts=_VERDICTS_NEVER_MAPPED,
+                              s1={"sessions_zero": True},
+                              qualify_nomod_link_loss=True)
+
+    def test_ff_nomod_learned_first_use_raises_ledger_signature(self):
+        """KI-01 twin: the learned-first-use intake row carries the row signature."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        result = self._twin_nomod_known_result("FF-NOMOD", [
+            {"name": "discovery subject", "reason": "discovery unavailable"},
+            {"name": "learned provider file",
+             "reason": oracle.LEARNED_FIRST_USE_REASON},
+        ])
+        with self.assertRaises(KnownFailure) as raised:
+            self._check_nomod_cell(result, store, sha)
+        self.assertEqual(raised.exception.p11scope_signature,
+                         self._ledger_row_signature(
+                             "BrowserCells.test_ff_nomod_observes_nothing"))
+        self.assertEqual(raised.exception.p11scope_signature,
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_nomod_mid_flight_skip_raises_ledger_signature(self):
+        """KI-01 twin: the mid-flight skip row carries the same row signature."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        result = self._twin_nomod_known_result("FF-NOMOD", [
+            {"name": "discovery subject", "reason": "discovery unavailable"},
+            {"name": "discovery subject", "reason": oracle.MID_FLIGHT_REASON},
+        ])
+        with self.assertRaises(KnownFailure) as raised:
+            self._check_nomod_cell(result, store, sha)
+        self.assertEqual(raised.exception.p11scope_signature,
+                         self._ledger_row_signature(
+                             "BrowserCells.test_ff_nomod_observes_nothing"))
+        self.assertEqual(raised.exception.p11scope_signature,
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_nomod_both_known_skips_raise_ledger_signature(self):
+        """KI-01 twin: both intake rows together still carry the row signature."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        result = self._twin_nomod_known_result("FF-NOMOD", [
+            {"name": "discovery subject", "reason": "discovery unavailable"},
+            {"name": "discovery subject", "reason": oracle.MID_FLIGHT_REASON},
+            {"name": "learned provider file",
+             "reason": oracle.LEARNED_FIRST_USE_REASON},
+        ])
+        with self.assertRaises(KnownFailure) as raised:
+            self._check_nomod_cell(result, store, sha)
+        self.assertEqual(raised.exception.p11scope_signature,
+                         self._ledger_row_signature(
+                             "BrowserCells.test_ff_nomod_observes_nothing"))
+
+    def test_ff_nomod_other_skip_stays_generic(self):
+        """KI-01 twin: an unnamed skip reason keeps the generic signature."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        result = self._twin_nomod_known_result("FF-NOMOD", [
+            {"name": "discovery subject", "reason": "discovery unavailable"},
+            {"name": "provider file", "reason": "a detach window hid calls"},
+        ])
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nomod_cell(result, store, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_ff_nomod_known_skip_plus_probe_stays_generic(self):
+        """KI-01 twin: the known row plus an attached probe stays generic."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        evidence = self._twin_evidence(
+            attached_probes=1,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {
+                "status": "lossy",
+                "causes": sorted(_GAPS_NEVER_MAPPED_RUN),
+            }},
+            skipped=[
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "learned provider file",
+                 "reason": oracle.LEARNED_FIRST_USE_REASON},
+            ],
+        )
+        result = self._twin_nomod_result("FF-NOMOD", [], evidence)
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nomod_cell(result, store, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def _twin_nodelay_result(self, name, rows, causes):
+        """Exact-sign CR-RUN-NODELAY twin; ``causes`` plants the gap under test."""
+        sha = "0" * 64
+        evidence = self._twin_evidence(
+            attached_probes=2,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {"status": "lossy", "causes": list(causes)}},
+            skipped=[],
+        )
+        result = self._twin_result(name, rows, evidence)
+        doc = json.loads(result.report_path.read_text())
+        doc["mechanisms"] = [{
+            "mechanism": 0x00000001,
+            "calls": 2,
+            "errors": 0,
+            "by_module": [{"module": {"sha256": sha}, "calls": 2, "errors": 0}],
+            "ops": ["sign"],
+        }]
+        doc["logins"] = {}
+        doc["sessions"] = {counter: 0 for counter in oracle.SESSION_COUNTERS}
+        result.report_path.write_text(json.dumps(doc))
+        return result, sha
+
+    def _check_nodelay_cell(self, result, sha):
+        """Run the CR-RUN-NODELAY oracle exactly as the live cell calls it."""
+        self.check_report(
+            result, None, None, attached=True,
+            allowed_gaps=_GAPS_ATTACHED_RUN,
+            allowed_verdicts=("concrete_gap",),
+            module_sha={sha},
+            qualify_run_floor_skipped=True,
+            exact={"C_SignInit": 1, "C_Sign": 1},
+            exact_opened_zero=("C_SignInit", "C_Sign"),
+            no_cross_alias=(("C_SignInit", "C_Sign"),),
+            s1={"sign_mechanisms": {"family_ids": sorted(_RSA_FAMILY_IDS),
+                                    "min_calls": 1,
+                                    "exact_calls": 2}})
+
+    def test_cr_run_nodelay_scan_unavailable_raises_ledger_signature(self):
+        """KI-02 twin: the lone unreadable post-scan gap carries the row signature."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"])
+        with self.assertRaises(KnownFailure) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertEqual(raised.exception.p11scope_signature,
+                         self._ledger_row_signature(
+                             "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"))
+        self.assertEqual(raised.exception.p11scope_signature,
+                         CR_RUN_NODELAY_KNOWN_SIGNATURE)
+
+    def test_cr_run_nodelay_other_gap_stays_generic(self):
+        """KI-02 twin: a different lone gap cause keeps the generic signature."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["in_flight_at_end"])
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_cr_run_nodelay_scan_gap_plus_lost_sign_stays_generic(self):
+        """KI-02 twin: the known gap plus a lost sign stays generic."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"])
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
     def test_oracle_rejects_halted_capture(self):
         """P2-3 twin: a halted capture fails even when floors are met."""
         sha = "0" * 64

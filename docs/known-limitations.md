@@ -30,6 +30,40 @@ scoped Singles stays correct, finite and disclosed in `observation.attach` and
 `evidence.attach_backend`; it does not establish Multi performance coverage.
 Readiness bounds are disclosed harness parameters, never a cold-start SLA.
 
+## Known limitations in 0.7.2
+
+The following limits are new in v0.7.2. Limits from
+[Known limitations in 0.7.0](#known-limitations-in-070) below still
+apply unless a subsection here says otherwise.
+
+<!-- p11scope-known-issues-v1
+{"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-01","test":true},{"id":"KI-02","test":true}]}
+-->
+
+### KI-01: a no-module Firefox run sometimes reports a first-use gap for an exited child
+
+On hosts with heavy short-lived-process churn (measured on Fedora),
+the FF-NOMOD cell intermittently fails while its asserted property
+still holds: zero function rows, zero attached probes. A browser
+child stopped at its first exec map exits before the observer proves
+its stopping file, so intake files a conservative first-use skip
+record — a mid-flight discovery subject or a learned provider file —
+that the structural skip check refuses (`src/discovery/member_stop.rs`
+intake, the unproven-resume arm). Pre-existing: v0.7.1 fails the same
+way through the same arm. The 0.8.0 fix skips the row when the stopped
+file sits outside the narrowed capture selection.
+
+### KI-02: a no-delay Chromium run sometimes reports an unreadable post-scan
+
+The CR-RUN-NODELAY cell intermittently fails with its signs exact: a
+Chromium descendant exits while a discovery post-scan reads it, the
+`/proc/<pid>/mem` open fails unreadable, and the observer honestly
+files a loud `scan_unavailable` gap the run cells do not allowlist
+(`src/discovery/scan.rs` mem-open class, `src/discovery/engine.rs`
+exit-proof latch). Measured 1 of 6 on Fedora; the owed signs were
+fully observed. The 0.8.0 fix re-proves victim exit before latching
+loud, mirroring the `gone` precedent.
+
 ## Known limitations in 0.7.0
 
 The following limits are new or changed in v0.7.0. Limits from

@@ -2167,17 +2167,8 @@
                       },
                       "loss_reasons": {
                         "type": "object",
-                        "properties": {
-                          "capture_stopped": {
-                            "type": "integer"
-                          },
-                          "instance_retired": {
-                            "type": "integer"
-                          },
-                          "semantic_loss": {
-                            "type": "integer"
-                          },
-                          "task_retired": {
+                        "patternProperties": {
+                          "^.*$": {
                             "type": "integer"
                           }
                         },
@@ -2194,8 +2185,8 @@
                       },
                       "reasons": {
                         "type": "object",
-                        "properties": {
-                          "task_retired": {
+                        "patternProperties": {
+                          "^.*$": {
                             "type": "integer"
                           }
                         },

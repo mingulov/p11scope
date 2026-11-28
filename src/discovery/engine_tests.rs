@@ -96845,7 +96845,7 @@ fn export_attach_without_context_on_a_live_group_still_files_the_gap() {
 /// re-arm — it also covers plain rescans — so it must never retry.
 #[test]
 fn export_attach_with_unmarked_queued_refresh_files_the_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
@@ -96862,8 +96862,7 @@ fn export_attach_with_unmarked_queued_refresh_files_the_gap() {
         "ordinary requests carry no deferred mark"
     );
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -96881,7 +96880,7 @@ fn export_attach_with_unmarked_queued_refresh_files_the_gap() {
 fn export_attach_with_two_attached_contexts_still_files_the_gap() {
     use p11scope_manifest::elf::SymbolFact;
 
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
@@ -96919,8 +96918,7 @@ fn export_attach_with_two_attached_contexts_still_files_the_gap() {
         .unwrap()
         .deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -96938,7 +96936,7 @@ fn export_attach_with_two_attached_contexts_still_files_the_gap() {
 fn export_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
     use p11scope_manifest::elf::SymbolFact;
 
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
@@ -96973,8 +96971,7 @@ fn export_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
         .unwrap()
         .deferred_rearm = Some(view);
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -96990,7 +96987,7 @@ fn export_attach_with_unattached_contexts_and_mark_still_files_the_gap() {
 /// does not retry this view — it files.
 #[test]
 fn export_attach_with_foreign_deferred_mark_files_the_gap() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
@@ -97005,8 +97002,7 @@ fn export_attach_with_foreign_deferred_mark_files_the_gap() {
         .deferred_rearm = Some(ProcessViewId(999));
     assert_ne!(view, ProcessViewId(999), "the mark names another view");
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert_eq!(outcome, (false, false, false, false));
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -97025,7 +97021,7 @@ fn export_attach_with_foreign_deferred_mark_files_the_gap() {
 fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() {
     use p11scope_manifest::elf::SymbolFact;
 
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.modules[0].scanned.exports = vec!["C_GetFunctionList".into()];
@@ -97078,8 +97074,7 @@ fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() 
         .unwrap()
         .deferred_rearm = None;
     let outcome = engine.attach_refreshed_exports(view, &mut ScriptedSession::default(), &mut true);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert_ne!(
         outcome,
         (false, false, true, false),
@@ -97105,7 +97100,7 @@ fn export_attach_with_deferred_rearm_mark_retries_then_attaches_without_a_gap() 
 /// forever after the re-arm resolved another way.
 #[test]
 fn deferred_rearm_mark_is_stamped_on_deferral_and_consumed_on_rearm() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     assert!(engine.loader_registry.ids_for_view(view).is_empty());
@@ -97145,8 +97140,7 @@ fn deferred_rearm_mark_is_stamped_on_deferral_and_consumed_on_rearm() {
             &mut PendingViewRetirements::new(),
         )
         .unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     assert!(
         !engine.loader_registry.ids_for_view(view).is_empty(),
         "the re-arm landed a context"
@@ -115261,7 +115255,7 @@ fn run_learned_harvest_persists_interfaces_only_proof() {
 #[test]
 fn run_learned_repeated_unaliasable_proof_does_not_duplicate_pins() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
-    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let (_dir, sleeper, mut engine, key, path) = learned_tables_engine_with(None);
     let badkey = overlay_key(99);
     assert_ne!(key, badkey, "the forwarded dependency names another file");
     let mut module = engine.run_learned_modules[0].clone();
@@ -115312,8 +115306,7 @@ fn run_learned_repeated_unaliasable_proof_does_not_duplicate_pins() {
         claims_after_second, claims_after_first,
         "an identical re-proof stacks no further pin claims"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Re-harvesting an identical proof skips the whole-store absorb: the
@@ -115324,7 +115317,7 @@ fn run_learned_repeated_unaliasable_proof_does_not_duplicate_pins() {
 #[test]
 fn run_learned_repeated_proof_skips_its_absorb() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
-    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let (_dir, sleeper, mut engine, key, path) = learned_tables_engine_with(None);
     let badkey = overlay_key(99);
     assert_ne!(key, badkey, "the rejected key names another file");
     let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
@@ -115404,8 +115397,7 @@ fn run_learned_repeated_proof_skips_its_absorb() {
         skips_after_second >= skips_after_first,
         "the comparison spans the re-absorb (first {skips_after_first}, second {skips_after_second})"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Re-proving an already-aliased learned module changes nothing in
@@ -115417,7 +115409,7 @@ fn run_learned_repeated_proof_skips_its_absorb() {
 #[test]
 fn run_learned_reproof_of_aliased_module_keeps_pinned_revision() {
     use crate::discovery::identity::test_fixture::real_scan_pin;
-    let (_dir, mut sleeper, mut engine, key, path) = learned_tables_engine_with(None);
+    let (_dir, sleeper, mut engine, key, path) = learned_tables_engine_with(None);
     let mut pins = real_scan_pin(std::path::Path::new(&path), None, 400, &"ef".repeat(32));
     record_scan_ownership(&mut pins, ProcessViewId(9), key, &path);
     let object = pins.pinned().next().expect("one pin").id;
@@ -115440,8 +115432,7 @@ fn run_learned_reproof_of_aliased_module_keeps_pinned_revision() {
         revision,
         "a re-proof of an aliased module leaves pinned revision unchanged"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// Reserved-owner aliases stop at the second 32-entry budget: a proof
@@ -115997,7 +115988,7 @@ fn run_learned_refused_harvests_burn_no_work_budget() {
 /// drop every valid endpoint before the binder sees them.
 #[test]
 fn run_learned_rejected_dependency_keeps_valid_entries() {
-    let (_dir, mut sleeper, mut engine, key, _path) = learned_tables_engine_with(None);
+    let (_dir, sleeper, mut engine, key, _path) = learned_tables_engine_with(None);
     assert_eq!(
         learned_candidate_module_count(&mut engine),
         1,
@@ -116026,8 +116017,7 @@ fn run_learned_rejected_dependency_keeps_valid_entries() {
         1,
         "a rejected dependency keeps the module's valid entries"
     );
-    sleeper.kill().expect("kill sleeper");
-    sleeper.wait().expect("reap sleeper");
+    sleeper.close();
 }
 
 /// One learned staging requests no refresh past a full queue: every

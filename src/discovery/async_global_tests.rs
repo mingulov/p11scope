@@ -2799,7 +2799,7 @@ fn system_zero_mapper_exit() -> (
     Vec<ScannedModule>,
     std::collections::BTreeSet<crate::plan::ModuleId>,
 ) {
-    let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let slot = engine.plan.slots[0].index;
     let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
@@ -2807,8 +2807,7 @@ fn system_zero_mapper_exit() -> (
     assert!(!retired.is_empty(), "premise: the slot names its module");
     let mut session = ScriptedSession::default();
     session.scripted_stamps.insert(slot, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let view = engine.views[0].id();
     let mut pending = PendingViewRetirements::new();
     engine.queue_retirement(view, RetirementCause::ExpectedRemoval, &mut pending);
@@ -3031,9 +3030,7 @@ fn parked_retire_promotes_only_for_a_live_mapper() {
     );
     assert_eq!(engine.coverage_retire_windows().len(), 1);
     assert!(retire_skip_filed(&engine));
-    let mut child = child;
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
 }
 
 /// Killing twin for the exit proof: the same replay with the retiring
@@ -3042,7 +3039,7 @@ fn parked_retire_promotes_only_for_a_live_mapper() {
 #[test]
 fn system_replay_without_a_proven_exit_keeps_the_lossy_window() {
     for recorded_proof in [false, true] {
-        let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+        let (child, mut engine, _modules) = engine_with_one_accepted_provider();
         engine.scope = Scope::System;
         let slot = engine.plan.slots[0].index;
         let mut session = ScriptedSession::default();
@@ -3066,8 +3063,7 @@ fn system_replay_without_a_proven_exit_keeps_the_lossy_window() {
         assert_eq!(engine.coverage_retired_slots(), 1);
         assert!(retire_skip_filed(&engine));
         assert!(engine.coverage_retire_parked().is_empty());
-        child.kill().unwrap();
-        child.wait().unwrap();
+        child.close();
     }
 }
 
@@ -3076,13 +3072,12 @@ fn system_replay_without_a_proven_exit_keeps_the_lossy_window() {
 /// view) keeps the lossy window.
 #[test]
 fn system_removed_view_without_exit_proof_keeps_the_lossy_window() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let slot = engine.plan.slots[0].index;
     let mut session = ScriptedSession::default();
     session.scripted_stamps.insert(slot, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let view = engine.views.remove(0).id();
     engine.pending_retirements.insert(view);
     engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
@@ -3090,13 +3085,12 @@ fn system_removed_view_without_exit_proof_keeps_the_lossy_window() {
     assert_eq!(engine.coverage_retire_windows().len(), 1);
     assert!(retire_skip_filed(&engine));
     // Twin: the same removal with the pin-proven exit recorded parks.
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let slot = engine.plan.slots[0].index;
     let mut session = ScriptedSession::default();
     session.scripted_stamps.insert(slot, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let view = engine.views.remove(0).id();
     engine.exit_proven_views.insert(view);
     engine.pending_retirements.insert(view);
@@ -3115,13 +3109,12 @@ fn system_removed_view_without_exit_proof_keeps_the_lossy_window() {
 /// so the retire keeps its lossy window.
 #[test]
 fn system_replay_with_rejected_keys_keeps_the_lossy_window() {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let slot = engine.plan.slots[0].index;
     let mut session = ScriptedSession::default();
     session.scripted_stamps.insert(slot, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let view = engine.views.remove(0).id();
     engine.exit_proven_views.insert(view);
     engine.pending_retirements.insert(view);
@@ -3278,8 +3271,8 @@ fn system_pending_zero_mapper_retire_parks_without_a_window() {
         .copied()
         .collect();
     case.session.scripted_stamps.insert(slot, 1);
-    case.child.kill().unwrap();
-    case.child.wait().unwrap();
+    case.child.inner_mut().kill().unwrap();
+    case.child.inner_mut().wait().unwrap();
     let view = case.engine.views.remove(0).id();
     case.engine.exit_proven_views.insert(view);
     case.engine.pending_retirements.insert(view);
@@ -3323,7 +3316,7 @@ fn system_pending_zero_mapper_retire_parks_without_a_window() {
 /// retire stays lossy.
 #[test]
 fn shared_object_with_an_unproven_retiring_mapper_keeps_the_lossy_window() {
-    let (mut child, mut engine, modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let mut second = std::process::Command::new("sleep")
         .arg("30")
@@ -3354,8 +3347,7 @@ fn shared_object_with_an_unproven_retiring_mapper_keeps_the_lossy_window() {
     for index in &live {
         session.scripted_stamps.insert(*index, 1);
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let first = engine.views.remove(0).id();
     let other = engine.views[0].id();
     engine.exit_proven_views.insert(first);
@@ -3445,13 +3437,12 @@ fn system_zero_mapper_exit_keeps_metrics_completeness_complete() {
         "{evidence}"
     );
 
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
     engine.scope = Scope::System;
     let slot = engine.plan.slots[0].index;
     let mut session = ScriptedSession::default();
     session.scripted_stamps.insert(slot, 1);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let view = engine.views.remove(0).id();
     engine.pending_retirements.insert(view);
     engine.replay_pending_conservative(&mut session, &mut true, &mut PendingViewRetirements::new());
@@ -3479,8 +3470,8 @@ fn system_zero_mapper_exit_keeps_metrics_completeness_complete() {
 fn cgroup_refresh_retire(
     listed: bool,
 ) -> (Engine, std::collections::BTreeSet<crate::plan::ModuleId>) {
-    let (mut child, mut engine, _modules) = engine_with_one_accepted_provider();
-    let pid = child.id();
+    let (child, mut engine, _modules) = engine_with_one_accepted_provider();
+    let pid = child.pid();
     let dir = tempfile::tempdir().expect("a scope directory");
     std::fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n")).expect("a cgroup.procs");
     engine.scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
@@ -3490,8 +3481,7 @@ fn cgroup_refresh_retire(
     let retired: std::collections::BTreeSet<crate::plan::ModuleId> =
         engine.plan.slots[0].module_ids.iter().copied().collect();
     assert!(!retired.is_empty(), "premise: the slot names its module");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.close();
     let listing = if listed {
         format!("{pid}\n")
     } else {
@@ -4068,7 +4058,7 @@ fn async_global_newcomer_waits_for_the_detach_then_admits_on_the_settling_frame(
         .unwrap();
     assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
     case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
-    e06_write_listing(scope.path(), &[case.child.id(), newcomer]);
+    e06_write_listing(scope.path(), &[case.child.pid(), newcomer]);
     let admitted = |engine: &Engine| engine.views.iter().any(|view| view.pid() == newcomer);
     let scans = case.engine.deep_scans;
     for frame in 0..40 {
@@ -4147,7 +4137,7 @@ fn async_global_newcomer_stays_deferred_when_the_detach_refuses() {
     assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
     assert!(case.engine.pending_global_retirement.is_some());
     case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
-    e06_write_listing(scope.path(), &[case.child.id(), newcomer]);
+    e06_write_listing(scope.path(), &[case.child.pid(), newcomer]);
     case.release();
     wait_for(|| {
         case.session

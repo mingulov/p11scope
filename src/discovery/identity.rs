@@ -4662,6 +4662,18 @@ impl PinnedObjects {
         None
     }
 
+    /// Resolve an exact-key learned note to its adopted owner: the
+    /// unique planned object filed canonically under the note key,
+    /// vetoed by contradiction. RED STUB (test commit): always
+    /// refuses; the implementation commit fills the query.
+    pub(crate) fn resolve_exact_note_target(
+        &self,
+        _learned_key: ObjectKey,
+        _planned: &[PinnedObjectId],
+    ) -> Option<PinnedObjectId> {
+        None
+    }
+
     /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed
     /// maps key, at pin time.
     ///
@@ -20992,6 +21004,226 @@ mod tests {
             pins.resolve_split_note_target(fd_key, &[scan_id]),
             None,
             "divergent twins never resolve alone"
+        );
+    }
+
+    /// Same-file second spelling: the merged split object plus a late
+    /// same-file pin filed under a symlinked path spelling absorbs, and
+    /// the note still joins the merged object — owners are one identity
+    /// under two spellings, never ambiguity.
+    #[test]
+    fn split_note_with_same_file_second_spelling_pin_resolves_to_merged_object() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        let mut late = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut late, &file);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        assert!(pins.absorb(late).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            2,
+            "the second spelling pair-files beside the merged object"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            Some(merged_id),
+            "same-file owners under two spellings still join"
+        );
+    }
+
+    /// Divergent second spelling: the merged split object plus a late
+    /// pin under another spelling for a DIFFERENT file never joins —
+    /// two identities under one key stay refused.
+    #[test]
+    fn split_note_with_divergent_second_spelling_pin_resolves_to_nothing() {
+        use super::test_fixture::{
+            backing_file, mark_pre_copy_up, overlay, reback, repath_single_pin, split_prearm_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        let mut late = split_prearm_pin(fd_key, maps_key, "deadbeef", 1);
+        reback(&mut late, &other);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        mark_pre_copy_up(&mut late);
+        assert!(pins.absorb(late).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            2,
+            "the divergent spelling pair-files beside the merged object"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            None,
+            "divergent identities under two spellings never resolve"
+        );
+    }
+
+    /// Representation for a same-file second spelling: one identity
+    /// under two spellings renders the canonical spelling's details,
+    /// never ambiguity.
+    #[test]
+    fn note_representation_for_same_file_second_spelling_is_detailed() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, repath_single_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, _) = merged_split_pair(fd_key, maps_key, &file);
+        let mut late = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut late, &file);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        assert!(pins.absorb(late).is_empty());
+        match pins.note_representation(fd_key) {
+            super::NoteRepresentation::Detailed(pin) => {
+                assert_eq!(
+                    pin.path, "/lib/x86_64-linux-gnu/libsofthsm2.so",
+                    "the canonical spelling renders"
+                );
+                assert_eq!(pin.sha256, SHA, "the shared digest renders");
+            }
+            other => panic!("one identity never reports ambiguity, got {other:?}"),
+        }
+    }
+
+    /// An exact-key note joins its unique planned canonical owner: the
+    /// adopted key's own object, no split to cross.
+    #[test]
+    fn exact_note_resolves_to_unique_planned_canonical_owner() {
+        use super::test_fixture::{backing_file, overlay};
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, scan_id) = unmerged_split_pair(overlay(41), maps_key, &file, &file);
+        assert_eq!(
+            pins.resolve_exact_note_target(maps_key, &[scan_id]),
+            Some(scan_id),
+            "the adopted key joins its canonical owner"
+        );
+    }
+
+    /// A poisoned adopted key never joins, even canonically: rejection
+    /// vetoes the exact arm exactly as it vetoes the split arm.
+    #[test]
+    fn exact_note_with_rejected_key_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(overlay(41), maps_key, &file, &file);
+        pins.rejected_keys.insert(maps_key);
+        assert_eq!(
+            pins.resolve_exact_note_target(maps_key, &[scan_id]),
+            None,
+            "a rejected adopted key never resolves"
+        );
+    }
+
+    /// Two planned canonical owners under one adopted key never join:
+    /// the adoption itself is ambiguous, so no single row can take it.
+    #[test]
+    fn exact_note_with_two_planned_canonical_owners_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, repath_single_pin};
+        let fd_key = overlay(41);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let e_id = pins.pinned().next().expect("the pin").id;
+        let mut twin = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut twin, &file);
+        repath_single_pin(&mut twin, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        let (_, entry) = twin.by_id.pop_first().expect("the twin entry");
+        let raw = entry.raw.clone();
+        let f_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(f_id, entry);
+        pins.raw_to_id.insert(raw, f_id);
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[e_id, f_id]),
+            None,
+            "two planned canonical owners never resolve alone"
+        );
+    }
+
+    /// A collapsed canonical owner with no live claimant still joins:
+    /// nothing contradicts the adoption, so the note folds onto the
+    /// adopted row instead of publishing a phantom second row.
+    #[test]
+    fn exact_note_with_collapsed_canonical_owner_still_resolves() {
+        use super::test_fixture::{backing_file, overlay};
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(overlay(41), maps_key, &file, &file);
+        pins.by_id
+            .get_mut(&scan_id)
+            .expect("the scan entry")
+            .collapsed = true;
+        assert_eq!(
+            pins.resolve_exact_note_target(maps_key, &[scan_id]),
+            Some(scan_id),
+            "an uncontradicted adoption still joins"
+        );
+    }
+
+    /// A live divergent claimant vetoes the exact join: the adopted key
+    /// names two identities, so neither row can take the note alone.
+    #[test]
+    fn exact_note_with_live_divergent_claimant_resolves_to_nothing() {
+        use super::test_fixture::{
+            backing_file, mark_pre_copy_up, overlay, reback, split_prearm_pin,
+        };
+        let fd_key = overlay(41);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let e_id = pins.pinned().next().expect("the pin").id;
+        let mut twin = split_prearm_pin(fd_key, fd_key, "deadbeef", 1);
+        reback(&mut twin, &other);
+        mark_pre_copy_up(&mut twin);
+        assert!(pins.absorb(twin).is_empty());
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[e_id]),
+            None,
+            "a divergent live claimant vetoes the exact join"
+        );
+    }
+
+    /// Same file restaged under a second spelling merges: the exact
+    /// note joins the one adopted object, and no second owner exists
+    /// to force ambiguity.
+    #[test]
+    fn exact_note_with_same_file_group_resolves_to_planned_owner() {
+        use super::test_fixture::{backing_file, overlay, reback, repath_single_pin};
+        let fd_key = overlay(41);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut pins, &file);
+        let e_id = pins.pinned().next().expect("the pin").id;
+        let mut late = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        reback(&mut late, &file);
+        repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+        assert!(pins.absorb(late).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            1,
+            "the same file restaged under another spelling merges"
+        );
+        assert_eq!(
+            pins.resolve_exact_note_target(fd_key, &[e_id]),
+            Some(e_id),
+            "the merged adoption joins"
         );
     }
 

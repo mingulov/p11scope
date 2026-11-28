@@ -93982,6 +93982,216 @@ fn terminal_rowless_resolved_note_publishes_with_its_gap() {
     );
 }
 
+/// Exact-key duplicate: a loader note under the adopted key staged
+/// after the final projection folds onto the planned row (gaining
+/// first_loaded_by) instead of vanishing in the planned-key skip.
+#[test]
+fn terminal_exact_duplicate_note_folds_onto_planned_row() {
+    let (mut engine, _, _, maps_key) = split_merged_terminal_state();
+    engine.learned_notes.insert(maps_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one adopted file stays one row"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the planned row gains the duplicate note"
+    );
+    assert!(
+        engine.plan.skipped.is_empty(),
+        "the fold files no gap: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Exact-key duplicate without a projected row: the adopted key's
+/// note still publishes as its own detailed record with the unjoined
+/// gap instead of vanishing.
+#[test]
+fn terminal_exact_duplicate_note_without_row_publishes_representation() {
+    use crate::discovery::identity::test_fixture::PATH;
+    let (mut engine, _, _, maps_key) = split_merged_terminal_state();
+    engine.learned_notes.insert(maps_key, split_note());
+    engine.discovery.modules = Vec::new();
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the adopted note keeps its record"
+    );
+    let ghost = &engine.discovery.modules[0];
+    assert!(
+        ghost.first_loaded_by.is_some(),
+        "the record carries the note"
+    );
+    assert_eq!(ghost.path, PATH, "the adopted file is named");
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_UNJOINED_REASON
+        }),
+        "the record names its unjoined gap: {:?}",
+        ghost.skipped
+    );
+}
+
+/// Exact-key note with an already-noted row: the row keeps its note
+/// and no second row or gap appears — the fold never duplicates.
+#[test]
+fn terminal_exact_note_with_noted_row_stays_single() {
+    let (mut engine, _, _, maps_key) = split_merged_terminal_state();
+    engine.learned_notes.insert(maps_key, split_note());
+    let mut row = split_live_row(maps_key);
+    row.first_loaded_by = Some(split_note());
+    engine.discovery.modules = vec![row];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the noted row stays single"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the row keeps its note"
+    );
+    assert!(
+        engine.plan.skipped.is_empty(),
+        "no gap files for an attached note: {:?}",
+        engine.plan.skipped
+    );
+}
+
+/// Same-file second spelling at the terminal: the merged object plus
+/// a late same-file pin under a symlinked spelling fold the fd note
+/// onto the one planned row — one identity, one row, note attached.
+#[test]
+fn terminal_same_file_second_spelling_note_folds_onto_planned_row() {
+    use crate::discovery::identity::test_fixture::{
+        PATH, SHA, backing_file, overlay, reback, repath_single_pin, split_prearm_pin,
+        split_scan_pin,
+    };
+    let fd_key = overlay(41);
+    let maps_key = overlay(21);
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let mut pins = split_prearm_pin(fd_key, maps_key, SHA, 1);
+    reback(&mut pins, &file);
+    let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+    reback(&mut scan, &file);
+    assert!(pins.absorb(scan).is_empty());
+    let merged_id = pins.pinned().next().expect("the merged object").id;
+    let mut late = split_prearm_pin(fd_key, maps_key, SHA, 1);
+    reback(&mut late, &file);
+    repath_single_pin(&mut late, "/lib/x86_64-linux-gnu/libsofthsm2.so");
+    assert!(pins.absorb(late).is_empty());
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = merged_id;
+    plan.modules[0].key = maps_key;
+    plan.modules[0].path = PATH.to_string();
+    engine.plan = plan;
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one identity stays one row: {:?}",
+        engine
+            .discovery
+            .modules
+            .iter()
+            .map(|row| &row.path)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the planned row gains the note"
+    );
+}
+
+/// Terminal-flush duplicate through real staging: the file is adopted
+/// and projected (noteless row), then the shutdown flush stages the
+/// same file twice — fresh, then the duplicate arm — and the note
+/// still folds onto the planned row instead of vanishing.
+#[test]
+fn terminal_flush_duplicate_note_folds_onto_planned_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("flush.c");
+    let so = dir.path().join("libflush.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void **out){ (void)out; return 5; }\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let display = so.to_string_lossy().into_owned();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    for _ in 0..2 {
+        let file = std::fs::File::open(&so).unwrap();
+        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        tx.send(crate::fanotify::LearnMsg::Candidate(
+            crate::fanotify::LearnedCandidate {
+                file,
+                dev,
+                ino,
+                display_path: display.clone(),
+                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+                loader_unknown_reason: None,
+                run_learned: false,
+                proving_retained: false,
+                loader_pid: None,
+            },
+        ))
+        .unwrap();
+        engine.set_learned_rx_for_test(rx);
+        let _drain_alive = &tx;
+        engine.shutdown_file_learning();
+    }
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the second flush takes the duplicate arm: no fresh object"
+    );
+    let key = *engine.learned_notes.keys().next().expect("the note key");
+    let id = engine
+        .pinned
+        .pinned()
+        .find(|pin| pin.key == key)
+        .expect("the staged pin")
+        .id;
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = id;
+    plan.modules[0].key = key;
+    plan.modules[0].path = display;
+    engine.plan = plan;
+    engine.discovery.modules = vec![split_live_row(key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "the flushed note joins its adopted row"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the planned row gains the flushed note"
+    );
+}
+
 /// Top-level gap dedup: two unjoined notes file one shared gap row,
 /// while each keeps its own record row.
 #[test]

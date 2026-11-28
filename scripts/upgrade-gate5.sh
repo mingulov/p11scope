@@ -52,6 +52,10 @@ SYNTHETIC=0
 # every listed dir, so the deb leg expects none). Observed live on the
 # official 0.7.1 rpm; the 0.7.2 layout is identical (same packager, verified
 # live this round), so both phases pin the same set. Sorted LC_ALL=C.
+# The rust-1.99.1 / rust-nightly-2026-05-20 components are historical facts
+# about the v0.7.1 package (v0.7.1 tag: .release-rust-version and
+# crates/ebpf/rust-toolchain.toml); do NOT derive them from the current
+# tree, which may have moved on. A toolchain bump keeps this pin as is.
 RPM_EMPTY_DIR_WART="/usr/share/doc/p11scope /usr/share/doc/p11scope/LICENSES /usr/share/doc/p11scope/notices /usr/share/doc/p11scope/notices/licenses /usr/share/doc/p11scope/notices/licenses/cargo /usr/share/doc/p11scope/notices/licenses/package-files /usr/share/doc/p11scope/notices/licenses/rust-1.99.1 /usr/share/doc/p11scope/notices/licenses/rust-1.99.1/licenses /usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20 /usr/share/doc/p11scope/notices/licenses/rust-nightly-2026-05-20/licenses /usr/share/doc/p11scope/notices/licenses/upstream"
 SHARED_PREFIXES="/ /usr /usr/bin /usr/share /usr/share/doc"
 

@@ -202,7 +202,34 @@ FF_NOMOD_KNOWN_SKIPS = frozenset({
 #: "ptrace", "gone" and a missing detail stay generic (see
 #: mem_unavailable in src/discovery/scan.rs for the vocabulary).
 CR_RUN_NODELAY_KNOWN_GAP = "scan_unavailable"
-CR_RUN_NODELAY_KNOWN_SCAN_REASON = "unreadable"
+
+#: The only complete scan-reason set the KI-26 row accepts: exactly one
+#: unreadable scan and nothing else. Set equality (never membership):
+#: any second reason, known or unknown, stays red.
+CR_RUN_NODELAY_KNOWN_SCAN_REASONS = frozenset({"unreadable"})
+
+
+def scan_unavailable_reasons(report):
+    """The complete set of typed scan_unavailable reasons in the record.
+
+    The scalar ``evidence.scan_unavailable`` is the only typed site that
+    carries a mem-open reason (rendered at
+    src/discovery/engine.rs:11234; schema string/null): per-view reasons
+    merge first-wins (src/discovery/engine.rs:12091-12094) and per-object
+    scan losses project to the generic discovery-unavailable vocabulary
+    (src/render.rs:2448-2457), so no per-object or per-pass reason
+    survives in the typed record. Returns the singleton {reason} when
+    the scalar is present, else the empty set.
+    """
+    reason = oracle.evidence(report).get("scan_unavailable")
+    if reason is None:
+        return set()
+    return {reason}
+
+
+def scan_reason_set_matches(reasons):
+    """Whether a reason set is exactly the row's known singleton."""
+    return set(reasons) == CR_RUN_NODELAY_KNOWN_SCAN_REASONS
 
 
 class KnownFailure(AssertionError):
@@ -252,7 +279,7 @@ def known_failure_signature(cell, report, failures, allowed_gaps):
     if cell == "CR-RUN-NODELAY":
         if len(failures) != 1:
             return None
-        if oracle.evidence(report).get("scan_unavailable") != CR_RUN_NODELAY_KNOWN_SCAN_REASON:
+        if not scan_reason_set_matches(scan_unavailable_reasons(report)):
             return None
         classes = oracle.evidence(report).get("gap_classes") or {}
         observation = (classes.get("observation") or {}) if isinstance(classes, dict) else {}
@@ -5336,11 +5363,27 @@ class ClassifierMutationTests(unittest.TestCase):
             "CR_RUN_NODELAY_KNOWN_SIGNATURE": CR_RUN_NODELAY_KNOWN_SIGNATURE,
             "FF_NOMOD_KNOWN_SKIPS": FF_NOMOD_KNOWN_SKIPS,
             "CR_RUN_NODELAY_KNOWN_GAP": CR_RUN_NODELAY_KNOWN_GAP,
-            "CR_RUN_NODELAY_KNOWN_SCAN_REASON": CR_RUN_NODELAY_KNOWN_SCAN_REASON,
+            "CR_RUN_NODELAY_KNOWN_SCAN_REASONS": CR_RUN_NODELAY_KNOWN_SCAN_REASONS,
+            "scan_unavailable_reasons": scan_unavailable_reasons,
+            "scan_reason_set_matches": scan_reason_set_matches,
             "oracle": oracle,
         }
         exec(source.replace(old, new, 1), namespace)
         return namespace["known_failure_signature"]
+
+    def mutate_predicate(self, old, new):
+        source = inspect.getsource(scan_reason_set_matches)
+        self.assertIn(old, source)
+        namespace = {"CR_RUN_NODELAY_KNOWN_SCAN_REASONS": CR_RUN_NODELAY_KNOWN_SCAN_REASONS}
+        exec(source.replace(old, new, 1), namespace)
+        return namespace["scan_reason_set_matches"]
+
+    def mutate_gatherer(self, old, new):
+        source = inspect.getsource(scan_unavailable_reasons)
+        self.assertIn(old, source)
+        namespace: dict = {"oracle": oracle}
+        exec(source.replace(old, new, 1), namespace)
+        return namespace["scan_unavailable_reasons"]
 
     def ff_report(self, probes=0, rows=(), skipped=()):
         return {"functions": list(rows),
@@ -5422,8 +5465,9 @@ class ClassifierMutationTests(unittest.TestCase):
                          FF_NOMOD_KNOWN_SIGNATURE)
 
     def test_nodelay_detail_guard_kills(self):
-        mutant = self.mutate("if oracle.evidence(report).get(\"scan_unavailable\") != CR_RUN_NODELAY_KNOWN_SCAN_REASON:",
-                             "if False:")
+        mutant = self.mutate(
+            "if not scan_reason_set_matches(scan_unavailable_reasons(report)):",
+            "if False:")
         report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
                                      "ptrace")
         failures = [self.nodelay_gap_failure()]
@@ -5433,17 +5477,55 @@ class ClassifierMutationTests(unittest.TestCase):
             mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
             CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
-    def test_nodelay_detail_direction_kills(self):
-        mutant = self.mutate("!= CR_RUN_NODELAY_KNOWN_SCAN_REASON:",
-                             "== CR_RUN_NODELAY_KNOWN_SCAN_REASON:")
-        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
-                                     "unreadable")
-        failures = [self.nodelay_gap_failure()]
+    def test_scan_reason_set_exact_equality(self):
+        self.assertTrue(scan_reason_set_matches({"unreadable"}))
+        for reasons in (set(), {"gone"}, {"ptrace"}, {"denied"},
+                        {"unreadable", "gone"}, {"unreadable", "denied"},
+                        {"unreadable", "unreadable", "gone"}):
+            with self.subTest(reasons=sorted(reasons)):
+                self.assertFalse(scan_reason_set_matches(reasons))
+
+    def test_scan_unavailable_reasons_gathers_scalar(self):
         self.assertEqual(
-            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
-            CR_RUN_NODELAY_KNOWN_SIGNATURE)
-        self.assertIsNone(
-            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+            scan_unavailable_reasons(self.nodelay_report([], "unreadable")),
+            {"unreadable"})
+        self.assertEqual(
+            scan_unavailable_reasons(self.nodelay_report([], "gone")), {"gone"})
+        self.assertEqual(scan_unavailable_reasons(self.nodelay_report([], None)), set())
+        self.assertEqual(scan_unavailable_reasons({"functions": []}), set())
+
+    def test_scan_reason_singleton_matches_signature(self):
+        self.assertEqual(len(CR_RUN_NODELAY_KNOWN_SCAN_REASONS), 1)
+        self.assertIn(CR_RUN_NODELAY_KNOWN_SIGNATURE["scan_reason"],
+                      CR_RUN_NODELAY_KNOWN_SCAN_REASONS)
+
+    def test_predicate_equality_direction_kills(self):
+        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
+                                       "!= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
+        self.assertTrue(scan_reason_set_matches({"unreadable"}))
+        self.assertFalse(mutant({"unreadable"}))
+        self.assertFalse(scan_reason_set_matches({"gone"}))
+        self.assertTrue(mutant({"gone"}))
+
+    def test_predicate_subset_mutant_kills(self):
+        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
+                                       "<= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
+        self.assertFalse(scan_reason_set_matches(set()))
+        self.assertTrue(mutant(set()))
+
+    def test_predicate_superset_mutant_kills(self):
+        mutant = self.mutate_predicate("== CR_RUN_NODELAY_KNOWN_SCAN_REASONS",
+                                       ">= CR_RUN_NODELAY_KNOWN_SCAN_REASONS")
+        self.assertFalse(scan_reason_set_matches({"unreadable", "gone"}))
+        self.assertTrue(mutant({"unreadable", "gone"}))
+        self.assertFalse(scan_reason_set_matches({"unreadable", "denied"}))
+        self.assertTrue(mutant({"unreadable", "denied"}))
+
+    def test_gatherer_scalar_mutant_kills(self):
+        mutant = self.mutate_gatherer("    return {reason}", "    return set()")
+        report = self.nodelay_report([], "unreadable")
+        self.assertEqual(scan_unavailable_reasons(report), {"unreadable"})
+        self.assertEqual(mutant(report), set())
 
     def test_nodelay_causes_guard_kills(self):
         mutant = self.mutate("if extra != [CR_RUN_NODELAY_KNOWN_GAP]:", "if False:")

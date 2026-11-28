@@ -386,7 +386,10 @@ impl AtomicFile {
         staging: RecoveryStaging,
         write_error: String,
     ) -> CommitFailure {
-        let base = recovered_base_dir();
+        // The dir actually attempted: the staging may have fallen
+        // back to a fresh sibling when the base was unusable, and
+        // the double-failure line must name that dir, not the base.
+        let actual = staging.actual().to_path_buf();
         match staging.finish() {
             Ok(saved) => {
                 let euid = unsafe { libc::geteuid() } as u32;
@@ -405,7 +408,7 @@ impl AtomicFile {
                 message: format!(
                     "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
                     self.final_path.display(),
-                    base.display()
+                    actual.display()
                 ),
                 kind: CommitFailureKind::RecoveryFailed,
                 saved: None,

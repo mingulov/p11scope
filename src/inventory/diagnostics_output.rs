@@ -148,13 +148,12 @@ impl DiagnosticsDestination {
                             self.path.display()
                         ));
                     }
+                    // The helper already prints `writing <path> failed:`,
+                    // so the caller passes the bare primary cause: a
+                    // wrapped prefix would print it twice.
                     let failure = self.output.fail_streaming_write_with_recovery(
                         staging,
-                        format!(
-                            "writing diagnostics {} failed: {}",
-                            self.path.display(),
-                            primary_error.unwrap_or_else(|| "unknown error".to_string()),
-                        ),
+                        primary_error.unwrap_or_else(|| "unknown error".to_string()),
                     );
                     return Err(failure.into_message());
                 }

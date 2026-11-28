@@ -7663,6 +7663,39 @@ def self_test():
     ]
     for bad in bad_minimal:
         rejected(lambda bad=bad: exact_capture_modules(bad))
+    # The gap covers only the missing digest: device, inode and build
+    # id stay exact on both lists, and a digest-less module with no
+    # discovery row to cover it stays rejected.
+    def corrupt_minimal_row(**overrides):
+        document = minimal_row_doc(LEARNED_NOTE_AMBIGUOUS_REASON)
+        row = document["evidence"]["discovery"][0]
+        module = document["capture"]["modules"][0]
+        for key, value in overrides.items():
+            row[key] = value
+            module[key] = value
+        return settle_fixture_verdict(document)
+
+    for bad in (
+        corrupt_minimal_row(dev=[8]),
+        corrupt_minimal_row(ino=0),
+        corrupt_minimal_row(build_id="zz"),
+    ):
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    unkeyed = minimal_row_doc(LEARNED_NOTE_AMBIGUOUS_REASON)
+    del unkeyed["evidence"]["discovery"][0]["build_id"]
+    del unkeyed["capture"]["modules"][0]["build_id"]
+    rejected(lambda: exact_capture_modules(unkeyed))
+    long_modules = minimal_row_doc(LEARNED_NOTE_AMBIGUOUS_REASON)
+    long_modules["capture"]["modules"].append(
+        {
+            "path": "unknown",
+            "dev": [8, 1],
+            "ino": 4243,
+            "sha256": None,
+            "build_id": None,
+        }
+    )
+    rejected(lambda: exact_capture_modules(long_modules))
     print("learned-note minimal rows carry their named gap, never a digest: OK")
     # Review answer (a) / F-1: the oracle recomputes the verdict from the
     # counters and refuses a document whose classes or detail disagree.

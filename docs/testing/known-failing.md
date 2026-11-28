@@ -177,12 +177,15 @@ crash after the fragment write cannot pass as green.
 
 ## Follow-ups
 
-- Stream identity: a row currently applies to every result stream with
-  the same runner and host. The first real cell row selected by only
-  one of several same-runner streams will need a stream identity so
-  the other streams do not fail it as unselected.
-- FF-NOMOD row: the browser cells run untyped, and the typed stream
-  skips them when prerequisites are missing (a skipped listed row
-  stays red). The post-tag row needs the browser job running under
-  `typed-python-suite.py` with its own judgment, plus the stream
-  identity above.
+- Stream identity: implemented. The strict browser-cells CI job merges
+  its typed results with runner `python-suite-strict-browser` (via
+  `P11SCOPE_KNOWN_FAILING_RUNNER`), and rows naming that runner are
+  judged only in that stream — never in the plain `python-suite`
+  scripts stream, where their live cells skip. A row still applies to
+  every result stream with the same runner and host.
+- FF-NOMOD row: done. The browser job runs the suite under
+  `typed-python-suite.py` via `scripts/run-python-suites.py
+  test_browser_cells.py` with the strict-browser runner identity, and
+  the judgment absorbs matching `KnownFailure`s as expected failures.
+  The post-tag FF-NOMOD row and its CR-RUN-NODELAY sibling are the
+  first stream-scoped rows (KI-25, KI-26).

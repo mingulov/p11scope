@@ -176,15 +176,16 @@ _SHA256_MECHANISM_ID = 0x00000250
 _SOFTOKN_BASENAME = "libsoftokn3.so"
 
 #: Typed known-failure signatures the ledger rows match by exact
-#: equality (tests/known-failing.json; KI-01/KI-02 in
+#: equality (tests/known-failing.json; KI-25/KI-26 in
 #: docs/known-limitations.md). Only the named report shapes raise
 #: them; every other failure keeps the generic unittest signature and
 #: stays red. The ledger twins pin these constants against the rows.
 FF_NOMOD_KNOWN_SIGNATURE = {"cell": "FF-NOMOD", "branch": "unproven_resume_intake"}
-CR_RUN_NODELAY_KNOWN_SIGNATURE = {"cell": "CR-RUN-NODELAY", "branch": "scan_unavailable"}
+CR_RUN_NODELAY_KNOWN_SIGNATURE = {"cell": "CR-RUN-NODELAY", "branch": "scan_unavailable",
+                                  "scan_reason": "unreadable"}
 
 #: Skip records the member-stop unproven-resume intake race files on
-#: FF-NOMOD (KI-01): a stopped child exits before the proving read, so
+#: FF-NOMOD (KI-25): a stopped child exits before the proving read, so
 #: intake records a first-use gap instead of withdrawing the stop
 #: (src/discovery/member_stop.rs intake_member_stop). Both shapes keep
 #: the never-mapped property (zero rows, zero probes).
@@ -194,9 +195,13 @@ FF_NOMOD_KNOWN_SKIPS = frozenset({
 })
 
 #: The one gap cause the CR-RUN-NODELAY post-scan exit race discloses
-#: (KI-02): the victim exits during the post-scan, its /proc mem open
+#: (KI-26): the victim exits during the post-scan, its /proc mem open
 #: fails unreadable, and the engine latches scan_unavailable loud.
+#: Only the "unreadable" typed reason is the granted race; "ptrace",
+#: "gone" and a missing detail stay generic (see mem_unavailable in
+#: src/discovery/scan.rs for the product vocabulary).
 CR_RUN_NODELAY_KNOWN_GAP = "scan_unavailable"
+CR_RUN_NODELAY_KNOWN_SCAN_REASON = "unreadable"
 
 
 class KnownFailure(AssertionError):
@@ -245,6 +250,8 @@ def known_failure_signature(cell, report, failures, allowed_gaps):
         return dict(FF_NOMOD_KNOWN_SIGNATURE)
     if cell == "CR-RUN-NODELAY":
         if len(failures) != 1:
+            return None
+        if oracle.evidence(report).get("scan_unavailable") != CR_RUN_NODELAY_KNOWN_SCAN_REASON:
             return None
         classes = oracle.evidence(report).get("gap_classes") or {}
         observation = (classes.get("observation") or {}) if isinstance(classes, dict) else {}
@@ -2034,7 +2041,7 @@ class BrowserCells(unittest.TestCase):
                               qualify_nomod_link_loss=True)
 
     def test_ff_nomod_learned_first_use_raises_ledger_signature(self):
-        """KI-01 twin: the learned-first-use intake row carries the row signature."""
+        """KI-25 twin: the learned-first-use intake row carries the row signature."""
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
         result = self._twin_nomod_known_result("FF-NOMOD", [
@@ -2051,7 +2058,7 @@ class BrowserCells(unittest.TestCase):
                          FF_NOMOD_KNOWN_SIGNATURE)
 
     def test_ff_nomod_mid_flight_skip_raises_ledger_signature(self):
-        """KI-01 twin: the mid-flight skip row carries the same row signature."""
+        """KI-25 twin: the mid-flight skip row carries the same row signature."""
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
         result = self._twin_nomod_known_result("FF-NOMOD", [
@@ -2067,7 +2074,7 @@ class BrowserCells(unittest.TestCase):
                          FF_NOMOD_KNOWN_SIGNATURE)
 
     def test_ff_nomod_both_known_skips_raise_ledger_signature(self):
-        """KI-01 twin: both intake rows together still carry the row signature."""
+        """KI-25 twin: both intake rows together still carry the row signature."""
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
         result = self._twin_nomod_known_result("FF-NOMOD", [
@@ -2083,7 +2090,7 @@ class BrowserCells(unittest.TestCase):
                              "BrowserCells.test_ff_nomod_observes_nothing"))
 
     def test_ff_nomod_other_skip_stays_generic(self):
-        """KI-01 twin: an unnamed skip reason keeps the generic signature."""
+        """KI-25 twin: an unnamed skip reason keeps the generic signature."""
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
         result = self._twin_nomod_known_result("FF-NOMOD", [
@@ -2096,7 +2103,7 @@ class BrowserCells(unittest.TestCase):
         self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
 
     def test_ff_nomod_known_skip_plus_probe_stays_generic(self):
-        """KI-01 twin: the known row plus an attached probe stays generic."""
+        """KI-25 twin: the known row plus an attached probe stays generic."""
         sha = "0" * 64
         store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
         evidence = self._twin_evidence(
@@ -2118,14 +2125,20 @@ class BrowserCells(unittest.TestCase):
         self.assertIs(type(raised.exception), AssertionError)
         self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
 
-    def _twin_nodelay_result(self, name, rows, causes):
-        """Exact-sign CR-RUN-NODELAY twin; ``causes`` plants the gap under test."""
+    def _twin_nodelay_result(self, name, rows, causes, scan_detail):
+        """Exact-sign CR-RUN-NODELAY twin.
+
+        ``causes`` plants the gap under test; ``scan_detail`` is the
+        typed ``evidence.scan_unavailable`` reason (``None`` renders a
+        missing detail).
+        """
         sha = "0" * 64
         evidence = self._twin_evidence(
             attached_probes=2,
             verdict_detail="concrete_gap",
             gap_classes={"observation": {"status": "lossy", "causes": list(causes)}},
             skipped=[],
+            scan_unavailable=scan_detail,
         )
         result = self._twin_result(name, rows, evidence)
         doc = json.loads(result.report_path.read_text())
@@ -2157,12 +2170,13 @@ class BrowserCells(unittest.TestCase):
                                     "exact_calls": 2}})
 
     def test_cr_run_nodelay_scan_unavailable_raises_ledger_signature(self):
-        """KI-02 twin: the lone unreadable post-scan gap carries the row signature."""
+        """KI-26 twin: the lone unreadable post-scan gap carries the row signature."""
         sha = "0" * 64
         rows = [self._twin_row(["C_SignInit"], 1, sha),
                 self._twin_row(["C_Sign"], 1, sha)]
         result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"])
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+            "unreadable")
         with self.assertRaises(KnownFailure) as raised:
             self._check_nodelay_cell(result, sha)
         self.assertEqual(raised.exception.p11scope_signature,
@@ -2172,23 +2186,64 @@ class BrowserCells(unittest.TestCase):
                          CR_RUN_NODELAY_KNOWN_SIGNATURE)
 
     def test_cr_run_nodelay_other_gap_stays_generic(self):
-        """KI-02 twin: a different lone gap cause keeps the generic signature."""
+        """KI-26 twin: a different lone gap cause keeps the generic signature."""
         sha = "0" * 64
         rows = [self._twin_row(["C_SignInit"], 1, sha),
                 self._twin_row(["C_Sign"], 1, sha)]
         result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["in_flight_at_end"])
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["in_flight_at_end"],
+            None)
         with self.assertRaises(AssertionError) as raised:
             self._check_nodelay_cell(result, sha)
         self.assertIs(type(raised.exception), AssertionError)
         self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
 
     def test_cr_run_nodelay_scan_gap_plus_lost_sign_stays_generic(self):
-        """KI-02 twin: the known gap plus a lost sign stays generic."""
+        """KI-26 twin: the known gap plus a lost sign stays generic."""
         sha = "0" * 64
         rows = [self._twin_row(["C_SignInit"], 1, sha)]
         result, sha = self._twin_nodelay_result(
-            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"])
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+            "unreadable")
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_cr_run_nodelay_ptrace_scan_stays_generic(self):
+        """KI-26 twin: a ptrace-refused scan is not the granted race."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+            "ptrace")
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_cr_run_nodelay_gone_scan_stays_generic(self):
+        """KI-26 twin: a gone scan is not the granted race."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+            "gone")
+        with self.assertRaises(AssertionError) as raised:
+            self._check_nodelay_cell(result, sha)
+        self.assertIs(type(raised.exception), AssertionError)
+        self.assertFalse(hasattr(raised.exception, "p11scope_signature"))
+
+    def test_cr_run_nodelay_missing_scan_detail_stays_generic(self):
+        """KI-26 twin: a scan gap with no typed detail stays generic."""
+        sha = "0" * 64
+        rows = [self._twin_row(["C_SignInit"], 1, sha),
+                self._twin_row(["C_Sign"], 1, sha)]
+        result, sha = self._twin_nodelay_result(
+            "CR-RUN-NODELAY", rows, sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+            None)
         with self.assertRaises(AssertionError) as raised:
             self._check_nodelay_cell(result, sha)
         self.assertIs(type(raised.exception), AssertionError)

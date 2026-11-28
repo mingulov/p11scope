@@ -1,0 +1,1228 @@
+{
+  "complete": true,
+  "invocation": [],
+  "path": "tests/python/test_browser_cells.py",
+  "process_exit": 0,
+  "results": [
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_aggregate_module_counts_sums_exactly_across_pair"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_attach_grace_default_is_the_measured_bound"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_attached_cell_still_rejects_link_loss"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_attached_run_gaps_exact"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_capture_readiness_marker_arrives_runs_flow"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_capture_ready_parsing"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_check_report_duplicate_open_entries_ordered_absence"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_check_report_duplicate_rows_sum_within_sha"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_chromium_uses_fresh_home_nss_db"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_client_cert_error_kinds"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_client_hello_parser_buckets"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_cr_pinbound_stalls_before_login_or_signing"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_cr_plain_validates_without_private_token_use"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_cr_run_nodelay_other_gap_stays_generic"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_cr_run_nodelay_scan_gap_plus_lost_sign_stays_generic"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_cr_run_nodelay_scan_unavailable_raises_ledger_signature"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_cr_run_sign_observes_client_cert_signs"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_crrunsign_rig_healthy_sign_passes"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_crrunsign_rig_mechanism_without_rows_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_crrunsign_rig_no_sign_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_crrunsign_rig_no_tls_ground_truth_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_crrunsign_rig_unattributed_mechanism_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_fast_attach_logs_no_regression_warning"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_ff_first_with_background_provider_covers_browser"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_ff_nomod_both_known_skips_raise_ledger_signature"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_ff_nomod_known_skip_plus_probe_stays_generic"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_ff_nomod_learned_first_use_raises_ledger_signature"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_ff_nomod_mid_flight_skip_raises_ledger_signature"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_ff_nomod_observes_nothing"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_ff_nomod_other_skip_stays_generic"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_ff_pinbound_never_logs_in_or_signs"
+    },
+    {
+      "signature": {
+        "branch": "skipped",
+        "oracle": "unittest"
+      },
+      "state": "skipped",
+      "test": "BrowserCells.test_ff_startup_observes_nss_store_traffic"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_find_softokn_falls_back_to_candidates"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_find_softokn_prefers_ldconfig_hits"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_find_softokn_survives_ldconfig_failure"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_complete_client_hello_then_silence_stalls"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_hrr_without_clienthello2_is_abandoned"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_partial_client_hello_is_abandoned"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_records_handshake_outcomes"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_split_handshake_header_stalls"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_flow_server_survives_garbage_peer"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_handshake_classifier_buckets"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_launch_with_registered_module_keeps_store_env"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_launch_without_registered_module_scrubs_store_env"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_missing_nss_seed_tools_names_absent_tools"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_module_counts_sums_exactly_within_sha"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_module_open_entries_sums_exactly_within_sha"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_multi_sha_open_entries_aggregate_for_absences"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_navigation_waits_for_capture_readiness"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_nomod_link_loss_gate_prongs"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_nomod_qualified_link_loss_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_attached"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_extra_gap"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_rows"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_observer_first_waits_for_capture_ready"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_oracle_builder_healthy_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_oracle_rejects_attach_failures"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_oracle_rejects_halted_capture"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_oracle_rejects_inflight_absence_gap"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_oracle_rejects_unattributed_activity"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_refusal_after_cert_request_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_abandoned_with_navigation_timeout"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_bare_alert_without_cert_request"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_hrr_stall_without_cert_request"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_partial_client_hello_stall"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_preselection_failure"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rejects_refusal_without_cert_request"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rig_healthy_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_pinbound_rig_stall_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_direct_chromium_tmpdir_fits_the_singleton_socket"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_direct_initial_delay_prefix"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_direct_prearm_modules_pin_each_file"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_direct_with_module_narrows"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_direct_without_module_omits_narrowing"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_run_tree_descendant_gap_allowed_for_never_mapped_run"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_slow_attach_logs_a_regression_warning"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_slow_attach_threshold_preserves_the_original_bound"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_soft_call_stop_parsing"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_strict_attach_sites_reference_the_ruled_bound"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_strict_mode_rejects_empty_selection"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserCells.test_zero_counts_reject_inflight_entries"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_bootstrap_with_live_browser_instances_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_bootstrap_with_rows_passes_without_live_instances"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_bootstrap_without_rows_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_bootstrap_with_rows_refused"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_bootstrap_without_rows_refused"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_folded_reason_requires_partial"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_folded_reason_without_rows_refused"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_live_instance_with_folded_reason_refused"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_loss_reasons_stay_eligible"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_branch_valid_partial_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_exe_matches_basename_only"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_exe_matches_firefox_binary"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_sign_counts_non_background_instance"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_folded_sign_requires_attributed_instance"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_journal_refusal_fails_on_a_journal_build"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_journal_refusal_passes_on_a_journal_less_build"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_journal_refusal_with_lost_events_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_journal_refusal_with_rows_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_journal_refusal_without_build_cause_fails"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_fails_closed_on_malformed_rows"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_reads_the_doctor_row"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_rejects_lookalikes"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserReapTree.test_supervisor_forwards_termination_to_the_tree"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserReapTree.test_supervisor_kills_and_reaps_an_orphaned_tree"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserReapTree.test_supervisor_kills_the_tree_at_flow_completion"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserReapTree.test_supervisor_passes_through_a_clean_exit"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserReapTree.test_supervisor_supervises_when_already_a_group_leader"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_attach_cells_flag_non_literal_s1"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_attach_cells_require_no_opened_floor"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_check_report_multi_sha_floors_sum_across_pair"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_discovery_anchor_rejects_coherent_substitution"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_discovery_module_shas_exact"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_function_rows_typed_rejects_bools_and_bad_shapes"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_live_cells_all_wire_s1_proof"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nodelay_cross_alias_rejected_distinct_rows_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nodelay_exact_counts_reject_overcount_and_undercount"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nodelay_exact_wiring_healthy_accepted_hostile_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nodelay_zero_open_entries_rejects_surplus_inflight"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nss_gate_probe_enforces_order_branch_and_spelling"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nss_gate_probe_flags_ungated_seeders_only"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nss_seed_gate_errors_when_tools_are_missing"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_nss_seeding_cells_call_the_seed_gate"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_rsa_family_mirror_matches_product_table"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_check_report_wiring"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_healthy_sections_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_joint_content_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_login_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_mechanism_use_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_sessions_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_check_report_wiring"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_healthy_accepted"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_rejected"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_sign_mechanisms_exact_calls_rejects_duplicates"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_sign_mechanisms_rejects_nonsign_ops"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_skipped_run_floor_check_report_wiring"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_skipped_run_floor_exact"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "BrowserS1Oracle.test_system_first_cells_wire_browser_rows_oracle"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "FlowServerSignsOwed.test_empty_or_missing_cert_owes_no_sign"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "FlowServerSignsOwed.test_full_handshake_with_cert_owes_one_sign"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "FlowServerSignsOwed.test_resumed_handshake_owes_no_sign"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_absent_delay_spawns_at_once"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_delay_wait_rechecks_parent_after_deadline"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_initial_delay_holds_the_spawn"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_invalid_delay_fails_loud"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_orphaned_delay_exits_promptly"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_valueless_delay_flag_fails_usage"
+    },
+    {
+      "signature": null,
+      "state": "passed",
+      "test": "ReapTreeDelay.test_valueless_flow_done_flag_fails_usage"
+    }
+  ],
+  "schema": "p11scope/python-suite-fragment/v1",
+  "selection": [
+    {
+      "test": "BrowserCells.test_aggregate_module_counts_sums_exactly_across_pair"
+    },
+    {
+      "test": "BrowserCells.test_attach_grace_default_is_the_measured_bound"
+    },
+    {
+      "test": "BrowserCells.test_attached_cell_still_rejects_link_loss"
+    },
+    {
+      "test": "BrowserCells.test_attached_run_gaps_exact"
+    },
+    {
+      "test": "BrowserCells.test_capture_readiness_marker_arrives_runs_flow"
+    },
+    {
+      "test": "BrowserCells.test_capture_ready_parsing"
+    },
+    {
+      "test": "BrowserCells.test_check_report_duplicate_open_entries_ordered_absence"
+    },
+    {
+      "test": "BrowserCells.test_check_report_duplicate_rows_sum_within_sha"
+    },
+    {
+      "test": "BrowserCells.test_chromium_uses_fresh_home_nss_db"
+    },
+    {
+      "test": "BrowserCells.test_client_cert_error_kinds"
+    },
+    {
+      "test": "BrowserCells.test_client_hello_parser_buckets"
+    },
+    {
+      "test": "BrowserCells.test_cr_pinbound_stalls_before_login_or_signing"
+    },
+    {
+      "test": "BrowserCells.test_cr_plain_validates_without_private_token_use"
+    },
+    {
+      "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"
+    },
+    {
+      "test": "BrowserCells.test_cr_run_nodelay_other_gap_stays_generic"
+    },
+    {
+      "test": "BrowserCells.test_cr_run_nodelay_scan_gap_plus_lost_sign_stays_generic"
+    },
+    {
+      "test": "BrowserCells.test_cr_run_nodelay_scan_unavailable_raises_ledger_signature"
+    },
+    {
+      "test": "BrowserCells.test_cr_run_sign_observes_client_cert_signs"
+    },
+    {
+      "test": "BrowserCells.test_crrunsign_rig_healthy_sign_passes"
+    },
+    {
+      "test": "BrowserCells.test_crrunsign_rig_mechanism_without_rows_fails"
+    },
+    {
+      "test": "BrowserCells.test_crrunsign_rig_no_sign_fails"
+    },
+    {
+      "test": "BrowserCells.test_crrunsign_rig_no_tls_ground_truth_fails"
+    },
+    {
+      "test": "BrowserCells.test_crrunsign_rig_unattributed_mechanism_fails"
+    },
+    {
+      "test": "BrowserCells.test_fast_attach_logs_no_regression_warning"
+    },
+    {
+      "test": "BrowserCells.test_ff_first_with_background_provider_covers_browser"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_both_known_skips_raise_ledger_signature"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_known_skip_plus_probe_stays_generic"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_learned_first_use_raises_ledger_signature"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_mid_flight_skip_raises_ledger_signature"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_observes_nothing"
+    },
+    {
+      "test": "BrowserCells.test_ff_nomod_other_skip_stays_generic"
+    },
+    {
+      "test": "BrowserCells.test_ff_pinbound_never_logs_in_or_signs"
+    },
+    {
+      "test": "BrowserCells.test_ff_startup_observes_nss_store_traffic"
+    },
+    {
+      "test": "BrowserCells.test_find_softokn_falls_back_to_candidates"
+    },
+    {
+      "test": "BrowserCells.test_find_softokn_prefers_ldconfig_hits"
+    },
+    {
+      "test": "BrowserCells.test_find_softokn_survives_ldconfig_failure"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_complete_client_hello_then_silence_stalls"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_hrr_without_clienthello2_is_abandoned"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_partial_client_hello_is_abandoned"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_records_handshake_outcomes"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_split_handshake_header_stalls"
+    },
+    {
+      "test": "BrowserCells.test_flow_server_survives_garbage_peer"
+    },
+    {
+      "test": "BrowserCells.test_handshake_classifier_buckets"
+    },
+    {
+      "test": "BrowserCells.test_launch_with_registered_module_keeps_store_env"
+    },
+    {
+      "test": "BrowserCells.test_launch_without_registered_module_scrubs_store_env"
+    },
+    {
+      "test": "BrowserCells.test_missing_nss_seed_tools_names_absent_tools"
+    },
+    {
+      "test": "BrowserCells.test_module_counts_sums_exactly_within_sha"
+    },
+    {
+      "test": "BrowserCells.test_module_open_entries_sums_exactly_within_sha"
+    },
+    {
+      "test": "BrowserCells.test_multi_sha_open_entries_aggregate_for_absences"
+    },
+    {
+      "test": "BrowserCells.test_navigation_waits_for_capture_readiness"
+    },
+    {
+      "test": "BrowserCells.test_nomod_link_loss_gate_prongs"
+    },
+    {
+      "test": "BrowserCells.test_nomod_qualified_link_loss_accepted"
+    },
+    {
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_attached"
+    },
+    {
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_extra_gap"
+    },
+    {
+      "test": "BrowserCells.test_nomod_qualified_link_loss_rejects_rows"
+    },
+    {
+      "test": "BrowserCells.test_observer_first_waits_for_capture_ready"
+    },
+    {
+      "test": "BrowserCells.test_oracle_builder_healthy_accepted"
+    },
+    {
+      "test": "BrowserCells.test_oracle_rejects_attach_failures"
+    },
+    {
+      "test": "BrowserCells.test_oracle_rejects_halted_capture"
+    },
+    {
+      "test": "BrowserCells.test_oracle_rejects_inflight_absence_gap"
+    },
+    {
+      "test": "BrowserCells.test_oracle_rejects_unattributed_activity"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_refusal_after_cert_request_accepted"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_abandoned_with_navigation_timeout"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_bare_alert_without_cert_request"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_hrr_stall_without_cert_request"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_partial_client_hello_stall"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_preselection_failure"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rejects_refusal_without_cert_request"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rig_healthy_accepted"
+    },
+    {
+      "test": "BrowserCells.test_pinbound_rig_stall_accepted"
+    },
+    {
+      "test": "BrowserCells.test_run_direct_chromium_tmpdir_fits_the_singleton_socket"
+    },
+    {
+      "test": "BrowserCells.test_run_direct_initial_delay_prefix"
+    },
+    {
+      "test": "BrowserCells.test_run_direct_prearm_modules_pin_each_file"
+    },
+    {
+      "test": "BrowserCells.test_run_direct_with_module_narrows"
+    },
+    {
+      "test": "BrowserCells.test_run_direct_without_module_omits_narrowing"
+    },
+    {
+      "test": "BrowserCells.test_run_tree_descendant_gap_allowed_for_never_mapped_run"
+    },
+    {
+      "test": "BrowserCells.test_slow_attach_logs_a_regression_warning"
+    },
+    {
+      "test": "BrowserCells.test_slow_attach_threshold_preserves_the_original_bound"
+    },
+    {
+      "test": "BrowserCells.test_soft_call_stop_parsing"
+    },
+    {
+      "test": "BrowserCells.test_strict_attach_sites_reference_the_ruled_bound"
+    },
+    {
+      "test": "BrowserCells.test_strict_mode_rejects_empty_selection"
+    },
+    {
+      "test": "BrowserCells.test_zero_counts_reject_inflight_entries"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_bootstrap_with_live_browser_instances_fails"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_bootstrap_with_rows_passes_without_live_instances"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_bootstrap_without_rows_fails"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_bootstrap_with_rows_refused"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_bootstrap_without_rows_refused"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_folded_reason_requires_partial"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_folded_reason_without_rows_refused"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_live_instance_with_folded_reason_refused"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_loss_reasons_stay_eligible"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_branch_valid_partial_accepted"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_exe_matches_basename_only"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_exe_matches_firefox_binary"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_sign_counts_non_background_instance"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_folded_sign_requires_attributed_instance"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_journal_refusal_fails_on_a_journal_build"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_journal_refusal_passes_on_a_journal_less_build"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_journal_refusal_with_lost_events_fails"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_journal_refusal_with_rows_fails"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_journal_refusal_without_build_cause_fails"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_fails_closed_on_malformed_rows"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_reads_the_doctor_row"
+    },
+    {
+      "test": "BrowserFoldedLeg.test_observer_omits_journal_rejects_lookalikes"
+    },
+    {
+      "test": "BrowserReapTree.test_supervisor_forwards_termination_to_the_tree"
+    },
+    {
+      "test": "BrowserReapTree.test_supervisor_kills_and_reaps_an_orphaned_tree"
+    },
+    {
+      "test": "BrowserReapTree.test_supervisor_kills_the_tree_at_flow_completion"
+    },
+    {
+      "test": "BrowserReapTree.test_supervisor_passes_through_a_clean_exit"
+    },
+    {
+      "test": "BrowserReapTree.test_supervisor_supervises_when_already_a_group_leader"
+    },
+    {
+      "test": "BrowserS1Oracle.test_attach_cells_flag_non_literal_s1"
+    },
+    {
+      "test": "BrowserS1Oracle.test_attach_cells_require_no_opened_floor"
+    },
+    {
+      "test": "BrowserS1Oracle.test_check_report_multi_sha_floors_sum_across_pair"
+    },
+    {
+      "test": "BrowserS1Oracle.test_discovery_anchor_rejects_coherent_substitution"
+    },
+    {
+      "test": "BrowserS1Oracle.test_discovery_module_shas_exact"
+    },
+    {
+      "test": "BrowserS1Oracle.test_function_rows_typed_rejects_bools_and_bad_shapes"
+    },
+    {
+      "test": "BrowserS1Oracle.test_live_cells_all_wire_s1_proof"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nodelay_cross_alias_rejected_distinct_rows_accepted"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nodelay_exact_counts_reject_overcount_and_undercount"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nodelay_exact_wiring_healthy_accepted_hostile_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nodelay_zero_open_entries_rejects_surplus_inflight"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nss_gate_probe_enforces_order_branch_and_spelling"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nss_gate_probe_flags_ungated_seeders_only"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nss_seed_gate_errors_when_tools_are_missing"
+    },
+    {
+      "test": "BrowserS1Oracle.test_nss_seeding_cells_call_the_seed_gate"
+    },
+    {
+      "test": "BrowserS1Oracle.test_rsa_family_mirror_matches_product_table"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_check_report_wiring"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_healthy_sections_accepted"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_joint_content_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_login_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_mechanism_use_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_sessions_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_check_report_wiring"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_healthy_accepted"
+    },
+    {
+      "test": "BrowserS1Oracle.test_s1_sign_mechanisms_rejected"
+    },
+    {
+      "test": "BrowserS1Oracle.test_sign_mechanisms_exact_calls_rejects_duplicates"
+    },
+    {
+      "test": "BrowserS1Oracle.test_sign_mechanisms_rejects_nonsign_ops"
+    },
+    {
+      "test": "BrowserS1Oracle.test_skipped_run_floor_check_report_wiring"
+    },
+    {
+      "test": "BrowserS1Oracle.test_skipped_run_floor_exact"
+    },
+    {
+      "test": "BrowserS1Oracle.test_system_first_cells_wire_browser_rows_oracle"
+    },
+    {
+      "test": "FlowServerSignsOwed.test_empty_or_missing_cert_owes_no_sign"
+    },
+    {
+      "test": "FlowServerSignsOwed.test_full_handshake_with_cert_owes_one_sign"
+    },
+    {
+      "test": "FlowServerSignsOwed.test_resumed_handshake_owes_no_sign"
+    },
+    {
+      "test": "ReapTreeDelay.test_absent_delay_spawns_at_once"
+    },
+    {
+      "test": "ReapTreeDelay.test_delay_wait_rechecks_parent_after_deadline"
+    },
+    {
+      "test": "ReapTreeDelay.test_initial_delay_holds_the_spawn"
+    },
+    {
+      "test": "ReapTreeDelay.test_invalid_delay_fails_loud"
+    },
+    {
+      "test": "ReapTreeDelay.test_orphaned_delay_exits_promptly"
+    },
+    {
+      "test": "ReapTreeDelay.test_valueless_delay_flag_fails_usage"
+    },
+    {
+      "test": "ReapTreeDelay.test_valueless_flow_done_flag_fails_usage"
+    }
+  ],
+  "suite_events": []
+}

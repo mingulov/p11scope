@@ -239,6 +239,40 @@ class StaticValidationTests(unittest.TestCase):
         self.assertIn("no CI judge", result.stderr)
         self.assertIn("python-suite rows without github", result.stderr)
 
+    def test_strict_browser_runner_is_a_suite_stream(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(runner="python-suite-strict-browser")])
+        result = f.run_checker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_strict_browser_row_without_github_has_no_judge(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(runner="python-suite-strict-browser", hosts=["vng"])])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no CI judge", result.stderr)
+        self.assertIn("python-suite-strict-browser rows without github", result.stderr)
+
+    def test_strict_browser_row_needs_suite_registration(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        other = f.root / "tests/python/test_other.py"
+        other.write_text(
+            "import unittest\n"
+            "class Other(unittest.TestCase):\n"
+            "    def test_y(self): pass\n"
+            "if __name__ == '__main__': unittest.main()\n", encoding="utf-8")
+        f.rows([row(runner="python-suite-strict-browser",
+                    path="tests/python/test_other.py", test="Other.test_y")])
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("suite invocation is not registered", result.stderr)
+
     def test_wrong_vocabulary_runner_is_refused(self):
         for runner in ("bogus-runner", "host-matrix"):
             with self.subTest(runner=runner):
@@ -300,6 +334,19 @@ class StaticValidationTests(unittest.TestCase):
         result = f.run_checker()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rows expire at their target release", result.stderr)
+
+    def test_undecodable_release_notes_still_expire_rows(self):
+        f = fixture(self)
+        f.registry()
+        f.python_suite()
+        f.rows([row(target="0.7.3")])
+        target_doc = f.root / "docs/releases/v0.7.3.md"
+        target_doc.parent.mkdir(parents=True, exist_ok=True)
+        target_doc.write_bytes(b"# p11scope v0.7.3\n\xff\n")
+        result = f.run_checker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rows expire at their target release", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_release_notes_lookalikes_still_expire_rows(self):
         lookalikes = {
@@ -1206,7 +1253,7 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         self.assertEqual(len(rows), 2, "both production browser rows must exist")
         for row in rows:
             self.assertEqual(row["path"], "tests/python/test_browser_cells.py")
-            self.assertEqual(row["runner"], "python-suite")
+            self.assertEqual(row["runner"], "python-suite-strict-browser")
             self.assertEqual(row["mode"], "intermittent")
             self.assertNotIn(row["signature"]["branch"], self.GENERIC_BRANCHES)
         return rows
@@ -1225,18 +1272,208 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
         f.rows(rows)
         return f, {row["test"]: row["signature"] for row in rows}
 
-    def browser_doc(self, signatures):
+    def browser_doc(self, signatures, runner="python-suite-strict-browser"):
         return result_doc([
             {"path": "tests/python/test_browser_cells.py", "test": test,
              "signature": signature}
             for test, signature in signatures.items()
-        ])
+        ], runner=runner)
 
     def test_matching_browser_failures_are_covered(self):
         f, signatures = self.browser_fixture()
         result = f.run_checker("--results", str(f.results_file(self.browser_doc(signatures))))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("2 expected failures", result.stdout)
+
+    def test_passing_browser_cells_stay_green(self):
+        f, signatures = self.browser_fixture()
+        entries = [{"path": "tests/python/test_browser_cells.py", "test": test,
+                    "state": "passed", "signature": None}
+                   for test in signatures]
+        doc = result_doc(entries, runner="python-suite-strict-browser")
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 intermittent passes", result.stdout)
+
+    def test_skipped_strict_browser_row_is_not_a_pass(self):
+        f, signatures = self.browser_fixture()
+        entries = [{"path": "tests/python/test_browser_cells.py",
+                    "test": "BrowserCells.test_ff_nomod_observes_nothing",
+                    "state": "skipped",
+                    "signature": {"branch": "skipped", "oracle": "unittest"}},
+                   {"path": "tests/python/test_browser_cells.py",
+                    "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
+                    "state": "failed",
+                    "signature": signatures[
+                        "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs"]}]
+        doc = result_doc(entries, runner="python-suite-strict-browser")
+        result = f.run_checker("--results", str(f.results_file(doc)))
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("listed row was not executed", result.stderr)
+
+    def test_recorded_scripts_stream_ignores_strict_rows(self):
+        """A real recorded scripts fragment judges green with the rows present.
+
+        The fixture is a byte-faithful typed-python-suite.py fragment of the
+        production browser suite recorded without gate prerequisites (the
+        live cells skipped). Merged as the plain python-suite stream and
+        judged against the production ledger, the skipped live cells stay
+        green WITHOUT any skip-as-pass: the rows name the strict-browser
+        stream and are not applicable here. Refresh with: python3 -I
+        scripts/typed-python-suite.py tests/python/test_browser_cells.py
+        <out> -v on a host without P11SCOPE_BIN.
+        """
+        fragment = ROOT / "tests/fixtures/known-failing/scripts-shaped-browser-fragment.json"
+        recorded = json.loads(fragment.read_text(encoding="utf-8"))
+        self.assertTrue(recorded["complete"])
+        self.assertEqual(recorded["process_exit"], 0)
+        states = {item["test"]: item["state"] for item in recorded["results"]}
+        for test in self.CELLS:
+            self.assertEqual(states.get(test), "skipped",
+                             f"recorded fragment must skip {test}")
+        f, _signatures = self.browser_fixture()
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_recorded")
+        merged = f.root / "merged.json"
+        self.assertEqual(
+            runner.merge_typed_fragments(
+                [(fragment, "test_browser_cells.py", [], 0)], merged, "github"), [])
+        result = f.run_checker("--results", str(merged))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    STRICT_SUITE_TEMPLATE = (
+        "import shutil\n"
+        "import sys\n"
+        "import tempfile\n"
+        "import unittest\n"
+        "from pathlib import Path\n"
+        "from types import SimpleNamespace\n"
+        "sys.path.insert(0, __PRODUCTION__)\n"
+        "import test_browser_cells as prod\n"
+        "\n"
+        "class BrowserCells(unittest.TestCase):\n"
+        "    def test_ff_nomod_observes_nothing(self):\n"
+        "        work = Path(tempfile.mkdtemp(prefix='strict-e2e-'))\n"
+        "        self.addCleanup(shutil.rmtree, work, True)\n"
+        "        helper = prod.BrowserCells('test_ff_nomod_other_skip_stays_generic')\n"
+        "        helper.work = work\n"
+        "__FF_BODY__\n"
+        "    def test_cr_run_nodelay_observes_client_cert_signs(self):\n"
+        "        work = Path(tempfile.mkdtemp(prefix='strict-e2e-'))\n"
+        "        self.addCleanup(shutil.rmtree, work, True)\n"
+        "        helper = prod.BrowserCells('test_cr_run_nodelay_other_gap_stays_generic')\n"
+        "        helper.work = work\n"
+        "__NODELAY_BODY__\n"
+        "if __name__ == '__main__': unittest.main()\n"
+    )
+    FF_MATCH = (
+        "        store = SimpleNamespace(lib=Path('/not-opened/provider.so'))\n"
+        "        sha = '0' * 64\n"
+        "        result = helper._twin_nomod_known_result('FF-NOMOD', [\n"
+        "            {'name': 'discovery subject', 'reason': 'discovery unavailable'},\n"
+        "            {'name': 'learned provider file',\n"
+        "             'reason': prod.oracle.LEARNED_FIRST_USE_REASON},\n"
+        "        ])\n"
+        "        helper._check_nomod_cell(result, store, sha)\n"
+    )
+    FF_NONMATCH = (
+        "        store = SimpleNamespace(lib=Path('/not-opened/provider.so'))\n"
+        "        sha = '0' * 64\n"
+        "        result = helper._twin_nomod_known_result('FF-NOMOD', [\n"
+        "            {'name': 'discovery subject', 'reason': 'discovery unavailable'},\n"
+        "            {'name': 'provider file', 'reason': 'a detach window hid calls'},\n"
+        "        ])\n"
+        "        helper._check_nomod_cell(result, store, sha)\n"
+    )
+    FF_PASS = (
+        "        store = SimpleNamespace(lib=Path('/not-opened/provider.so'))\n"
+        "        sha = '0' * 64\n"
+        "        evidence = helper._twin_evidence(\n"
+        "            attached_probes=0,\n"
+        "            verdict_detail='concrete_gap',\n"
+        "            gap_classes={'observation': helper._twin_nomod_observation()})\n"
+        "        result = helper._twin_nomod_result('FF-NOMOD', [], evidence)\n"
+        "        helper._check_nomod_cell(result, store, sha)\n"
+    )
+    NODELAY_MATCH = (
+        "        sha = '0' * 64\n"
+        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
+        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
+        "        result, sha = helper._twin_nodelay_result(\n"
+        "            'CR-RUN-NODELAY', rows,\n"
+        "            sorted(prod._GAPS_ATTACHED_RUN) + ['scan_unavailable'],\n"
+        "            'unreadable')\n"
+        "        helper._check_nodelay_cell(result, sha)\n"
+    )
+    NODELAY_NONMATCH = (
+        "        sha = '0' * 64\n"
+        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
+        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
+        "        result, sha = helper._twin_nodelay_result(\n"
+        "            'CR-RUN-NODELAY', rows,\n"
+        "            sorted(prod._GAPS_ATTACHED_RUN) + ['in_flight_at_end'],\n"
+        "            None)\n"
+        "        helper._check_nodelay_cell(result, sha)\n"
+    )
+    NODELAY_PASS = (
+        "        sha = '0' * 64\n"
+        "        rows = [helper._twin_row(['C_SignInit'], 1, sha),\n"
+        "                helper._twin_row(['C_Sign'], 1, sha)]\n"
+        "        result, sha = helper._twin_nodelay_result(\n"
+        "            'CR-RUN-NODELAY', rows, sorted(prod._GAPS_ATTACHED_RUN), None)\n"
+        "        helper._check_nodelay_cell(result, sha)\n"
+    )
+
+    def strict_end_to_end(self, ff_body, nodelay_body):
+        """One two-cell suite through producer, merge and strict judgment.
+
+        The synthetic suite replays the production check_report oracle
+        calls with live-exact kwargs and twin report shapes, so the
+        recorded signatures are the actual failing artifact shapes. The
+        producer, merge (strict-browser runner, as the browser-cells CI
+        job runs it) and judgment are the real committed code paths.
+        """
+        f, _signatures = self.browser_fixture()
+        body = self.STRICT_SUITE_TEMPLATE.replace(
+            "__PRODUCTION__", json.dumps(str(ROOT / "tests" / "python")))
+        body = body.replace("__FF_BODY__", ff_body.rstrip("\n"))
+        body = body.replace("__NODELAY_BODY__", nodelay_body.rstrip("\n"))
+        suite = f.root / "tests/python/test_browser_cells.py"
+        suite.write_text(body, encoding="utf-8")
+        fragment = f.root / "fragment.json"
+        run = subprocess.run(
+            [sys.executable, "-I", str(ROOT / "scripts/typed-python-suite.py"),
+             "tests/python/test_browser_cells.py", str(fragment)],
+            cwd=f.root, capture_output=True, text=True, timeout=120)
+        self.assertIn(run.returncode, (0, 1), run.stderr)
+        runner = load_script(ROOT / "scripts/run-python-suites.py",
+                             "python_suite_runner_strict_e2e")
+        merged = f.root / "merged.json"
+        problems = runner.merge_typed_fragments(
+            [(fragment, "test_browser_cells.py", [], run.returncode)],
+            merged, "github", runner="python-suite-strict-browser")
+        self.assertEqual(problems, [])
+        return f.run_checker("--results", str(merged))
+
+    def test_strict_stream_matching_failures_are_known_failing(self):
+        judged = self.strict_end_to_end(self.FF_MATCH, self.NODELAY_MATCH)
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+        self.assertIn("2 expected failures", judged.stdout)
+
+    def test_strict_stream_nonmatching_ff_stays_red(self):
+        judged = self.strict_end_to_end(self.FF_NONMATCH, self.NODELAY_MATCH)
+        self.assertNotEqual(judged.returncode, 0)
+        self.assertIn("failure signature mismatch", judged.stderr)
+
+    def test_strict_stream_nonmatching_nodelay_stays_red(self):
+        judged = self.strict_end_to_end(self.FF_MATCH, self.NODELAY_NONMATCH)
+        self.assertNotEqual(judged.returncode, 0)
+        self.assertIn("failure signature mismatch", judged.stderr)
+
+    def test_strict_stream_passes_stay_green(self):
+        judged = self.strict_end_to_end(self.FF_PASS, self.NODELAY_PASS)
+        self.assertEqual(judged.returncode, 0, judged.stderr)
+        self.assertIn("2 intermittent passes", judged.stdout)
 
     def test_ff_nomod_nonmatching_failure_stays_red(self):
         f, signatures = self.browser_fixture()
@@ -1262,6 +1499,11 @@ class ProductionBrowserLedgerTests(unittest.TestCase):
                                  "oracle": "unittest"},
             "wrong_typed_branch": {"cell": "CR-RUN-NODELAY",
                                    "branch": "unproven_resume_intake"},
+            "wrong_scan_reason": {"cell": "CR-RUN-NODELAY",
+                                  "branch": "scan_unavailable",
+                                  "scan_reason": "ptrace"},
+            "missing_scan_reason": {"cell": "CR-RUN-NODELAY",
+                                    "branch": "scan_unavailable"},
         }
         for label, signature in variants.items():
             with self.subTest(label):
@@ -1298,6 +1540,42 @@ class StaticWiringTests(unittest.TestCase):
                         "static ledger check must precede typed judgment")
         self.assertEqual(set(steps[static[0]]), {"run"},
                          "static checker step must carry no guard keys (an if: could disable it)")
+
+    def browser_cells_job(self, workflow_path=None):
+        import yaml
+        path = workflow_path or ROOT / ".github/workflows/privileged-tests.yml"
+        document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        return document["jobs"]["browser-cells"]
+
+    def test_browser_cells_job_judges_the_strict_typed_stream(self):
+        job = self.browser_cells_job()
+        typed = [step for step in job["steps"]
+                 if isinstance(step, dict) and "run-python-suites.py" in str(step.get("run", ""))]
+        self.assertEqual(len(typed), 1,
+                         "browser-cells must run the typed suite driver exactly once")
+        step = typed[0]
+        self.assertNotIn("if", step,
+                         "typed browser step must carry no guard keys (an if: could disable it)")
+        run = step["run"]
+        for token in ('"$RUNNER_TEMP/pw/bin/python" -I scripts/run-python-suites.py test_browser_cells.py',
+                      "P11SCOPE_BROWSER_STRICT=1",
+                      "P11SCOPE_BIN=",
+                      "P11SCOPE_KNOWN_FAILING_RESULTS=",
+                      "P11SCOPE_KNOWN_FAILING_HOST=github",
+                      "P11SCOPE_KNOWN_FAILING_RUNNER=python-suite-strict-browser"):
+            self.assertIn(token, run, f"typed browser step must set {token}")
+        uploads = [step for step in job["steps"]
+                   if isinstance(step, dict) and "upload-artifact" in str(step.get("uses", ""))]
+        self.assertEqual(len(uploads), 1, "browser-cells must upload its artifacts exactly once")
+        self.assertIn("browser-kf.json", str(uploads[0].get("with", {}).get("path", "")),
+                      "browser-cells must archive the judged typed result document")
+
+    def test_browser_cells_venv_carries_the_checker_dependency(self):
+        text = (ROOT / ".github/workflows/privileged-tests.yml").read_text(encoding="utf-8")
+        self.assertIn('"pyyaml==$CI_PYYAML_VERSION"', text,
+                      "browser venv must pin pyyaml: the typed judgment imports yaml")
+        import yaml
+        self.assertIn("CI_PYYAML_VERSION", yaml.safe_load(text)["env"])
 
 
 class StrictNullAdmissionTests(unittest.TestCase):
@@ -2179,8 +2457,62 @@ class TypedEnvironmentTests(unittest.TestCase):
         failed = self.run_tiny_suite({"P11SCOPE_KNOWN_FAILING_RESULTS": "x"})
         self.assertIn("typed-result configuration", " ".join(failed))
 
+    def test_runner_only_typed_environment_fails_typed(self):
+        failed = self.run_tiny_suite(
+            {"P11SCOPE_KNOWN_FAILING_RUNNER": "python-suite-strict-browser"})
+        self.assertIn("typed-result configuration", " ".join(failed))
+
     def test_missing_typed_environment_runs_untyped(self):
         self.assertEqual(self.run_tiny_suite({}), [])
+
+    def test_merge_runner_param_names_the_stream(self):
+        runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_stream")
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            fragment = temp / "fragment.json"
+            fragment.write_text(
+                '{"schema": "p11scope/python-suite-fragment/v1", '
+                '"path": "tests/python/test_sample.py", "invocation": [], '
+                '"process_exit": 0, "complete": true, '
+                '"selection": [{"test": "Sample.test_x"}], '
+                '"results": [{"test": "Sample.test_x", "state": "passed", "signature": null}], '
+                '"suite_events": []}\n', encoding="utf-8")
+            strict = temp / "strict.json"
+            self.assertEqual(
+                runner.merge_typed_fragments(
+                    [(fragment, "test_sample.py", [], 0)], strict, "github",
+                    runner="python-suite-strict-browser"), [])
+            self.assertEqual(
+                json.loads(strict.read_text(encoding="utf-8"))["runner"],
+                "python-suite-strict-browser")
+            plain = temp / "plain.json"
+            self.assertEqual(
+                runner.merge_typed_fragments(
+                    [(fragment, "test_sample.py", [], 0)], plain, "github"), [])
+            self.assertEqual(
+                json.loads(plain.read_text(encoding="utf-8"))["runner"], "python-suite")
+
+    def test_typed_runner_env_reaches_the_merged_document(self):
+        f = fixture(self)
+        shutil.copy2(ROOT / "scripts/run-python-suites.py",
+                     f.root / "scripts/run-python-suites.py")
+        shutil.copy2(ROOT / "scripts/check-known-failing.py",
+                     f.root / "scripts/check-known-failing.py")
+        suite = f.root / "tests/python/test_sample.py"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(self.BODY, encoding="utf-8")
+        runner = load_script(f.root / "scripts/run-python-suites.py",
+                             "python_suite_runner_env_stream")
+        runner.RUN = [("test_sample.py", [])]
+        merged = f.root / "merged.json"
+        full_env = {"PATH": os.environ.get("PATH", ""),
+                    "P11SCOPE_KNOWN_FAILING_RESULTS": str(merged),
+                    "P11SCOPE_KNOWN_FAILING_HOST": "github",
+                    "P11SCOPE_KNOWN_FAILING_RUNNER": "python-suite-strict-browser"}
+        with mock.patch.dict(os.environ, full_env, clear=True):
+            self.assertEqual(runner.run_suites(set()), [])
+        self.assertEqual(json.loads(merged.read_text(encoding="utf-8"))["runner"],
+                         "python-suite-strict-browser")
 
     def test_merge_output_directory_fails_typed(self):
         runner = load_script(ROOT / "scripts/run-python-suites.py", "python_suite_runner_output_dir")
@@ -4997,6 +5329,12 @@ class MutationSweepTests(unittest.TestCase):
             "results-discovery-skip": ('discover_executables=args.results is None', 'discover_executables=True'),
             "generic-branch-refused": ('if isinstance(raw.get("signature"), dict) and type(raw["signature"].get("branch")) is str \\\n            and raw["signature"].get("branch") in GENERIC_SIGNATURE_BRANCHES:', 'if False:'),
             "target-release-expiry": ('if release_is_final(root, row["target"]):', 'if False:'),
+            "draft-marker-recognized": ('return all(line.strip() != RELEASE_DRAFT_MARKER',
+                                         'return any(line.strip() != RELEASE_DRAFT_MARKER'),
+            "strict-registration-required": ('PYTHON_SUITE_RUNNERS = {"python-suite", "python-suite-strict-browser"}',
+                                             'PYTHON_SUITE_RUNNERS = {"python-suite"}'),
+            "suite-runner-github-judge": ('if raw.get("runner") in PYTHON_SUITE_RUNNERS and "github" not in raw["hosts"]:',
+                                          'if False:'),
             "bogus-host-refused": ('if not isinstance(host, str) or host not in HOSTS:', 'if False:'),
             "cell-judge-runner": ('if invocation.get("runner") != row["runner"]:', 'if False:'),
             "unparsable-checker-mention": ('if ("check-cell-results.py" in executable_script\n                            or "run-cell-script.sh" in executable_script):', 'if False:'),
@@ -5131,6 +5469,23 @@ class MutationSweepTests(unittest.TestCase):
                 target_doc = f.root / "docs/releases/v0.7.3.md"
                 target_doc.parent.mkdir(parents=True, exist_ok=True)
                 target_doc.write_text("# p11scope v0.7.3\n", encoding="utf-8")
+                return None
+            if name == "strict-registration-required":
+                f.registry()
+                f.python_suite()
+                other = f.root / "tests/python/test_other.py"
+                other.write_text(
+                    "import unittest\n"
+                    "class Other(unittest.TestCase):\n"
+                    "    def test_y(self): pass\n"
+                    "if __name__ == '__main__': unittest.main()\n", encoding="utf-8")
+                f.rows([row(runner="python-suite-strict-browser",
+                            path="tests/python/test_other.py", test="Other.test_y")])
+                return None
+            if name == "suite-runner-github-judge":
+                f.registry()
+                f.python_suite()
+                f.rows([row(runner="python-suite-strict-browser", hosts=["vng"])])
                 return None
             if name == "draft-marker-recognized":
                 f.registry()

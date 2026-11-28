@@ -500,7 +500,7 @@ def print_registry():
         print(f"EXCLUDED  {name}: {reason}")
 
 
-def merge_typed_fragments(fragment_specs, output, host):
+def merge_typed_fragments(fragment_specs, output, host, runner="python-suite"):
     """Merge per-suite fragments into the typed result document.
 
     The outer runner owns the invocation selection. In addition to unittest
@@ -511,7 +511,9 @@ def merge_typed_fragments(fragment_specs, output, host):
     erased after every selected test passed. The fragment's self-reported
     process_exit must also equal the outer-observed returncode, since the
     fragment is written before interpreter shutdown and a teardown crash
-    never reaches it.
+    never reaches it. ``runner`` names the judged stream; the strict
+    browser-cells job merges with ``python-suite-strict-browser`` so only
+    its rows apply, and every other caller keeps the plain stream.
     """
     selection = []
     results = []
@@ -644,7 +646,7 @@ def merge_typed_fragments(fragment_specs, output, host):
 
     document = {
         "schema": "p11scope/known-failing-results/v1",
-        "runner": "python-suite",
+        "runner": runner,
         "host": host,
         "complete": complete,
         "selection": selection,
@@ -665,7 +667,8 @@ def run_suites(selected):
     failed = []
     typed_output = os.environ.get("P11SCOPE_KNOWN_FAILING_RESULTS")
     typed_host = os.environ.get("P11SCOPE_KNOWN_FAILING_HOST")
-    typed = bool(typed_output or typed_host)
+    typed_runner = os.environ.get("P11SCOPE_KNOWN_FAILING_RUNNER", "python-suite")
+    typed = bool(typed_output or typed_host or "P11SCOPE_KNOWN_FAILING_RUNNER" in os.environ)
     fragments = []
     entries = list(RUN) + [
         (name, []) for name in sorted(DRIVEN) if name in selected
@@ -698,7 +701,8 @@ def run_suites(selected):
                 print("run-python-suites: typed results need both P11SCOPE_KNOWN_FAILING_RESULTS and P11SCOPE_KNOWN_FAILING_HOST", file=sys.stderr)
                 return [*failed, "typed-result configuration"]
             output = Path(typed_output)
-            process_problems = merge_typed_fragments(fragments, output, typed_host)
+            process_problems = merge_typed_fragments(fragments, output, typed_host,
+                                                     runner=typed_runner)
             if process_problems is None:
                 return [*failed, "typed-result output"]
             checker = subprocess.run(

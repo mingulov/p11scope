@@ -37,10 +37,10 @@ The following limits are new in v0.7.2. Limits from
 apply unless a subsection here says otherwise.
 
 <!-- p11scope-known-issues-v1
-{"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-01","test":true},{"id":"KI-02","test":true}]}
+{"schema":"p11scope/known-issues/v1","issues":[{"id":"KI-25","test":true},{"id":"KI-26","test":true}]}
 -->
 
-### KI-01: a no-module Firefox run sometimes reports a first-use gap for an exited child
+### KI-25: a no-module Firefox run sometimes reports a first-use gap for an exited child
 
 On hosts with heavy short-lived-process churn (measured on Fedora),
 the FF-NOMOD cell intermittently fails while its asserted property
@@ -53,7 +53,7 @@ intake, the unproven-resume arm). Pre-existing: v0.7.1 fails the same
 way through the same arm. The 0.8.0 fix skips the row when the stopped
 file sits outside the narrowed capture selection.
 
-### KI-02: a no-delay Chromium run sometimes reports an unreadable post-scan
+### KI-26: a no-delay Chromium run sometimes reports an unreadable post-scan
 
 The CR-RUN-NODELAY cell intermittently fails with its signs exact: a
 Chromium descendant exits while a discovery post-scan reads it, the

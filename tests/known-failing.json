@@ -6,10 +6,10 @@
       "test": "BrowserCells.test_ff_nomod_observes_nothing",
       "cell": "FF-NOMOD",
       "issues": [
-        "KI-01"
+        "KI-25"
       ],
       "target": "0.8.0",
-      "runner": "python-suite",
+      "runner": "python-suite-strict-browser",
       "signature": {
         "cell": "FF-NOMOD",
         "branch": "unproven_resume_intake"
@@ -18,26 +18,27 @@
       "mode": "intermittent",
       "reason": "a stopped browser child exits before its stopping file is proven, so member-stop intake files a first-use skip row (mid-flight or learned-first-use) that trips the structural check while zero rows and zero probes hold",
       "last_green_sha": "7d96600cc1ca053164679e06be0eb69597794e97",
-      "evidence": "fedora lane: v0.7.1 2/6, WIP 7d96600cc 1/6 (r6 green); identical unproven-resume arm both sides"
+      "evidence": "spark-v072-hosts-fedora-browser-races.report.md"
     },
     {
       "path": "tests/python/test_browser_cells.py",
       "test": "BrowserCells.test_cr_run_nodelay_observes_client_cert_signs",
       "cell": "CR-RUN-NODELAY",
       "issues": [
-        "KI-02"
+        "KI-26"
       ],
       "target": "0.8.0",
-      "runner": "python-suite",
+      "runner": "python-suite-strict-browser",
       "signature": {
         "cell": "CR-RUN-NODELAY",
-        "branch": "scan_unavailable"
+        "branch": "scan_unavailable",
+        "scan_reason": "unreadable"
       },
       "lane": "task/v080-cr-nodelay-scan-race",
       "mode": "intermittent",
       "reason": "a chromium descendant exits during the post-scan, its /proc mem open fails unreadable, and the loud scan_unavailable gap is not allowlisted for run cells while the owed signs stay exact",
       "last_green_sha": "7d96600cc1ca053164679e06be0eb69597794e97",
-      "evidence": "fedora lane: WIP 7d96600cc 5/6, the one red carries scan_unavailable with signs exact 1/1"
+      "evidence": "spark-v072-hosts-fedora-browser-races.report.md"
     }
   ]
 }

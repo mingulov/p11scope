@@ -110,6 +110,7 @@ env:
   CI_TOOL_BPF_LINKER: 0.10.4
   CI_VNG_VERSION: "1.41"
   CI_PLAYWRIGHT_VERSION: 1.64.0
+  CI_PYYAML_VERSION: 6.0.2
   # Keep in step with the privileged-shard matrix below.
   SHARDS: 8
 jobs:
@@ -2032,14 +2033,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/pw"
-          "$RUNNER_TEMP/pw/bin/pip" install --quiet "playwright==$CI_PLAYWRIGHT_VERSION"
+          "$RUNNER_TEMP/pw/bin/pip" install --quiet "playwright==$CI_PLAYWRIGHT_VERSION" "pyyaml==$CI_PYYAML_VERSION"
           "$RUNNER_TEMP/pw/bin/python" -m playwright install --with-deps chromium firefox
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-inputs
           path: ${{ runner.temp }}/release-inputs
-      - name: Run the browser cells (strict)
+      - name: Run the browser cells (strict, typed)
         shell: bash
         run: |
           set -euo pipefail
@@ -2048,14 +2049,24 @@ jobs:
           (cd "$in" && sha256sum --check SHA256SUMS)
           chmod +x "$in/p11scope" "$in/p11scope-discover"
           mkdir -m 700 "$RUNNER_TEMP/browser-tmp"
+          # Typed strict-browser stream: the runner executes the suite under
+          # typed-python-suite.py, merges one result document with the
+          # strict-browser runner identity, and judges it against the
+          # known-failing ledger. A matching KnownFailure is absorbed as an
+          # expected failure; any other failure, error or skip stays red.
           P11SCOPE_BIN="$in/p11scope" P11SCOPE_BROWSER_STRICT=1 TMPDIR="$RUNNER_TEMP/browser-tmp" \
-            "$RUNNER_TEMP/pw/bin/python" -I tests/python/test_browser_cells.py -v 2>&1 | tee "$RUNNER_TEMP/browser.log"
+          P11SCOPE_KNOWN_FAILING_RESULTS="$RUNNER_TEMP/browser-kf.json" \
+          P11SCOPE_KNOWN_FAILING_HOST=github \
+          P11SCOPE_KNOWN_FAILING_RUNNER=python-suite-strict-browser \
+            "$RUNNER_TEMP/pw/bin/python" -I scripts/run-python-suites.py test_browser_cells.py 2>&1 | tee "$RUNNER_TEMP/browser.log"
       - name: Upload the browser log
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-cells
-          path: ${{ runner.temp }}/browser.log
+          path: |
+            ${{ runner.temp }}/browser.log
+            ${{ runner.temp }}/browser-kf.json
           if-no-files-found: warn
           retention-days: 7
   # Permanent container-image cell: the observer image built from this

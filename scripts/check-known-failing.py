@@ -27,7 +27,10 @@ unification is deferred to 0.7.3), and exact `cell: known-failing`
 ignored-test entries. The eleven pre-existing inverted declarations are a
 closed legacy baseline until their 0.7.3 migration. Host-limited rows for
 hosts without a CI judge (fedora, fedora-sm1) and privileged-lib rows
-(the summary job does not count XFAIL yet) are refused.
+(the summary job does not count XFAIL yet) are refused. The
+`python-suite-strict-browser` runner is the strict browser-cells CI
+stream: a row naming it is judged only there, never in the plain
+scripts stream where its live cells skip.
 
 With `--results`, the checker judges schema
 `p11scope/known-failing-results/v1`:
@@ -79,7 +82,15 @@ ISSUE_MARKER = "<!-- p11scope-known-issues-v1"
 TARGETS = {"0.7.3", "0.8.0"}
 MODES = {"always", "intermittent"}
 HOSTS = {"fedora", "fedora-sm1", "vng", "github"}
-BASE_RUNNERS = {"privileged-lib", "python-suite"}
+BASE_RUNNERS = {"privileged-lib", "python-suite", "python-suite-strict-browser"}
+#: Runners produced by scripts/run-python-suites.py typed streams. The
+#: strict-browser stream is the P11SCOPE_BROWSER_STRICT=1 browser-cells
+#: CI job (live prerequisites required, skips are failures); the plain
+#: stream is the unprivileged scripts job (live cells skip there). A row
+#: names exactly one stream and is never applicable to the other, so
+#: skipped live cells stay green in the scripts judgment without any
+#: skip being treated as a pass.
+PYTHON_SUITE_RUNNERS = {"python-suite", "python-suite-strict-browser"}
 REQUIRED_ROW_FIELDS = {
     "path", "test", "cell", "issues", "target", "runner", "signature",
     "lane", "mode", "reason", "last_green_sha",
@@ -306,8 +317,9 @@ def validate_row(raw, index):
         limited = [host for host in raw["hosts"] if host in ("fedora", "fedora-sm1")]
         if limited:
             problems.append(f"{label}: hosts {', '.join(limited)} have no CI judge: host-limited rows are refused until one exists")
-        if raw.get("runner") == "python-suite" and "github" not in raw["hosts"]:
-            problems.append(f"{label}: python-suite rows without github have no CI judge: python suites are judged only with host github")
+        if raw.get("runner") in PYTHON_SUITE_RUNNERS and "github" not in raw["hosts"]:
+            problems.append(f"{label}: {raw['runner']} rows without github have no CI judge: "
+                            f"{raw['runner']} streams are judged only with host github")
     if isinstance(raw.get("runner"), str) and raw["runner"].startswith("cell:"):
         script = raw["runner"][len("cell:"):]
         if isinstance(raw.get("path"), str) and raw["path"] != script and not raw["path"].endswith(".rs"):
@@ -576,7 +588,7 @@ def registry_run_entries(registry_path):
 
 
 def python_suite_registered(root, row):
-    if row["runner"] != "python-suite":
+    if row["runner"] not in PYTHON_SUITE_RUNNERS:
         return True
     prefix = "tests/python/"
     if not row["path"].startswith(prefix):

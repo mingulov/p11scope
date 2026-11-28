@@ -1947,9 +1947,10 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
 /// a file, a symlink, a permissive dir): the returned path is the
 /// dir actually held, which the save names. The test override pins
 /// the exact dir (no fallback), so refusal twins keep their precise
-/// base; production always falls back, so another user can never
-/// block this caller's recovery, not even by squatting its per-euid
-/// name.
+/// base, unless the twin holds the fallback guard to exercise the
+/// production sibling path; production always falls back, so another
+/// user can never block this caller's recovery, not even by squatting
+/// its per-euid name.
 fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
     match open_recovered_dir(base) {
         Ok(dir) => Ok((dir, base.to_path_buf())),
@@ -1957,6 +1958,7 @@ fn open_recovered_dir_or_sibling_fallback(base: &Path) -> Result<(std::fs::File,
             #[cfg(test)]
             if std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR")
                 .is_some_and(|dir| dir == base.as_os_str())
+                && !test_recovery_fallback_enabled()
             {
                 return Err(first);
             }
@@ -2521,6 +2523,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_STAGING_FAIL_WRITE: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    static TEST_RECOVERY_FALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_recovery_fallback_enabled() -> bool {
+    TEST_RECOVERY_FALLBACK.with(|flag| flag.get())
 }
 
 #[cfg(test)]
@@ -2575,6 +2584,27 @@ pub(crate) fn hold_staging_fail_write(errno: i32) -> StagingFailGuard {
 impl Drop for StagingFailGuard {
     fn drop(&mut self) {
         TEST_STAGING_FAIL_WRITE.with(|flag| flag.set(None));
+    }
+}
+
+/// Holds sibling fallback for one twin: a refused recovery base
+/// falls back to a fresh sibling even when the base is the pinned
+/// test override (which otherwise disables fallback so refusal twins
+/// keep their precise base). Thread-local, so concurrent twins do
+/// not race; production builds always fall back. Clears on drop.
+#[cfg(test)]
+pub(crate) struct RecoveryFallbackGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_recovery_fallback() -> RecoveryFallbackGuard {
+    TEST_RECOVERY_FALLBACK.with(|flag| flag.set(true));
+    RecoveryFallbackGuard
+}
+
+#[cfg(test)]
+impl Drop for RecoveryFallbackGuard {
+    fn drop(&mut self) {
+        TEST_RECOVERY_FALLBACK.with(|flag| flag.set(false));
     }
 }
 

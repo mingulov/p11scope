@@ -1426,4 +1426,75 @@ mod tests {
         );
         assert_no_temporary_files(directory.path());
     }
+
+    /// A primary write failure (ENOSPC) plus a failed recovery write
+    /// (EDQUOT) in a fallback sibling names the sibling actually
+    /// attempted, not the refused requested base: the whole message,
+    /// exact. The sibling holds no partial file afterwards, the
+    /// destination keeps its old bytes, and nothing is written
+    /// through the refused link.
+    #[test]
+    fn diagnostics_double_failure_with_fallback_sibling_names_the_staging_dir() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let plant = private_directory();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let refused = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &refused).unwrap();
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&refused);
+        let _fallback = crate::output::hold_recovery_fallback();
+        let _staging_fail = crate::output::hold_staging_fail_write(libc::EDQUOT);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        // The dir actually attempted: exactly one fresh sibling
+        // beside the refused base, distinct from it.
+        let mut siblings: Vec<std::path::PathBuf> = std::fs::read_dir(plant.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &target && entry != &refused)
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings.len(), 1, "one fallback sibling: {siblings:?}");
+        let actual = &siblings[0];
+        assert_ne!(
+            actual, &refused,
+            "the staging dir must differ from the requested base"
+        );
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let recovery = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        let expected = format!(
+            "writing diagnostics {} failed: {}; saving to {} also failed: {recovery}; capture lost",
+            path.display(),
+            primary,
+            actual.display(),
+        );
+        assert_eq!(error, expected);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let leftover: Vec<std::path::PathBuf> = std::fs::read_dir(actual)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no partial fallback file remains in the sibling: {leftover:?}"
+        );
+        let target_files: Vec<std::path::PathBuf> = std::fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            target_files.is_empty(),
+            "nothing is written through the refused link: {target_files:?}"
+        );
+        assert_no_temporary_files(directory.path());
+    }
 }

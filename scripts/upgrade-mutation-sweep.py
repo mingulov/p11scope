@@ -36,6 +36,64 @@ CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_sc
 
 MUTATIONS = [
     {
+        "site": "b1 removed-vocab membership check",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        if label in new_vocab.get(prefix, ()):",
+        "new": "        if True:",
+        "killer": "UpgradeGate6PureTests.test_b1_removed_reason_fails",
+    },
+    {
+        "site": "b1 unexpected-vocab membership check",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        if label not in new_vocab.get(prefix, ()):",
+        "new": "        if False:",
+        "killer": "UpgradeGate6PureTests.test_b1_unexpected_reason_fails",
+    },
+    {
+        "site": "b1 dynamic-leaf exemption",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "                kind = \"dynamic\"",
+        "new": "                kind = None",
+        "killer": "UpgradeGate6PureTests.test_b1_dynamic_mapping_leaves_are_not_compared",
+    },
+    {
+        "site": "b1 reason-node exemption",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "                    kind = \"node\"",
+        "new": "                    kind = None",
+        "killer": "UpgradeGate6PureTests.test_b1_reason_node_absence_passes",
+    },
+    {
+        "site": "b1 vocab loader unreadable refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        return None, f\"refused: reason vocabularies unreadable: {exc}\"",
+        "new": "        return {\"v071\": {}, \"v072\": {}}, \"\"",
+        "killer": "UpgradeGate6PureTests.test_b1_vocabularies_loader_refuses",
+    },
+    {
+        "site": "b1 vocab loader non-object refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        return None, \"refused: reason vocabularies root is not an object\"",
+        "new": "        return {\"v071\": {}, \"v072\": {}}, \"\"",
+        "killer": "UpgradeGate6PureTests.test_b1_vocabularies_loader_refuses",
+    },
+    {
+        "site": "b1 vocab loader map-set refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "        if not isinstance(vocab, dict) or set(vocab) != expected:",
+        "new": "        if False:",
+        "killer": "UpgradeGate6PureTests.test_b1_vocabularies_loader_refuses",
+    },
+    {
+        "site": "b1 vocab loader string-list refusal",
+        "file": "scripts/upgrade-gate6.py",
+        "old": """            if not isinstance(labels, list) or not all(
+                isinstance(label, str) for label in labels
+            ):""",
+        "new": "            if False:",
+        "killer": "UpgradeGate6PureTests.test_b1_vocabularies_loader_refuses",
+    },
+    {
         "site": "inventory schema launched_by_gap null branch",
         "file": "docs/schema/inventory-v1.schema.json",
         "old": """              {
@@ -527,6 +585,7 @@ def copy_cell_tree(destination: Path) -> None:
         "scripts/upgrade-gate6.py",
         "scripts/upgrade_artifact_validation.py",
         "scripts/upgrade-artifact-pins.json",
+        "scripts/upgrade-reason-vocabularies.json",
         "scripts/json_schema.py",
         "scripts/upgrade-softhsm-workload.py",
         "tests/python/test_upgrade_cells.py",

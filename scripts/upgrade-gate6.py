@@ -85,11 +85,98 @@ B1_KEYS = frozenset(
     ]
 )
 
+# B1 reason vocabularies: flattened paths of count-maps keyed by reason
+# labels. Leaves compare by vocabulary membership (mechanical sets from the
+# producer's enums/tables), never by per-capture occurrence: a reason that
+# fires on capture timing in one run is not a removal. Map nodes are exempt
+# from occurrence comparison for the same reason (populated-or-not is
+# timing); the strict schema, which runs first, still requires every node
+# and types every map shape, so nothing structural goes unguarded.
+REASON_MAP_PREFIXES = frozenset(
+    [
+        "modules[0].unbound_use.reasons",
+        "modules[0].departed_use.entries.coverage.unknown",
+        "modules[0].departed_use.entries.observation",
+        "modules[0].departed_use.semantics.labels",
+        "modules[0].departed_use.instances.reasons",
+        "modules[0].departed_use.instances.loss_reasons",
+        "observation.native_witnesses.unbound_reasons",
+    ]
+)
+# Dynamic reason leaves carry capture values (clock ticks) and have no finite
+# vocabulary; both sides' nodes and leaves under these maps are not compared.
+DYNAMIC_LEAF_PREFIXES = frozenset(
+    [
+        "modules[0].departed_use.mapping.reasons",
+    ]
+)
+VOCABULARIES_MANIFEST = SCRIPT_DIR / "upgrade-reason-vocabularies.json"
+
+
+def load_reason_vocabularies(path=None):
+    """Load committed reason-label sets; fail closed on any problem.
+
+    Returns (vocabularies, error): vocabularies maps era -> map prefix ->
+    label list when error is "". Unknown eras, missing maps, extra maps and
+    non-string labels all refuse: the gate must not run B1 on a vocabulary
+    it cannot account for exactly.
+    """
+    manifest = Path(path) if path is not None else VOCABULARIES_MANIFEST
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, ValueError) as exc:
+        return None, f"refused: reason vocabularies unreadable: {exc}"
+    if not isinstance(data, dict):
+        return None, "refused: reason vocabularies root is not an object"
+    expected = set(REASON_MAP_PREFIXES)
+    for era in ("v071", "v072"):
+        vocab = data.get(era)
+        if not isinstance(vocab, dict) or set(vocab) != expected:
+            return None, f"refused: reason vocabularies {era} map mismatch"
+        for prefix, labels in vocab.items():
+            if not isinstance(labels, list) or not all(
+                isinstance(label, str) for label in labels
+            ):
+                return None, f"refused: reason vocabularies {era}.{prefix} not string list"
+    return {"v071": data["v071"], "v072": data["v072"]}, ""
+
+
+def split_reason_keys(keys):
+    """Partition flattened paths into structural paths and reason leaves.
+
+    Returns (structural, leaves) where leaves holds (map prefix, label)
+    for static-map leaves. Reason-map nodes and dynamic-map subtrees are
+    dropped from both sides: their occurrence is per-capture timing.
+    """
+    structural = set()
+    leaves = []
+    for path in keys:
+        kind = None
+        for prefix in DYNAMIC_LEAF_PREFIXES:
+            if path == prefix or path.startswith(prefix + "."):
+                kind = "dynamic"
+                break
+        if kind is None:
+            for prefix in REASON_MAP_PREFIXES:
+                if path == prefix:
+                    kind = "node"
+                    break
+                if path.startswith(prefix + "."):
+                    kind = ("leaf", prefix, path[len(prefix) + 1:])
+                    break
+        if kind is None:
+            structural.add(path)
+        elif kind != "node" and kind != "dynamic":
+            leaves.append((kind[1], kind[2]))
+    return structural, leaves
+
+
 # Conditional new keys: present only when the capture populated their section.
 # The populated departed_use fold subtree appears only when callers folded
 # during the capture; the semantic_capture counters appear when the
-# observation section carries them. Pinned: any new key outside B1+ADDITIVE
-# fails the "nothing else" proof.
+# observation section carries them. Pinned: any new STRUCTURAL key outside
+# B1+ADDITIVE fails the "nothing else" proof. Reason-map leaves are not
+# pinned here; they compare by vocabulary membership instead.
 ADDITIVE_KEYS = frozenset(
     [
         "modules[0].departed_use.callers",
@@ -102,9 +189,6 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.entries.coverage.lossy",
         "modules[0].departed_use.entries.coverage.pid_exit",
         "modules[0].departed_use.entries.coverage.since_min_ns",
-        "modules[0].departed_use.entries.coverage.unknown",
-        "modules[0].departed_use.entries.coverage.unknown.caller_exited_before_match",
-        "modules[0].departed_use.entries.coverage.unknown.use_before_admission",
         "modules[0].departed_use.entries.coverage.until_max_ns",
         "modules[0].departed_use.entries.coverage.watched_no_use",
         "modules[0].departed_use.entries.coverage.witnessed",
@@ -113,8 +197,6 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.entries.in_flight",
         "modules[0].departed_use.entries.last_max_ns",
         "modules[0].departed_use.entries.logical",
-        "modules[0].departed_use.entries.observation",
-        "modules[0].departed_use.entries.observation.unknown (usage observation unavailable)",
         "modules[0].departed_use.entries.saturated",
         "modules[0].departed_use.first_ns",
         "modules[0].departed_use.folded_instances",
@@ -149,16 +231,9 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.instances.folded",
         "modules[0].departed_use.instances.historical_only_returns",
         "modules[0].departed_use.instances.last_max_ns",
-        "modules[0].departed_use.instances.loss_reasons",
-        "modules[0].departed_use.instances.loss_reasons.capture_stopped",
-        "modules[0].departed_use.instances.loss_reasons.instance_retired",
-        "modules[0].departed_use.instances.loss_reasons.semantic_loss",
-        "modules[0].departed_use.instances.loss_reasons.task_retired",
         "modules[0].departed_use.instances.lossy_rows",
         "modules[0].departed_use.instances.null_reasons",
         "modules[0].departed_use.instances.observed",
-        "modules[0].departed_use.instances.reasons",
-        "modules[0].departed_use.instances.reasons.task_retired",
         "modules[0].departed_use.instances.retired",
         "modules[0].departed_use.instances.settled_live",
         "modules[0].departed_use.instances.uncertain",
@@ -169,8 +244,6 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.mapping.first_min_ns",
         "modules[0].departed_use.mapping.interruptions",
         "modules[0].departed_use.mapping.last_max_ns",
-        "modules[0].departed_use.mapping.reasons",
-        "modules[0].departed_use.mapping.reasons.process exited (pid names no live process)",
         "modules[0].departed_use.mapping.reasons_overflow",
         "modules[0].departed_use.mapping.state",
         "modules[0].departed_use.mapping.state.ended",
@@ -183,8 +256,6 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.mechanisms_overflow.mechs",
         "modules[0].departed_use.operations",
         "modules[0].departed_use.semantics",
-        "modules[0].departed_use.semantics.labels",
-        "modules[0].departed_use.semantics.labels.unknown (semantic capture withheld)",
         "observation.semantic_capture.length_insert_failures",
         "observation.semantic_capture.length_stash_mismatches",
         # B17 leg 2: the staged reload disclosure, present only when the
@@ -273,16 +344,39 @@ def flatten_keys(value, path=""):
                 yield from flatten_keys(child, here)
 
 
-def evaluate_b1_delta(old_keys, new_keys) -> dict:
-    """Evaluate the typed B1 key delta in both directions."""
-    old_keys = set(old_keys)
-    new_keys = set(new_keys)
-    new_only = new_keys - old_keys
+def evaluate_b1_delta(old_keys, new_keys, vocabularies) -> dict:
+    """Evaluate the typed B1 key delta in both directions.
+
+    Structural paths compare by occurrence; reason leaves compare by
+    vocabulary membership. An old leaf outside the v0.7.2 vocabulary is a
+    removal when v0.7.1 has it, else unknown (forged input or a derivation
+    gap: fails closed, never silently passes). A new leaf outside the
+    v0.7.2 vocabulary is unexpected. Timing-only absence passes silently.
+    """
+    old_struct, old_leaves = split_reason_keys(set(old_keys))
+    new_struct, new_leaves = split_reason_keys(set(new_keys))
     allowed = set(B1_KEYS) | set(ADDITIVE_KEYS)
+    removed = set(old_struct - new_struct)
+    removed_unknown = set()
+    old_vocab = vocabularies.get("v071", {})
+    new_vocab = vocabularies.get("v072", {})
+    for prefix, label in old_leaves:
+        if label in new_vocab.get(prefix, ()):
+            continue
+        path = f"{prefix}.{label}"
+        if label in old_vocab.get(prefix, ()):
+            removed.add(path)
+        else:
+            removed_unknown.add(path)
+    unexpected = set((new_struct - old_struct) - allowed)
+    for prefix, label in new_leaves:
+        if label not in new_vocab.get(prefix, ()):
+            unexpected.add(f"{prefix}.{label}")
     return {
-        "removed": old_keys - new_keys,
-        "unexpected": new_only - allowed,
-        "missing_b1": set(B1_KEYS) - new_keys,
+        "removed": removed,
+        "removed_unknown": removed_unknown,
+        "unexpected": unexpected,
+        "missing_b1": set(B1_KEYS) - set(new_keys),
     }
 
 
@@ -648,15 +742,25 @@ def run_gate(args, workdir: Path, result: dict) -> int:
     )
 
     # 2. B1: departed_use delta is exactly B1+additive, nothing else, and
-    # every pinned B1 key is present in the new typed report.
+    # every pinned B1 key is present in the new typed report. Reason leaves
+    # compare by vocabulary, never by occurrence.
+    vocabularies, vocab_error = load_reason_vocabularies()
+    check(
+        result,
+        "b1_vocabularies",
+        not vocab_error,
+        vocab_error
+        or f"v071/v072 cover {len(REASON_MAP_PREFIXES)} reason maps",
+    )
     old_keys = set(flatten_keys(old))
     new_keys = set(flatten_keys(new))
-    delta = evaluate_b1_delta(old_keys, new_keys)
+    delta = evaluate_b1_delta(old_keys, new_keys, vocabularies)
     check(
         result,
         "b1_no_removed",
-        len(delta["removed"]) == 0,
-        f"removed={sorted(delta['removed'])}",
+        len(delta["removed"]) == 0 and len(delta["removed_unknown"]) == 0,
+        f"removed={sorted(delta['removed'])} "
+        f"unknown={sorted(delta['removed_unknown'])}",
     )
     check(
         result,

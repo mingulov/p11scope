@@ -42,6 +42,16 @@ def load_gate6():
     return module
 
 
+def load_vocab_generator():
+    spec = importlib.util.spec_from_file_location(
+        "generate_reason_vocabularies_under_test",
+        ROOT / "scripts/generate-reason-vocabularies.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def artifact_pin(name):
     """Read one committed sha256 pin (single source: the manifest file)."""
     manifest = json.loads((ROOT / "scripts/upgrade-artifact-pins.json").read_text())
@@ -2312,9 +2322,6 @@ class UpgradeGate6PureTests(unittest.TestCase):
                 "modules[0].departed_use.entries.coverage.lossy",
                 "modules[0].departed_use.entries.coverage.pid_exit",
                 "modules[0].departed_use.entries.coverage.since_min_ns",
-                "modules[0].departed_use.entries.coverage.unknown",
-                "modules[0].departed_use.entries.coverage.unknown.caller_exited_before_match",
-                "modules[0].departed_use.entries.coverage.unknown.use_before_admission",
                 "modules[0].departed_use.entries.coverage.until_max_ns",
                 "modules[0].departed_use.entries.coverage.watched_no_use",
                 "modules[0].departed_use.entries.coverage.witnessed",
@@ -2323,8 +2330,6 @@ class UpgradeGate6PureTests(unittest.TestCase):
                 "modules[0].departed_use.entries.in_flight",
                 "modules[0].departed_use.entries.last_max_ns",
                 "modules[0].departed_use.entries.logical",
-                "modules[0].departed_use.entries.observation",
-                "modules[0].departed_use.entries.observation.unknown (usage observation unavailable)",
                 "modules[0].departed_use.entries.saturated",
                 "modules[0].departed_use.first_ns",
                 "modules[0].departed_use.folded_instances",
@@ -2359,16 +2364,9 @@ class UpgradeGate6PureTests(unittest.TestCase):
                 "modules[0].departed_use.instances.folded",
                 "modules[0].departed_use.instances.historical_only_returns",
                 "modules[0].departed_use.instances.last_max_ns",
-                "modules[0].departed_use.instances.loss_reasons",
-                "modules[0].departed_use.instances.loss_reasons.capture_stopped",
-                "modules[0].departed_use.instances.loss_reasons.instance_retired",
-                "modules[0].departed_use.instances.loss_reasons.semantic_loss",
-                "modules[0].departed_use.instances.loss_reasons.task_retired",
                 "modules[0].departed_use.instances.lossy_rows",
                 "modules[0].departed_use.instances.null_reasons",
                 "modules[0].departed_use.instances.observed",
-                "modules[0].departed_use.instances.reasons",
-                "modules[0].departed_use.instances.reasons.task_retired",
                 "modules[0].departed_use.instances.retired",
                 "modules[0].departed_use.instances.settled_live",
                 "modules[0].departed_use.instances.uncertain",
@@ -2379,8 +2377,6 @@ class UpgradeGate6PureTests(unittest.TestCase):
                 "modules[0].departed_use.mapping.first_min_ns",
                 "modules[0].departed_use.mapping.interruptions",
                 "modules[0].departed_use.mapping.last_max_ns",
-                "modules[0].departed_use.mapping.reasons",
-                "modules[0].departed_use.mapping.reasons.process exited (pid names no live process)",
                 "modules[0].departed_use.mapping.reasons_overflow",
                 "modules[0].departed_use.mapping.state",
                 "modules[0].departed_use.mapping.state.ended",
@@ -2393,8 +2389,6 @@ class UpgradeGate6PureTests(unittest.TestCase):
                 "modules[0].departed_use.mechanisms_overflow.mechs",
                 "modules[0].departed_use.operations",
                 "modules[0].departed_use.semantics",
-                "modules[0].departed_use.semantics.labels",
-                "modules[0].departed_use.semantics.labels.unknown (semantic capture withheld)",
                 "observation.semantic_capture.length_insert_failures",
                 "observation.semantic_capture.length_stash_mismatches",
                 "instance_reload_not_excluded",
@@ -2427,17 +2421,134 @@ class UpgradeGate6PureTests(unittest.TestCase):
     def test_b1_delta_is_exact_in_both_directions(self):
         old_keys = {"schema", "modules[0].path"}
         good_new = old_keys | set(self.gate6.B1_KEYS) | set(self.gate6.ADDITIVE_KEYS)
-        delta = self.gate6.evaluate_b1_delta(old_keys, good_new)
+        empty = {"v071": {}, "v072": {}}
+        delta = self.gate6.evaluate_b1_delta(old_keys, good_new, empty)
         self.assertEqual(delta["removed"], set())
         self.assertEqual(delta["unexpected"], set())
         self.assertEqual(delta["missing_b1"], set())
 
-        missing = self.gate6.evaluate_b1_delta(old_keys, good_new - {"budgets.edges.folded"})
+        missing = self.gate6.evaluate_b1_delta(old_keys, good_new - {"budgets.edges.folded"}, empty)
         self.assertEqual(missing["missing_b1"], {"budgets.edges.folded"})
-        unexpected = self.gate6.evaluate_b1_delta(old_keys, good_new | {"modules[0].surprise"})
+        unexpected = self.gate6.evaluate_b1_delta(old_keys, good_new | {"modules[0].surprise"}, empty)
         self.assertEqual(unexpected["unexpected"], {"modules[0].surprise"})
-        removed = self.gate6.evaluate_b1_delta(old_keys, good_new - {"modules[0].path"})
+        removed = self.gate6.evaluate_b1_delta(old_keys, good_new - {"modules[0].path"}, empty)
         self.assertEqual(removed["removed"], {"modules[0].path"})
+
+    def test_b1_timing_only_reason_absence_is_not_a_removal(self):
+        prefix = "modules[0].unbound_use.reasons"
+        vocabs = {"v071": {prefix: ["no_mapping_edge"]},
+                  "v072": {prefix: ["no_mapping_edge"]}}
+        delta = self.gate6.evaluate_b1_delta(
+            {prefix, f"{prefix}.no_mapping_edge"}, {prefix}, vocabs)
+        self.assertEqual(delta["removed"], set())
+        self.assertEqual(delta["removed_unknown"], set())
+
+    def test_b1_reason_node_absence_passes(self):
+        prefix = "modules[0].unbound_use.reasons"
+        vocabs = {"v071": {prefix: ["no_mapping_edge"]},
+                  "v072": {prefix: ["no_mapping_edge"]}}
+        delta = self.gate6.evaluate_b1_delta(
+            {prefix, f"{prefix}.no_mapping_edge"}, set(), vocabs)
+        self.assertEqual(delta["removed"], set())
+        self.assertEqual(delta["removed_unknown"], set())
+
+    def test_b1_dynamic_mapping_leaves_are_not_compared(self):
+        old_keys = {"modules[0].departed_use.mapping.reasons",
+                    "modules[0].departed_use.mapping.reasons.pid reused: x"}
+        new_keys = set()
+        delta = self.gate6.evaluate_b1_delta(
+            old_keys, new_keys, {"v071": {}, "v072": {}})
+        self.assertEqual(delta["removed"], set())
+        self.assertEqual(delta["removed_unknown"], set())
+
+    def test_b1_unexpected_reason_fails(self):
+        prefix = "modules[0].unbound_use.reasons"
+        vocabs = {"v071": {prefix: []}, "v072": {prefix: []}}
+        delta = self.gate6.evaluate_b1_delta(
+            {prefix}, {prefix, f"{prefix}.zzz_new"}, vocabs)
+        self.assertEqual(delta["unexpected"], {f"{prefix}.zzz_new"})
+
+    def test_b1_vocabularies_match_across_eras(self):
+        committed = json.loads(self.gate6.VOCABULARIES_MANIFEST.read_text())
+        for prefix, labels in committed["v072"].items():
+            self.assertEqual(sorted(labels), sorted(committed["v071"][prefix]))
+
+    def test_b1_vocabularies_loader_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "nope.json"
+            vocabs, error = self.gate6.load_reason_vocabularies(missing)
+            self.assertIsNone(vocabs)
+            self.assertTrue(error)
+            garbage = Path(tmp) / "garbage.json"
+            garbage.write_text("{nope")
+            vocabs, error = self.gate6.load_reason_vocabularies(garbage)
+            self.assertIsNone(vocabs)
+            self.assertTrue(error)
+            nonobject = Path(tmp) / "nonobject.json"
+            nonobject.write_text("[1, 2]")
+            vocabs, error = self.gate6.load_reason_vocabularies(nonobject)
+            self.assertIsNone(vocabs)
+            self.assertTrue(error)
+            mismatch = Path(tmp) / "mismatch.json"
+            mismatch.write_text(json.dumps({"v071": {}, "v072": {}}))
+            vocabs, error = self.gate6.load_reason_vocabularies(mismatch)
+            self.assertIsNone(vocabs)
+            self.assertTrue(error)
+            nonstrings = Path(tmp) / "nonstrings.json"
+            bad = {era: {prefix: [1] for prefix in self.gate6.REASON_MAP_PREFIXES}
+                   for era in ("v071", "v072")}
+            nonstrings.write_text(json.dumps(bad))
+            vocabs, error = self.gate6.load_reason_vocabularies(nonstrings)
+            self.assertIsNone(vocabs)
+            self.assertTrue(error)
+            vocabs, error = self.gate6.load_reason_vocabularies()
+            self.assertEqual(error, "")
+            self.assertEqual(set(vocabs), {"v071", "v072"})
+
+    def test_b1_removed_reason_fails(self):
+        vocabs = {"v071": {"modules[0].unbound_use.reasons": ["gone"]},
+                  "v072": {"modules[0].unbound_use.reasons": []}}
+        delta = self.gate6.evaluate_b1_delta(
+            {"modules[0].unbound_use.reasons",
+             "modules[0].unbound_use.reasons.gone"},
+            {"modules[0].unbound_use.reasons"}, vocabs)
+        self.assertEqual(delta["removed"],
+                         {"modules[0].unbound_use.reasons.gone"})
+
+    def test_b1_renamed_reason_fails(self):
+        vocabs = {"v071": {"modules[0].unbound_use.reasons": ["old_name"]},
+                  "v072": {"modules[0].unbound_use.reasons": ["new_name"]}}
+        delta = self.gate6.evaluate_b1_delta(
+            {"modules[0].unbound_use.reasons",
+             "modules[0].unbound_use.reasons.old_name"},
+            {"modules[0].unbound_use.reasons"}, vocabs)
+        self.assertEqual(delta["removed"],
+                         {"modules[0].unbound_use.reasons.old_name"})
+
+    def test_b1_unknown_reason_fails_closed(self):
+        vocabs = {"v071": {"modules[0].unbound_use.reasons": []},
+                  "v072": {"modules[0].unbound_use.reasons": []}}
+        delta = self.gate6.evaluate_b1_delta(
+            {"modules[0].unbound_use.reasons",
+             "modules[0].unbound_use.reasons.zzz_forged"},
+            {"modules[0].unbound_use.reasons"}, vocabs)
+        self.assertEqual(delta["removed"], set())
+        self.assertEqual(delta["removed_unknown"],
+                         {"modules[0].unbound_use.reasons.zzz_forged"})
+
+    def test_b1_admission_emptiness_detected(self):
+        old_keys = {"modules[0].path", "instances[0].caller",
+                    "semantic_edges[0].caller"}
+        new_keys = {"modules[0].path"}
+        vocabs = {"v071": {}, "v072": {}}
+        delta = self.gate6.evaluate_b1_delta(old_keys, new_keys, vocabs)
+        self.assertEqual(delta["removed"],
+                         {"instances[0].caller", "semantic_edges[0].caller"})
+
+    def test_b1_vocabularies_are_fresh(self):
+        committed = json.loads(self.gate6.VOCABULARIES_MANIFEST.read_text())
+        fresh = load_vocab_generator().derive_reason_vocabularies()
+        self.assertEqual(fresh, committed)
 
     def test_reason_membership_uses_enum_not_description(self):
         schema = {
@@ -2567,6 +2678,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "diff_old_new",
                 "diff_typed",
                 "diff_churn_lifecycle",
+                "b1_vocabularies",
                 "b1_no_removed",
                 "b1_all_present",
                 "b1_exact",
@@ -2588,7 +2700,9 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
         missing_b1 = self.harness.good_new_doc()
         del missing_b1["budgets"]["edges"]["folded"]
         unexpected = self.harness.good_new_doc()
-        unexpected["modules"][0]["departed_use"]["mapping"]["reasons"]["zzz_new_reason"] = 1
+        unexpected["excluded_modules"] = [
+            {"path": "/x.so", "dev": 1, "ino": 2, "processes": 3}
+        ]
         removed = self.harness.good_new_doc()
         del removed["callers"][0]["app_hint"]
         old_departed = self.harness.good_old_doc()

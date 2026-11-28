@@ -162,6 +162,18 @@ pub fn preserve_stdio_private_descriptions() {
     sink::preserve_stdio_private_descriptions();
 }
 
+/// The build's capability flavor for `--version`: `full`, or what a
+/// limited build cannot do. Mirrors the `--key-sizes` and
+/// `--provider-info` refusals, so the version line tells the operator
+/// which build they have.
+pub fn build_flavor() -> &'static str {
+    if cfg!(feature = "stub-object-attributes") {
+        "limited: no key-size or provider-info capture"
+    } else {
+        "full"
+    }
+}
+
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,
 /// maps, drains, guards and injected actions are unreachable from outside.

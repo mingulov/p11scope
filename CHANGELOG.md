@@ -143,6 +143,10 @@ versioned separately and are opaque, exact dispatch keys.
   degrades to partial instead of voiding to unavailable: pending
   keys lost to an H3 audit gap record one named `outcome_lost` gap
   each.
+- The `--version` first line names the build flavour in parentheses
+  (`p11scope <semver> (full)`, or what a limited build cannot do),
+  so the operator can tell which build they have; scripts must parse
+  only the `p11scope <semver>` prefix.
 
 ### Fixed
 

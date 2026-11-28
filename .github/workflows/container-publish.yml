@@ -142,7 +142,7 @@ jobs:
             "$RUNNER_TEMP" >"$SOFTHSM2_CONF"
           softhsm2-util --init-token --free --label smoke --so-pin 5678 --pin 1234
           v="${GITHUB_REF_NAME#v}"
-          expected="p11scope ${v%%-*}"
+          expected="p11scope ${v%%-*} (full)"
           actual=$(docker run --rm p11scope-observer:preview --version | head -n 1)
           test "$actual" = "$expected"
           echo "version ok: $actual"

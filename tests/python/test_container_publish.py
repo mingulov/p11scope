@@ -16,6 +16,7 @@ touched.
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -157,6 +158,41 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertEqual(uploads[0]["with"].get("if-no-files-found"), "error")
         self.assertIn("image-id", bodies)
         self.assertIn("is-latest", bodies, "build must record whether the tag is newest stable")
+
+    def test_smoke_version_matches_tag_and_build_flavor(self):
+        # The release image is the full build, and --version names the
+        # build flavour in parentheses; the smoke must expect exactly
+        # that. Both sides are parsed, not hardcoded, so editing either
+        # the smoke string or build_flavor() without the other fails here
+        # instead of on the release tag.
+        body = step("Smoke-test the image", "build").get("run", "")
+        expected_lines = [line.strip() for line in body.splitlines()
+                          if line.strip().startswith("expected=")]
+        self.assertEqual(len(expected_lines), 1,
+                         f"smoke must set one expected version line: {expected_lines}")
+        match = re.fullmatch(
+            r'expected="p11scope \$\{v%%-\*\} \(([^)]+)\)"', expected_lines[0])
+        self.assertIsNotNone(
+            match,
+            f"smoke must expect the stripped tag plus the flavour: {expected_lines[0]}")
+        lib = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
+        start = lib.index("pub fn build_flavor()")
+        end = lib.index("\n}\n", start)
+        before, _, after = lib[start:end].partition("} else {")
+
+        def literals(segment):
+            # Statement-position string literals; the cfg!(feature = ...)
+            # line names the feature, not a flavour.
+            return [found for line in segment.splitlines() if "cfg!" not in line
+                    for found in re.findall(r'"([^"]+)"', line)]
+
+        limited = literals(before)
+        full = literals(after)
+        self.assertEqual(len(limited), 1, f"one limited flavour literal: {limited}")
+        self.assertEqual(len(full), 1, f"one full flavour literal: {full}")
+        self.assertIn("limited", limited[0])
+        self.assertEqual(match.group(1), full[0],
+                         "smoke flavour must equal build_flavor()'s full value")
 
     def test_release_dockerfile_defers_member_check_to_the_gnu_tar_step(self):
         self.assertTrue(RELEASE_DOCKERFILE.is_file(), "the release Dockerfile is missing")

@@ -1018,6 +1018,25 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertNotIn("github.event_name", release,
                          "release-build must run on schedule for FULL")
 
+    def test_profile_enospc_leg_is_wired_end_to_end(self):
+        # The profile ENOSPC positive leg must run in the privileged
+        # root-integration runner: without capture the unprivileged gate
+        # would skip it silently. Every wiring point below must name the
+        # leg, so removing it anywhere breaks this test.
+        cell = "output_recovery_process:profile_enospc_recovery_is_one_stderr_line"
+        runner = (ROOT / "scripts/ci/run-root-integration.sh").read_text(encoding="utf-8")
+        self.assertIn("TARGETS=(run_lifecycle pause t2_cold_start ux_journeys"
+                        " run_abandon_report output_owner output_recovery_process)", runner)
+        self.assertIn("'output_owner','output_recovery_process']", runner)
+        self.assertIn(f"    {cell}\n", runner)
+        job = job_body(self.yml, "root-integration")
+        self.assertIn("--test output_owner --test output_recovery_process", job)
+        self.assertIn("run_abandon_report output_owner output_recovery_process; do", job)
+        self.assertIn(f'"{cell.replace(":", "::")}"', job)
+        source = (ROOT / "tests/output_recovery_process.rs").read_text(encoding="utf-8")
+        self.assertIn("fn profile_enospc_recovery_is_one_stderr_line()", source)
+        self.assertIn("P11SCOPE_TEST_BRANCH=positive", source)
+
 
 if __name__ == "__main__":
     unittest.main()

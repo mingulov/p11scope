@@ -1533,7 +1533,7 @@ jobs:
         with:
           name: release-inputs
           path: ${{ runner.temp }}/release-inputs
-      - name: Build the six integration test targets
+      - name: Build the seven integration test targets
         shell: bash
         run: |
           set -euo pipefail
@@ -1541,11 +1541,11 @@ jobs:
           cargo +"$toolchain" test --locked --offline --no-run \
             --test run_lifecycle --test pause --test t2_cold_start \
             --test ux_journeys --test run_abandon_report \
-            --test output_owner \
+            --test output_owner --test output_recovery_process \
             --message-format=json >"$RUNNER_TEMP/root-build.jsonl"
           bindir="$GITHUB_WORKSPACE/root-test-bins"
           mkdir -p "$bindir"
-          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report output_owner; do
+          for target in run_lifecycle pause t2_cold_start ux_journeys run_abandon_report output_owner output_recovery_process; do
             exe=$(jq -r --arg t "$target" 'select(.reason == "compiler-artifact" and .target.name == $t and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/root-build.jsonl" | grep -v '^null$' | tail -1)
             test -x "$exe"
             cp -p "$exe" "$bindir/$target"
@@ -1563,7 +1563,7 @@ jobs:
           sudo -n scripts/ci/run-root-integration.sh "$in/p11scope" "$out" "$GITHUB_WORKSPACE/root-test-bins"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
           # Inline exact-set check (the WP-1 checker takes this over
-          # with --require when that lane ports; same 19 cells).
+          # with --require when that lane ports; same 20 cells).
           python3 -I - "$out/results.jsonl" <<'PY'
           import json
           import sys
@@ -1589,7 +1589,8 @@ jobs:
                   "output_owner::flag_trusts_the_named_owner_and_hands_the_files_over",
                   "output_owner::symlink_and_mode_protections_hold_with_the_flag",
                   "output_owner::trace_stream_is_handed_over_and_reused_by_a_second_run",
-                  "output_owner::inventory_scan_hands_the_report_over"}
+                  "output_owner::inventory_scan_hands_the_report_over",
+                  "output_recovery_process::profile_enospc_recovery_is_one_stderr_line"}
           problems = sorted("missing cell " + name for name in need - set(cells))
           problems += sorted("extra cell " + name for name in set(cells) - need)
           for row in rows:

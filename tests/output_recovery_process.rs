@@ -245,27 +245,10 @@ fn private_output_dir(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn cases(root: &Path, target: Option<&SleepTarget>) -> Vec<(String, Vec<String>, &'static str)> {
+fn cases(root: &Path) -> Vec<(String, Vec<String>, &'static str)> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/inventory-diff/scan-current.json");
     let mut cases = Vec::new();
-    if let Some(target) = target {
-        let out = root.join("profile-out");
-        private_output_dir(&out);
-        cases.push((
-            "profile".to_string(),
-            vec![
-                "profile".into(),
-                "--pid".into(),
-                target.pid(),
-                "--duration".into(),
-                "1".into(),
-                "-o".into(),
-                out.join("profile.json").display().to_string(),
-            ],
-            "sync-after-first",
-        ));
-    }
     let cbom_out = root.join("cbom-out");
     private_output_dir(&cbom_out);
     cases.push((
@@ -302,65 +285,95 @@ fn cases(root: &Path, target: Option<&SleepTarget>) -> Vec<(String, Vec<String>,
     cases
 }
 
-#[test]
-fn enospc_recovery_is_one_stderr_line_and_closed_stderr_still_exits_one() {
+fn run_recovery_case(name: &str, args: &[String], mode: &str, injector: &Path) {
+    let inject_dir = PathBuf::from(args.last().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let (output, guard) = run_injected(args, &inject_dir, injector, mode, false);
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{name} must fail the requested -o: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("capture saved to").count(),
+        1,
+        "{name} must print the recovery fact exactly once: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("rescued_after_output_failure"),
+        "{name} must not duplicate a recovered report through the stdout rescue"
+    );
+    let recovered = guard.new_files();
+    assert_eq!(recovered.len(), 1, "{name} leaves one recovery file");
+    let bytes = std::fs::read(&recovered[0]).unwrap();
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|error| panic!("{name} recovery is not complete JSON: {error}"));
+    let (output, _guard) = run_injected(args, &inject_dir, injector, mode, true);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{name} with closed stderr must exit 1, not panic with 101"
+    );
+}
+
+fn private_temp_root() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(
         temp.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .unwrap();
-    let injector = compile_injector(temp.path());
-    let capture = capture_available();
-    if !capture {
+    temp
+}
+
+/// The profile ENOSPC positive leg, exactly selectable for the privileged
+/// root-integration runner: with capture available it proves the streamed
+/// report's recovery fact, and under P11SCOPE_REQUIRE_CAPTURE a host
+/// without capture fails instead of silently dropping the leg.
+#[test]
+fn profile_enospc_recovery_is_one_stderr_line() {
+    if !capture_available() {
         require_capture_positive("profile ENOSPC recovery");
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        return;
     }
-    let target = capture.then(SleepTarget::spawn);
-    let cases = cases(temp.path(), target.as_ref());
+    let temp = private_temp_root();
+    let injector = compile_injector(temp.path());
+    let target = SleepTarget::spawn();
+    let out = temp.path().join("profile-out");
+    private_output_dir(&out);
+    run_recovery_case(
+        "profile",
+        &[
+            "profile".to_string(),
+            "--pid".to_string(),
+            target.pid(),
+            "--duration".to_string(),
+            "1".to_string(),
+            "-o".to_string(),
+            out.join("profile.json").display().to_string(),
+        ],
+        "sync-after-first",
+        &injector,
+    );
+    eprintln!("P11SCOPE_TEST_BRANCH=positive");
+}
+
+#[test]
+fn enospc_recovery_is_one_stderr_line_and_closed_stderr_still_exits_one() {
+    let temp = private_temp_root();
+    let injector = compile_injector(temp.path());
+    let cases = cases(temp.path());
     assert_eq!(
         cases.len(),
-        if capture { 3 } else { 2 },
-        "profile, cbom and inventory legs (profile needs a capture-capable host)"
+        2,
+        "cbom and inventory legs (profile runs in its own positive-gated test)"
     );
 
     for (name, args, mode) in &cases {
-        let inject_dir = PathBuf::from(args.last().unwrap())
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let (output, guard) = run_injected(args, &inject_dir, &injector, mode, false);
-        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "{name} must fail the requested -o: {stderr}"
-        );
-        assert_eq!(
-            stderr.matches("capture saved to").count(),
-            1,
-            "{name} must print the recovery fact exactly once: {stderr}"
-        );
-        assert!(
-            !String::from_utf8_lossy(&output.stdout).contains("rescued_after_output_failure"),
-            "{name} must not duplicate a recovered report through the stdout rescue"
-        );
-        let recovered = guard.new_files();
-        assert_eq!(recovered.len(), 1, "{name} leaves one recovery file");
-        let bytes = std::fs::read(&recovered[0]).unwrap();
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .unwrap_or_else(|error| panic!("{name} recovery is not complete JSON: {error}"));
-    }
-
-    for (name, args, mode) in &cases {
-        let inject_dir = PathBuf::from(args.last().unwrap())
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let (output, _guard) = run_injected(args, &inject_dir, &injector, mode, true);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "{name} with closed stderr must exit 1, not panic with 101"
-        );
+        run_recovery_case(name, args, mode, &injector);
     }
 }

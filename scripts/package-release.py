@@ -553,6 +553,16 @@ def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
                "P0 official build with object-attribute capture disabled")
     doc_entries = "\n".join(f"/usr/share/doc/p11scope/{name}"
                             for name in sorted(docs))
+    # Every intermediate doc subdir must be owned, or rpm leaves an empty
+    # skeleton behind on erase (only the top dir was %dir before). Sorted
+    # for deterministic bytes; all ancestor levels, not just the first.
+    doc_dirs = sorted({
+        f"/usr/share/doc/p11scope/{parent}"
+        for name in docs
+        for parent in Path(name).parents
+        if str(parent) != "."
+    })
+    doc_dir_entries = "\n".join(f"%dir {directory}" for directory in doc_dirs)
     spec = (f"Name: p11scope\nVersion: {version}\nRelease: 1\n"
             f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: {license_expression}\n"
             f"URL: {SYSTEM_PACKAGE_URL}\nBuildArch: x86_64\n"
@@ -565,6 +575,7 @@ def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
             "See /usr/share/doc/p11scope/RELEASE.json for build provenance.\n"
             "%files\n/usr/bin/p11scope\n/usr/bin/p11scope-discover\n"
             "%dir /usr/share/doc/p11scope\n"
+            f"{doc_dir_entries}\n"
             f"{doc_entries}\n"
             "%changelog\n"
             f"* {changelog_date} {SYSTEM_PACKAGE_MAINTAINER} - {version}-1\n"

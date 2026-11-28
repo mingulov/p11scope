@@ -9,7 +9,7 @@ import hashlib
 import importlib.util
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tarfile
@@ -356,6 +356,12 @@ class PackageReleaseTests(unittest.TestCase):
         expected_rpm = {"/usr/bin/p11scope", "/usr/bin/p11scope-discover",
                         "/usr/share/doc/p11scope"}
         expected_rpm.update(f"/usr/share/doc/p11scope/{name}" for name in docs)
+        # Owned doc subdirs (%dir): every intermediate directory rpm
+        # creates must be owned or erase leaves a skeleton behind.
+        for name in docs:
+            for parent in PurePosixPath(name).parents:
+                if str(parent) != ".":
+                    expected_rpm.add(f"/usr/share/doc/p11scope/{parent}")
         self.assertEqual(sorted(file_list.splitlines()), sorted(expected_rpm))
         self.assertEqual(set(entries), expected_rpm)
         # No file capabilities on any packaged path.
@@ -429,6 +435,42 @@ License: Apache-2.0 and MIT and (MIT OR BSD-3-Clause)
         rpm_files = subprocess.run(["rpm", "-qlp", str(rpm)], check=True,
                                    capture_output=True, text=True, timeout=30).stdout
         self.assertIn("/usr/share/doc/p11scope/copyright\n", rpm_files)
+
+    def test_rpm_owns_every_doc_subdir_it_creates(self):
+        # Gate-5 rehearsal: dnf remove left an empty doc skeleton behind
+        # because only the top dir was %dir. Every intermediate directory
+        # of every installed doc file must be owned (rpm -qlpv shows it
+        # as a `d` entry), or rpm cannot rmdir it on erase.
+        self.package()
+        rpm = self.output / "p11scope-0.1.0-1.x86_64.rpm"
+        listing = subprocess.run(
+            ["rpm", "-qlpv", str(rpm)],
+            check=True, capture_output=True, text=True, timeout=30).stdout.splitlines()
+        top = "/usr/share/doc/p11scope"
+        owned_dirs = set()
+        doc_files = []
+        for line in listing:
+            fields = line.split()
+            mode, path = fields[0], fields[-1]
+            if path != top and not path.startswith(top + "/"):
+                continue
+            if mode.startswith("d"):
+                owned_dirs.add(path)
+            else:
+                doc_files.append(path)
+        self.assertIn(top, owned_dirs)
+        self.assertTrue(doc_files, "the rpm installs doc files")
+        depths = set()
+        for path in doc_files:
+            parents = PurePosixPath(path).parents
+            chain = [str(parent) for parent in parents
+                     if str(parent).startswith(top + "/")]
+            depths.add(len(chain))
+            for directory in chain:
+                self.assertIn(directory, owned_dirs,
+                              f"{directory} is created but not owned")
+        self.assertGreaterEqual(max(depths), 2,
+                                "the fixtures must nest docs to pin multi-level %dir")
 
     def test_license_rollup_matches_manifests_and_owner_boundaries(self):
         rollup = PACKAGE.license_rollup(self.root, self.notice_manifest)

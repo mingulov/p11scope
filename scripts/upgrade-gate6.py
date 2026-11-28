@@ -187,6 +187,14 @@ ADDITIVE_KEYS = frozenset(
         "modules[0].departed_use.semantics.labels.unknown (semantic capture withheld)",
         "observation.semantic_capture.length_insert_failures",
         "observation.semantic_capture.length_stash_mismatches",
+        # B17 leg 2: the staged reload disclosure, present only when the
+        # capture staged instance reloads (observed live on fedora-sm1).
+        "instance_reload_not_excluded",
+        "instance_reload_not_excluded.continued_across_global",
+        "instance_reload_not_excluded.joined_across_global",
+        "instance_reload_not_excluded.identities",
+        "instance_reload_not_excluded.identities[0].instances",
+        "instance_reload_not_excluded.identities[0].module",
     ]
 )
 

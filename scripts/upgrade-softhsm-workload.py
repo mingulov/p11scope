@@ -120,8 +120,10 @@ def child(module: str) -> int:
         digest_once(library)
         # Stay mapped long enough for several capture passes to observe this
         # caller alive, then exit so the new binary folds it into departed_use
-        # while the old binary keeps it a live row.
-        time.sleep(2.0)
+        # while the old binary keeps it a live row. Four seconds still churns
+        # (a child every 2s over a 24s capture) but survives slow-host
+        # observers that missed 2s children entirely (fedora-sm1, 3 CPUs).
+        time.sleep(4.0)
     finally:
         library.C_Finalize(None)
         if temporary is not None:
@@ -170,7 +172,7 @@ def parent(module: str, interval: float, child_python: str) -> int:
     finally:
         library.C_Finalize(None)
         for row in children:
-            row.wait(timeout=2)
+            row.wait(timeout=6)
         temporary.cleanup()
     return 0
 

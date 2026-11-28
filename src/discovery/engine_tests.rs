@@ -3059,6 +3059,77 @@ fn discovery_evidence_folds_a_split_learned_note_onto_its_row() {
     );
 }
 
+/// Projection refusal: a learned note under the adopted key with a
+/// live divergent claimant never attaches to the projected row — the
+/// exact projection consults the same identity authority as the
+/// terminal. The refused note stays filed and publishes its gapped
+/// record at terminal time instead of vanishing.
+#[test]
+fn discovery_evidence_refuses_an_exact_note_with_a_divergent_claimant() {
+    use crate::discovery::identity::test_fixture::{
+        PATH, SHA, backing_file, mark_pre_copy_up, overlay, reback, split_prearm_pin,
+    };
+    let fd_key = overlay(41);
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let other = backing_file(&dir, "other.so");
+    let mut pins = split_prearm_pin(fd_key, fd_key, SHA, 1);
+    reback(&mut pins, &file);
+    let e_id = pins.pinned().next().expect("the pin").id;
+    let mut twin = split_prearm_pin(fd_key, fd_key, "deadbeef", 1);
+    reback(&mut twin, &other);
+    mark_pre_copy_up(&mut twin);
+    assert!(pins.absorb(twin).is_empty());
+    assert_eq!(
+        pins.pinned().count(),
+        2,
+        "the divergent claimant pair-files beside the adopted pin"
+    );
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = e_id;
+    plan.modules[0].key = fd_key;
+    plan.modules[0].path = PATH.to_string();
+    let learned = BTreeMap::from([(fd_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1, "the adopted row projects");
+    assert!(
+        evidence.modules[0].first_loaded_by.is_none(),
+        "a divergent exact-key claimant must not take the note"
+    );
+    // End to end: the refused note publishes its gapped record at
+    // terminal time instead of vanishing.
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    engine.plan = plan;
+    engine.learned_notes = learned;
+    engine.discovery.modules = evidence.modules;
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "the refused note keeps its own record"
+    );
+    let ghost = &engine.discovery.modules[1];
+    assert!(
+        ghost.first_loaded_by.is_some(),
+        "the record carries the refused note"
+    );
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_NOTE_AMBIGUOUS_REASON
+        }),
+        "the record names its ambiguity gap: {:?}",
+        ghost.skipped
+    );
+}
+
 /// No-data-loss twin: a note for a genuinely different file never
 /// attaches to the planned row.
 #[test]
@@ -94163,12 +94234,15 @@ fn terminal_exact_note_with_stale_noted_row_stays_single() {
     );
 }
 
-/// Terminal-flush duplicate through real staging: the file is adopted
-/// and projected (noteless row), then the shutdown flush stages the
-/// same file twice — fresh, then the duplicate arm — and the note
-/// still folds onto the planned row instead of vanishing.
+/// Terminal-flush duplicate through real staging: the operator
+/// pre-arms the file (no learned note), the plan adopts it and the
+/// final projection renders its noteless row, then one shutdown flush
+/// re-observes the same file and spelling — the duplicate arm files
+/// only the loader note (no fresh object) — and the note still folds
+/// onto the planned row instead of vanishing.
 #[test]
 fn terminal_flush_duplicate_note_folds_onto_planned_row() {
+    use crate::discovery::identity::{PrearmPinRequest, pin_prearm_requests_in_views_with_budget};
     let dir = tempfile::tempdir().unwrap();
     let c = dir.path().join("flush.c");
     let so = dir.path().join("libflush.so");
@@ -94186,58 +94260,96 @@ fn terminal_flush_duplicate_note_folds_onto_planned_row() {
             .unwrap()
             .success()
     );
-    let display = so.to_string_lossy().into_owned();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let prearm = pin_prearm_requests_in_views_with_budget(
+        &[PrearmPinRequest::path(so.clone())],
+        &[],
+        None,
+        0,
+        0,
+        &mut budget,
+        crate::discovery::handle_table::Filing::Untracked,
+    )
+    .expect("the prearm pins");
+    assert_eq!(prearm.inputs.len(), 1, "one prearmed input");
+    let key = prearm.inputs[0].key;
+    let spelling = prearm.inputs[0].path.clone();
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
-    for _ in 0..2 {
-        let file = std::fs::File::open(&so).unwrap();
-        let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
-        let (tx, rx) = std::sync::mpsc::sync_channel(8);
-        tx.send(crate::fanotify::LearnMsg::Candidate(
-            crate::fanotify::LearnedCandidate {
-                file,
-                dev,
-                ino,
-                display_path: display.clone(),
-                loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
-                loader_unknown_reason: None,
-                run_learned: false,
-                proving_retained: false,
-                loader_pid: None,
-            },
-        ))
-        .unwrap();
-        engine.set_learned_rx_for_test(rx);
-        let _drain_alive = &tx;
-        engine.shutdown_file_learning();
-    }
-    assert_eq!(
-        engine.learned_staged_files_for_test(),
-        1,
-        "the second flush takes the duplicate arm: no fresh object"
-    );
-    let key = *engine.learned_notes.keys().next().expect("the note key");
+    engine.prearm_input = Some(PrearmInput {
+        pins: prearm.pins.clone(),
+        inputs: prearm.inputs,
+    });
+    assert!(engine.pinned.absorb(prearm.pins).is_empty());
     let id = engine
         .pinned
         .pinned()
         .find(|pin| pin.key == key)
-        .expect("the staged pin")
+        .expect("the adopted pin")
         .id;
     let mut plan = plan_with(0, 0);
     plan.modules[0].object = id;
     plan.modules[0].key = key;
-    plan.modules[0].path = display;
+    plan.modules[0].path = spelling.clone();
     engine.plan = plan;
-    engine.discovery.modules = vec![split_live_row(key)];
+    let empty_learned = std::collections::BTreeMap::new();
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &empty_learned,
+    );
+    assert_eq!(evidence.modules.len(), 1, "the adopted row projects");
+    assert!(
+        evidence.modules[0].first_loaded_by.is_none(),
+        "the final projection runs before any note stages"
+    );
+    engine.discovery.modules = evidence.modules;
+    let file = std::fs::File::open(&so).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: spelling,
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+            loader_pid: None,
+        },
+    ))
+    .unwrap();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.shutdown_file_learning();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "the duplicate arm stages no fresh object"
+    );
+    let note = engine.learned_notes.get(&key).expect("the duplicate note");
+    assert_eq!(
+        note.exe.as_deref(),
+        Some("/usr/bin/pkcs11-tool"),
+        "the duplicate arm files the observed loader"
+    );
     engine.publish_terminal_learned_records();
     assert_eq!(
         engine.discovery.modules.len(),
         1,
         "the flushed note joins its adopted row"
     );
-    assert!(
-        engine.discovery.modules[0].first_loaded_by.is_some(),
-        "the planned row gains the flushed note"
+    let row = &engine.discovery.modules[0];
+    assert_eq!(
+        row.first_loaded_by
+            .as_ref()
+            .and_then(|note| note.exe.as_deref()),
+        Some("/usr/bin/pkcs11-tool"),
+        "the planned row gains the flushed loader"
     );
 }
 

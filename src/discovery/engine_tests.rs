@@ -93686,6 +93686,378 @@ fn terminal_learned_note_for_an_unprojected_object_still_publishes() {
     );
 }
 
+/// The merged/re-keyed terminal state: one object files under the maps
+/// key and retains the fd key as its pre-arm alias; the plan adopts it
+/// and one live row is projected. No canonical fd pin remains.
+fn split_merged_terminal_state() -> (
+    Engine,
+    PinnedObjectId,
+    p11scope_manifest::maps::ObjectKey,
+    p11scope_manifest::maps::ObjectKey,
+) {
+    use crate::discovery::identity::test_fixture::{
+        PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+    };
+    let fd_key = overlay(41);
+    let maps_key = overlay(21);
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let mut pins = split_prearm_pin(fd_key, maps_key, SHA, 1);
+    reback(&mut pins, &file);
+    let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+    reback(&mut scan, &file);
+    assert!(pins.absorb(scan).is_empty());
+    assert_eq!(pins.pinned().count(), 1, "the split merges once");
+    let merged_id = pins.pinned().next().expect("the merged object").id;
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = merged_id;
+    plan.modules[0].key = maps_key;
+    plan.modules[0].path = PATH.to_string();
+    engine.plan = plan;
+    (engine, merged_id, fd_key, maps_key)
+}
+
+/// The refiled terminal state: the live refile moved the fd alias onto
+/// the scan object and retired the fd entry; the planned scan object
+/// carries the alias.
+fn split_refiled_terminal_state() -> (
+    Engine,
+    PinnedObjectId,
+    p11scope_manifest::maps::ObjectKey,
+    p11scope_manifest::maps::ObjectKey,
+) {
+    use crate::discovery::identity::test_fixture::{
+        PATH, SHA, backing_file, overlay, reback, split_prearm_pin, split_scan_pin,
+    };
+    let fd_key = overlay(41);
+    let maps_key = overlay(21);
+    let dir = tempfile::tempdir().unwrap();
+    let file = backing_file(&dir, "provider.so");
+    let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+    reback(&mut scan, &file);
+    let mut pins = PinnedObjects::empty();
+    assert!(pins.absorb(scan).is_empty());
+    let mut prearm = split_prearm_pin(fd_key, maps_key, SHA, 1);
+    reback(&mut prearm, &file);
+    assert!(pins.absorb(prearm).is_empty());
+    pins.refile_split_prearm_alias(PATH);
+    assert_eq!(pins.pinned().count(), 1, "the refile joins the split");
+    let scan_id = pins.pinned().next().expect("the joined object").id;
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let mut plan = plan_with(0, 0);
+    plan.modules[0].object = scan_id;
+    plan.modules[0].key = maps_key;
+    plan.modules[0].path = PATH.to_string();
+    engine.plan = plan;
+    (engine, scan_id, fd_key, maps_key)
+}
+
+/// Terminal fold through a merge: a mid-capture learned note under the
+/// fd key folds onto the live row of the merged/re-keyed object (which
+/// files no canonical fd pin) instead of vanishing.
+#[test]
+fn terminal_learned_note_folds_onto_a_merged_rekeyed_object() {
+    let (mut engine, _, fd_key, maps_key) = split_merged_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one file stays one row across the merge"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the fold keeps the loader note on the live row"
+    );
+}
+
+/// Terminal fold through a refile: the fd entry is retired and only
+/// the alias record remains on the planned scan object, yet the note
+/// still folds onto its row.
+#[test]
+fn terminal_learned_note_folds_through_a_refiled_alias() {
+    let (mut engine, _, fd_key, maps_key) = split_refiled_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "one file stays one row across the refile"
+    );
+    assert!(
+        engine.discovery.modules[0].first_loaded_by.is_some(),
+        "the fold keeps the loader note on the live row"
+    );
+}
+
+/// Data-always twin: a note that cannot join (genuinely distinct file)
+/// still publishes its own row, and the row carries the named unjoined
+/// gap mirrored at top level.
+#[test]
+fn terminal_unjoined_note_publishes_a_named_gap() {
+    use crate::discovery::identity::test_fixture::{
+        INODE, SHA, backing_file, overlay, reback, split_prearm_pin,
+    };
+    use p11scope_manifest::maps::ObjectKey;
+    let (mut engine, _, _, maps_key) = split_terminal_state();
+    let dir = tempfile::tempdir().unwrap();
+    let other = backing_file(&dir, "other.so");
+    let other_inode = INODE + 1;
+    let other_fd_key = ObjectKey {
+        device: overlay(41).device,
+        inode: other_inode,
+    };
+    let other_maps_key = ObjectKey {
+        device: maps_key.device,
+        inode: other_inode,
+    };
+    let mut foreign = split_prearm_pin(other_fd_key, other_maps_key, SHA, 1);
+    reback(&mut foreign, &other);
+    assert!(engine.pinned.absorb(foreign).is_empty());
+    engine.learned_notes.insert(other_fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "a distinct file keeps its own row"
+    );
+    let ghost = &engine.discovery.modules[1];
+    assert!(ghost.first_loaded_by.is_some(), "the row carries the note");
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_UNJOINED_REASON
+        }),
+        "the row names its unjoined gap: {:?}",
+        ghost.skipped
+    );
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_UNJOINED_REASON
+        }),
+        "the gap mirrors at top level"
+    );
+}
+
+/// Data-always twin for ambiguity: witness-divergent twins under one
+/// note key publish a minimal row (no digest shown for either file)
+/// with the ambiguity gap mirrored at top level.
+#[test]
+fn terminal_ambiguous_note_publishes_a_minimal_row() {
+    use crate::discovery::identity::test_fixture::{
+        backing_file, mark_pre_copy_up, reback, split_prearm_pin,
+    };
+    let (mut engine, _, fd_key, maps_key) = split_terminal_state();
+    let dir = tempfile::tempdir().unwrap();
+    let other = backing_file(&dir, "other.so");
+    let mut twin = split_prearm_pin(fd_key, maps_key, "deadbeef", 1);
+    reback(&mut twin, &other);
+    mark_pre_copy_up(&mut twin);
+    assert!(engine.pinned.absorb(twin).is_empty());
+    assert_eq!(
+        engine.pinned.pinned().count(),
+        3,
+        "the divergent twin pair-files beside the plain pin"
+    );
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "an ambiguous note keeps its own row"
+    );
+    let ghost = &engine.discovery.modules[1];
+    assert!(
+        ghost.first_loaded_by.is_some(),
+        "the minimal row carries the note"
+    );
+    assert_eq!(
+        ghost.path,
+        crate::render::UNKNOWN_MODULE_PATH,
+        "no file details render for an ambiguous key"
+    );
+    assert!(
+        ghost.sha256.is_none(),
+        "no digest renders for an ambiguous key"
+    );
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_NOTE_AMBIGUOUS_REASON
+        }),
+        "the row names its ambiguity gap: {:?}",
+        ghost.skipped
+    );
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_NOTE_AMBIGUOUS_REASON
+        }),
+        "the gap mirrors at top level"
+    );
+}
+
+/// Data-always twin for pinlessness: a note whose key no live pin
+/// files still publishes a minimal row with the unpinned gap mirrored
+/// at top level. It never vanishes.
+#[test]
+fn terminal_unpinned_note_publishes_a_minimal_row() {
+    use crate::discovery::identity::test_fixture::overlay;
+    let maps_key = overlay(21);
+    let (mut engine, _, _, _) = split_terminal_state();
+    engine.learned_notes.insert(overlay(99), split_note());
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        2,
+        "an unpinned note keeps its own row"
+    );
+    let ghost = &engine.discovery.modules[1];
+    assert!(
+        ghost.first_loaded_by.is_some(),
+        "the minimal row carries the note"
+    );
+    assert_eq!(
+        ghost.path,
+        crate::render::UNKNOWN_MODULE_PATH,
+        "no path renders without a live pin"
+    );
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_NOTE_UNPINNED_REASON
+        }),
+        "the row names its unpinned gap: {:?}",
+        ghost.skipped
+    );
+    assert!(
+        engine.plan.skipped.iter().any(|skip| {
+            skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_NOTE_UNPINNED_REASON
+        }),
+        "the gap mirrors at top level"
+    );
+}
+
+/// A resolved-but-unprojected note still publishes with the unjoined
+/// gap: the planned row never rendered, so the record is
+/// representation.
+#[test]
+fn terminal_rowless_resolved_note_publishes_with_its_gap() {
+    let (mut engine, _, fd_key, _) = split_terminal_state();
+    engine.learned_notes.insert(fd_key, split_note());
+    engine.discovery.modules = Vec::new();
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        1,
+        "an unrepresented file keeps its record"
+    );
+    let ghost = &engine.discovery.modules[0];
+    assert!(
+        ghost.skipped.iter().any(|skip| {
+            skip.name == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_UNJOINED_REASON
+        }),
+        "the record names its unjoined gap: {:?}",
+        ghost.skipped
+    );
+}
+
+/// Top-level gap dedup: two unjoined notes file one shared gap row,
+/// while each keeps its own record row.
+#[test]
+fn terminal_unjoined_gaps_dedupe_at_top_level() {
+    use crate::discovery::identity::test_fixture::{
+        INODE, SHA, backing_file, overlay, reback, split_prearm_pin,
+    };
+    use p11scope_manifest::maps::ObjectKey;
+    let (mut engine, _, _, maps_key) = split_terminal_state();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, delta) in [("other.so", 1), ("third.so", 2)] {
+        let other = backing_file(&dir, name);
+        let inode = INODE + delta;
+        let fd = ObjectKey {
+            device: overlay(41).device,
+            inode,
+        };
+        let maps = ObjectKey {
+            device: maps_key.device,
+            inode,
+        };
+        let mut foreign = split_prearm_pin(fd, maps, SHA, 1);
+        reback(&mut foreign, &other);
+        assert!(engine.pinned.absorb(foreign).is_empty());
+        engine.learned_notes.insert(fd, split_note());
+    }
+    engine.discovery.modules = vec![split_live_row(maps_key)];
+    engine.publish_terminal_learned_records();
+    assert_eq!(
+        engine.discovery.modules.len(),
+        3,
+        "each unjoined note keeps its own row"
+    );
+    let unjoined = engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| {
+            skip.subject == crate::render::LEARNED_SKIP_SUBJECT
+                && skip.reason == crate::render::LEARNED_UNJOINED_REASON
+        })
+        .count();
+    assert_eq!(unjoined, 1, "one shared top-level gap row, got {unjoined}");
+}
+
+/// Projection fold through a merge: the live row carries the loader
+/// note even though no canonical fd pin exists anymore.
+#[test]
+fn discovery_evidence_folds_a_note_onto_a_merged_row() {
+    let (engine, _, fd_key, _) = split_merged_terminal_state();
+    let learned = BTreeMap::from([(fd_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1);
+    assert!(
+        evidence.modules[0].first_loaded_by.is_some(),
+        "the merged row carries its split note"
+    );
+}
+
+/// Projection fold through a refile: the retired fd entry leaves the
+/// alias record on the planned object, and the note follows it.
+#[test]
+fn discovery_evidence_folds_a_note_through_a_refiled_alias() {
+    let (engine, _, fd_key, _) = split_refiled_terminal_state();
+    let learned = BTreeMap::from([(fd_key, split_note())]);
+    let (evidence, _) = discovery_evidence(
+        &engine.plan,
+        &engine.pinned,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+        &learned,
+    );
+    assert_eq!(evidence.modules.len(), 1);
+    assert!(
+        evidence.modules[0].first_loaded_by.is_some(),
+        "the refiled row carries its split note"
+    );
+}
+
 /// The per-capture learned-file cap names its excess once: the 33rd file
 /// is refused loudly, the first 32 are unaffected.
 #[test]

@@ -68,7 +68,8 @@ PRODUCER_CONSTANTS = (
     "RUN_TREE_MEMBERSHIP_UNKNOWN",
     # Learned-file gaps: first-run, overflow, file cap, table
     # cap, table unbind, unavailable, replaced/deleted,
-    # operator-disabled, mount-namespace and unmarked-filesystem
+    # operator-disabled, mount-namespace, unmarked-filesystem,
+    # unjoined-note, ambiguous-note-key and unpinned-note-key
     # reasons under their own subject.
     "LEARNED_FIRST_RUN_REASON",
     "LEARNED_OVERFLOW_REASON",
@@ -80,6 +81,9 @@ PRODUCER_CONSTANTS = (
     "LEARNED_DISABLED_REASON",
     "LEARNED_MOUNT_NAMESPACE_REASON",
     "LEARNED_UNMARKED_REASON",
+    "LEARNED_UNJOINED_REASON",
+    "LEARNED_NOTE_AMBIGUOUS_REASON",
+    "LEARNED_NOTE_UNPINNED_REASON",
 )
 
 
@@ -102,7 +106,7 @@ def producer_reasons():
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
     twenty discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
-    of its ten reasons under its own subject. The split mirrors
+    of its thirteen reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
     source, never from a copy pasted into this test.
     """
@@ -149,12 +153,15 @@ def producer_reasons():
         const["LEARNED_DISABLED_REASON"],
         const["LEARNED_MOUNT_NAMESPACE_REASON"],
         const["LEARNED_UNMARKED_REASON"],
+        const["LEARNED_UNJOINED_REASON"],
+        const["LEARNED_NOTE_AMBIGUOUS_REASON"],
+        const["LEARNED_NOTE_UNPINNED_REASON"],
     }
     assert (
         len(entry) == 2
         and len(discovery) == 20
         and len(run_tree) == 3
-        and len(learned) == 10
+        and len(learned) == 13
     ), const
     return entry, discovery, run_tree, learned
 

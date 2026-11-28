@@ -2045,7 +2045,7 @@ pub(crate) const PAUSE_RELEASE_UNPROVEN_REASON: &str = "the release after a fail
 pub(crate) const MEMBER_STOP_SKIP_SUBJECT: &str = "run first-map stop";
 pub(crate) const MEMBER_STOP_UNAVAILABLE_REASON: &str =
     "the run first-map stop was unavailable; descendants ran without first-map protection";
-/// Learned-file gaps file under this subject with ten finite reasons
+/// Learned-file gaps file under this subject with thirteen finite reasons
 /// (schema v3): the staged-file count rides in
 /// `evidence.learned_staged_files`, the loss in
 /// `evidence.learned_event_loss`, the cap excess in
@@ -2069,6 +2069,17 @@ pub(crate) const LEARNED_REPLACED_DELETED_REASON: &str =
 pub(crate) const LEARNED_DISABLED_REASON: &str = "file learning was disabled by the operator; short-lived first loads of new provider files were not learned";
 pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned";
 pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
+pub(crate) const LEARNED_UNJOINED_REASON: &str =
+    "a learned loader note never joined a planned row; its file is listed unattached";
+pub(crate) const LEARNED_NOTE_AMBIGUOUS_REASON: &str =
+    "a learned note key names more than one live file; the note is listed without file details";
+pub(crate) const LEARNED_NOTE_UNPINNED_REASON: &str =
+    "no live pin remains for a learned note key; the note is listed without file details";
+/// The presented path for a discovery row published without file
+/// details (an unjoined learned note with no live pin to name):
+/// transparent, never a rival claim, always beside the named gap
+/// that explains the missing identity.
+pub(crate) const UNKNOWN_MODULE_PATH: &str = "unknown";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 /// Gap-noise folds: mid-flight exits, scan-budget stops and
 /// loader-context misses project to these finite public reasons
@@ -2353,7 +2364,7 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
-    // Learned-file gaps keep their subject and their ten finite
+    // Learned-file gaps keep their subject and their thirteen finite
     // reasons; the counts ride in the `evidence.learned_*` keys.
     // Anything else under the subject falls through to the fail-closed
     // generic below instead of breaking the closed vocabulary.
@@ -2370,6 +2381,9 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
                 | LEARNED_DISABLED_REASON
                 | LEARNED_MOUNT_NAMESPACE_REASON
                 | LEARNED_UNMARKED_REASON
+                | LEARNED_UNJOINED_REASON
+                | LEARNED_NOTE_AMBIGUOUS_REASON
+                | LEARNED_NOTE_UNPINNED_REASON
         )
     {
         return SkippedOut {

@@ -1281,7 +1281,7 @@ Run-tree scope gaps file under their own subject. Each record is
 
 Learned-file gaps file under their own subject. Each record is
 `{name: "learned provider file", reason}` with `reason` exactly one of
-the ten reasons below:
+the thirteen reasons below:
 
 - `a provider file was learned after its first use; its earlier calls
   were not observed`: the fanotify drain staged a provider file after
@@ -1338,6 +1338,16 @@ the ten reasons below:
   `--pid=host` container, or the host watching rootless podman), and
   filesystem marks are placed from the observer's own mount table
   only. In-namespace learning still ran.
+- `a learned loader note never joined a planned row; its file is listed
+  unattached`: the note's file never matched a planned object, so the
+  terminal record lists it with the pin's own path and digest rather
+  than folding it onto a live row.
+- `a learned note key names more than one live file; the note is listed
+  without file details`: the key is genuinely ambiguous, so no digest
+  renders rather than risk naming the wrong file.
+- `no live pin remains for a learned note key; the note is listed without
+  file details`: the key's pins retired or were refused before
+  publication, so the record names only the key and the note.
 
 No path, pid, or executable ever appears in these rows: anything else
 filed under the subject redacts to the generic `discovery subject` /

@@ -1671,6 +1671,18 @@ LEARNED_UNMARKED_REASON = (
     "pass was still pending or could not start; short-lived first loads "
     "of new provider files opened only there were not learned"
 )
+LEARNED_UNJOINED_REASON = (
+    "a learned loader note never joined a planned row; "
+    "its file is listed unattached"
+)
+LEARNED_NOTE_AMBIGUOUS_REASON = (
+    "a learned note key names more than one live file; "
+    "the note is listed without file details"
+)
+LEARNED_NOTE_UNPINNED_REASON = (
+    "no live pin remains for a learned note key; "
+    "the note is listed without file details"
+)
 LEARNED_SKIP_REASONS = {
     LEARNED_FIRST_RUN_REASON,
     LEARNED_OVERFLOW_REASON,
@@ -1682,6 +1694,17 @@ LEARNED_SKIP_REASONS = {
     LEARNED_DISABLED_REASON,
     LEARNED_MOUNT_NAMESPACE_REASON,
     LEARNED_UNMARKED_REASON,
+    LEARNED_UNJOINED_REASON,
+    LEARNED_NOTE_AMBIGUOUS_REASON,
+    LEARNED_NOTE_UNPINNED_REASON,
+}
+# The two minimal-row gaps: a learned note that never joined a pin
+# publishes its row without a digest (never an invented one). The
+# unjoined-note reason keeps its digest (its pin is known), so it never
+# covers a digest-less row.
+MINIMAL_ROW_GAP_REASONS = {
+    LEARNED_NOTE_AMBIGUOUS_REASON,
+    LEARNED_NOTE_UNPINNED_REASON,
 }
 # Owned-handoff (v0.7.0): a run whose startup step failed after probes
 # attached seals a partial report naming the failed step, with every
@@ -3691,6 +3714,43 @@ def exact_full_identity(carrier):
     exact_identity(carrier)
 
 
+def exact_module_row_identity(module, row=None):
+    """A discovery/module row's identity: pinned rows carry the full
+    digest; a learned note that never joined a pin publishes its row
+    without one (never an invented digest), covered by the named
+    minimal-row gap the discovery row itself carries. `row` is the
+    evidence.discovery[] row (the module itself when the module is one);
+    a digest-less module with no row to cover it stays rejected, and so
+    does one whose row carries any other gap — including the
+    unjoined-note reason, which keeps its pin's digest. The covering row
+    is prearm-sourced: only the terminal learned-note publisher emits
+    digest-less rows, so a scan- or manifest-sourced row without a
+    digest is producer corruption, never a minimal row."""
+    if row is None:
+        row = module
+    if module["sha256"] is not None:
+        exact_full_identity(module)
+        return
+    require(
+        "prearm" in (row.get("sources") or []),
+        f"digest-less non-prearm module row: {module}",
+    )
+    reasons = {skip["reason"] for skip in row.get("skipped", [])}
+    require(
+        reasons & MINIMAL_ROW_GAP_REASONS,
+        f"digest-less module row without a minimal-row gap: {module}",
+    )
+    require("build_id" in module, f"full identity omits build ID: {module}")
+    require(
+        isinstance(module["dev"], list)
+        and len(module["dev"]) == 2
+        and all(u64(part) for part in module["dev"]),
+        f"invalid object device: {module}",
+    )
+    require(u64(module["ino"], positive=True), f"invalid object inode: {module}")
+    require(build_id_ok(module["build_id"]), f"invalid object build ID: {module}")
+
+
 def exact_sources(carrier):
     require(
         carrier["sources"] in ALLOWED_SOURCE_ARRAYS,
@@ -4033,7 +4093,7 @@ def exact_manifest_object_fallbacks(evidence):
             f"incomplete discovery module: {module}",
         )
         exact_sources(module)
-        exact_full_identity(module)
+        exact_module_row_identity(module)
         nested_skips = module["skipped"]
         require(isinstance(nested_skips, list), f"module skips are not an array: {module}")
         for skip in nested_skips:
@@ -4971,7 +5031,7 @@ def exact_common(
     require(evidence["discovery"], "evidence.discovery is empty: nothing was discovered")
     exact_manifest_object_fallbacks(evidence)
     for module in evidence["discovery"]:
-        exact_full_identity(module)
+        exact_module_row_identity(module)
         exact_sources(module)
         for object_ in module["objects"]:
             exact_full_identity(object_)
@@ -5108,12 +5168,16 @@ def exact_capture_modules(document):
     exact_module_ownership(document)
     modules = document["capture"]["modules"]
     require(modules, "capture.modules is empty: the document names no provider")
-    for module in modules:
+    for index, module in enumerate(modules):
         require(module["path"], f"module without a path: {module}")
-        # `sha256` is null for an object nothing pinned — never in a lane that
-        # attached probes, and the guard keeps that a stated rejection rather
-        # than a TypeError traceback.
-        exact_full_identity(module)
+        # `sha256` is null for an object nothing pinned — otherwise never
+        # in a lane that attached probes, so the guard keeps that a stated
+        # rejection rather than a TypeError traceback. The one exception is
+        # a learned note's minimal row, covered by the named gap its
+        # discovery row carries (positional: the agreement check below
+        # pins the two lists to the same order).
+        rows = document["evidence"]["discovery"]
+        exact_module_row_identity(module, rows[index] if index < len(rows) else None)
     require(
         modules == [
             {key: module[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
@@ -7564,6 +7628,42 @@ def self_test():
         settle_fixture_verdict(bad)
         rejected(lambda bad=bad: exact_capture_modules(bad))
     print("function rows carry an exact target and sorted unique ordinals: OK")
+    # A learned note's minimal row: no digest (never an invented one),
+    # covered by the named minimal-row gap on its prearm discovery row
+    # and mirrored at top level. A digest-less row with no gap, with
+    # the wrong gap, covered only by the unjoined-note reason (which
+    # keeps its pin's digest), or on a non-prearm row stays rejected —
+    # as does a minimal row whose gap never reaches top level.
+    def minimal_row_doc(reason, *, sources=("prearm",), mirror=True):
+        document = copy.deepcopy(clean)
+        rows = discovery_fixture(sources)
+        row = rows[0]
+        row.update(path="unknown", sha256=None, build_id=None)
+        if reason is not None:
+            gap = {"name": LEARNED_SKIP_SUBJECT, "reason": reason}
+            row["skipped"] = [gap]
+            if mirror:
+                document["evidence"]["skipped"].append(copy.deepcopy(gap))
+        document["evidence"]["discovery"] = rows
+        document["capture"]["modules"] = [
+            {key: row[key] for key in ("path", "dev", "ino", "sha256", "build_id")}
+        ]
+        for item in document["functions"]:
+            item.update(module=None, module_ambiguous=False, module_unresolved=True)
+        return settle_fixture_verdict(document)
+
+    for reason in (LEARNED_NOTE_AMBIGUOUS_REASON, LEARNED_NOTE_UNPINNED_REASON):
+        exact_capture_modules(minimal_row_doc(reason))
+    bad_minimal = [
+        minimal_row_doc(None),
+        minimal_row_doc(LEARNED_UNJOINED_REASON),
+        minimal_row_doc(LEARNED_FIRST_RUN_REASON),
+        minimal_row_doc(LEARNED_NOTE_AMBIGUOUS_REASON, sources=("scan",)),
+        minimal_row_doc(LEARNED_NOTE_AMBIGUOUS_REASON, mirror=False),
+    ]
+    for bad in bad_minimal:
+        rejected(lambda bad=bad: exact_capture_modules(bad))
+    print("learned-note minimal rows carry their named gap, never a digest: OK")
     # Review answer (a) / F-1: the oracle recomputes the verdict from the
     # counters and refuses a document whose classes or detail disagree.
     def verdict_doc(**counters):

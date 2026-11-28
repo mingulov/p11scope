@@ -24,8 +24,8 @@ use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ClaimAuthority, ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
     InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError, ManifestPinning,
-    ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId, PinnedObjects,
-    PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
+    ManifestStaleReason, NoteRepresentation, Pin, PinnedConservativeCursor, PinnedObjectId,
+    PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
     StaleManifestObject, WaitCause, bind_scanned_modules, bind_scanned_modules_strict,
     bind_scanned_modules_strict_gated, canonicalize_scanned_overlays, open_view_executable_cached,
@@ -24931,7 +24931,9 @@ impl Engine {
     /// unattached (no objects, no watch, no windows), so the file is
     /// named in the evidence instead of only counted. Files the plan
     /// adopted already list through ordinary projection and are
-    /// skipped here.
+    /// skipped here. Every published record carries its named gap and
+    /// mirrors it at top level; a note that cannot join still
+    /// publishes — it never vanishes.
     fn publish_terminal_learned_records(&mut self) {
         if self.learned_notes.is_empty() {
             return;
@@ -24968,17 +24970,16 @@ impl Engine {
             }) {
                 continue;
             }
-            let Some(pin) = self.pinned.pinned().find(|pin| pin.key == *key) else {
-                continue;
-            };
-            // Same-file fold across the proved overlay split: the note
-            // names a planned object the exact key joins miss (fd-domain
-            // note key vs maps-domain plan key), so it folds onto that
-            // row — forward-only, never clobbering an attached note —
-            // instead of publishing a ghost row for the same file. A
-            // planned-but-unprojected target still publishes: the file
-            // is otherwise unnamed, so the record is representation,
-            // not duplication.
+            // Same-file fold across the proved overlay split, resolved
+            // before any pin lookup: the note names a planned object
+            // the exact key joins miss (fd-domain note key vs
+            // maps-domain plan key, possibly surviving only as a
+            // retained alias after a merge or re-key), so it folds onto
+            // that row — forward-only, never clobbering an attached
+            // note — instead of publishing a ghost row for the same
+            // file. A planned-but-unprojected target still publishes:
+            // the file is otherwise unnamed, so the record is
+            // representation, not duplication.
             if let Some(target) = self.pinned.resolve_split_note_target(*key, &planned_ids) {
                 let mut folded = false;
                 if let Some(module) = self
@@ -25001,11 +25002,35 @@ impl Engine {
                     continue;
                 }
             }
-            let (path, sha256, build_id) = (
-                pin.path.to_string(),
-                pin.sha256.to_string(),
-                pin.build_id.map(str::to_string),
-            );
+            // Fallback: identity-owner representation without
+            // canonical-key equality. Detailed pins render their path
+            // and digest; ambiguous or unpinned keys render a minimal
+            // row that names only the key and the note, never invented
+            // details. Every arm publishes with its named gap.
+            let (path, sha256, build_id, reason) = match self.pinned.note_representation(*key) {
+                NoteRepresentation::Detailed(pin) => (
+                    pin.path.to_string(),
+                    Some(pin.sha256.to_string()),
+                    pin.build_id.map(str::to_string),
+                    crate::render::LEARNED_UNJOINED_REASON,
+                ),
+                NoteRepresentation::Ambiguous => (
+                    crate::render::UNKNOWN_MODULE_PATH.to_string(),
+                    None,
+                    None,
+                    crate::render::LEARNED_NOTE_AMBIGUOUS_REASON,
+                ),
+                NoteRepresentation::Unpinned => (
+                    crate::render::UNKNOWN_MODULE_PATH.to_string(),
+                    None,
+                    None,
+                    crate::render::LEARNED_NOTE_UNPINNED_REASON,
+                ),
+            };
+            let gap = Skipped {
+                subject: crate::render::LEARNED_SKIP_SUBJECT.to_string(),
+                reason: reason.to_string(),
+            };
             let id = plan::ModuleId(next_id);
             next_id = next_id.saturating_add(1);
             self.discovery.modules.push(render::DiscoveredModule {
@@ -25013,7 +25038,7 @@ impl Engine {
                 admission_class: None,
                 dev: (key.device.major, key.device.minor),
                 ino: key.inode,
-                sha256: Some(sha256),
+                sha256,
                 path,
                 build_id,
                 layer: None,
@@ -25023,7 +25048,7 @@ impl Engine {
                 corroboration: vec!["uncorroborated"],
                 tables: Vec::new(),
                 interfaces: 0,
-                skipped: Vec::new(),
+                skipped: vec![skipped_out(&gap)],
                 watch: None,
                 attached_at_ns: Some(None),
                 unobserved_windows: None,
@@ -25032,6 +25057,17 @@ impl Engine {
                 first_attach_points: None,
                 first_loaded_by: Some(note.clone()),
             });
+            // Mirror at top level, deduplicated: module skips must
+            // appear in top-level evidence, and one shared row names
+            // the loss no matter how many records cite it.
+            if !self
+                .plan
+                .skipped
+                .iter()
+                .any(|filed| filed.subject == gap.subject && filed.reason == gap.reason)
+            {
+                self.plan.skipped.push(gap);
+            }
         }
     }
 

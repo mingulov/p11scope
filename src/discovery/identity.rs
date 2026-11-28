@@ -1803,6 +1803,20 @@ pub struct PinnedSummary<'a> {
     pub pre_copy_up: bool,
 }
 
+/// Display identity for an unjoined learned-note key: the one live pin
+/// filing it (its path, digest and build id render on the row), or the
+/// structured reason the row carries no file details.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NoteRepresentation<'a> {
+    /// Exactly one live pin files the note key; show its details.
+    Detailed(PinnedSummary<'a>),
+    /// Several live pins file the note key; details withheld, never
+    /// misattributed.
+    Ambiguous,
+    /// No live pin files the note key; details absent, never invented.
+    Unpinned,
+}
+
 /// Claims retained per accepted process view. Vectors deliberately preserve duplicate
 /// claims: two tables or views may rely on the same pin/target independently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4532,12 +4546,63 @@ impl PinnedObjects {
         self.raw_to_id.insert(prearm_raw, scan_id);
     }
 
+    /// Live owners of a learned-note key: distinct entries filing a
+    /// raw under it — canonical pins and retained aliases alike —
+    /// that are present and uncollapsed. Collapsed entries file
+    /// heuristic observations that prove no physical identity, so
+    /// they neither route nor veto; witness-marked entries stay,
+    /// since a pre mark is proven context on the observation rather
+    /// than a different file. Callers decide ambiguity from the set.
+    fn live_note_owners(&self, key: ObjectKey) -> BTreeSet<PinnedObjectId> {
+        let mut owners = BTreeSet::new();
+        for (raw, id) in &self.raw_to_id {
+            if raw.key != key {
+                continue;
+            }
+            let Some(entry) = self.by_id.get(id) else {
+                continue;
+            };
+            if entry.collapsed {
+                continue;
+            }
+            owners.insert(*id);
+        }
+        owners
+    }
+
+    /// Display identity backing an unjoined learned-note key: the one
+    /// live pin filing it (shown with its digest), or the structured
+    /// reason the row carries no file details. A poisoned key is
+    /// ambiguous (its rejection proved same-key divergence). Callers
+    /// publish in every arm; a note never vanishes for lack of a pin.
+    pub(crate) fn note_representation(&self, key: ObjectKey) -> NoteRepresentation<'_> {
+        if self.rejected_keys.contains(&key) {
+            return NoteRepresentation::Ambiguous;
+        }
+        let owners = self.live_note_owners(key);
+        let mut owners = owners.into_iter();
+        let Some(first) = owners.next() else {
+            return NoteRepresentation::Unpinned;
+        };
+        if owners.next().is_some() {
+            return NoteRepresentation::Ambiguous;
+        }
+        match self.summary(first) {
+            Some(pin) => NoteRepresentation::Detailed(pin),
+            None => NoteRepresentation::Unpinned,
+        }
+    }
+
     /// Resolve a learned-note key to the planned same-file object
     /// across a pre-6.8 overlay split, so the note folds onto the live
     /// row instead of publishing a ghost `prearm`-only row for the same
-    /// file. The note is keyed by the fd-domain pin identity while the
-    /// plan adopts the maps-domain scan object; the join crosses that
-    /// split only on proof, mirroring
+    /// file. The join follows merges and re-keys through the identity
+    /// owner: every raw filing the note key routes — canonical fd pins
+    /// and retained aliases (absorb re-keys, split refiles) alike —
+    /// never canonical-key equality alone. A uniquely-owned planned
+    /// alias folds directly (the merge or refile already proved the
+    /// alias names this object); otherwise the join crosses the split
+    /// only on proof, mirroring
     /// [`refile_split_prearm_alias`](Self::refile_split_prearm_alias):
     /// a pin filed under the note key carries the pin-time
     /// self-mapping proof (`Entry::probed_maps_key`) naming the maps
@@ -4546,9 +4611,9 @@ impl PinnedObjects {
     /// is the same complete opened-file identity
     /// ([`exactly_matches`](Self::exactly_matches), the authority).
     /// Anything else fails closed to `None` and the note keeps its
-    /// own terminal record: a poisoned note key, an unproven or
-    /// collapsed pin, a collapsed target, ambiguity (never across a
-    /// heuristic collapse, never by key equality alone — inode
+    /// own terminal record: a poisoned note key, several live owners,
+    /// an unproven or collapsed pin, a collapsed target (never across
+    /// a heuristic collapse, never by key equality alone — inode
     /// numbers repeat across btrfs subvolumes and overlay layers),
     /// and genuinely distinct files.
     pub(crate) fn resolve_split_note_target(
@@ -4559,34 +4624,37 @@ impl PinnedObjects {
         if self.rejected_keys.contains(&learned_key) {
             return None;
         }
+        let owners = self.live_note_owners(learned_key);
+        let mut owners = owners.into_iter();
+        let owner = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        let entry = &self.by_id[&owner];
+        if planned.contains(&owner) && entry.raw.key != learned_key {
+            return Some(owner);
+        }
+        let probed = entry.probed_maps_key?;
         let mut targets = BTreeSet::new();
-        for (id, entry) in &self.by_id {
-            if entry.raw.key != learned_key || entry.collapsed {
-                continue;
-            }
-            let Some(probed) = entry.probed_maps_key else {
+        for target in planned {
+            let Some(known) = self.by_id.get(target) else {
                 continue;
             };
-            for target in planned {
-                let Some(known) = self.by_id.get(target) else {
-                    continue;
-                };
-                if known.collapsed {
-                    continue;
-                }
-                if !self.object_matches_key(
-                    *target,
-                    probed.device.major,
-                    probed.device.minor,
-                    probed.inode,
-                ) {
-                    continue;
-                }
-                if !self.exactly_matches(*target, self, *id) {
-                    continue;
-                }
-                targets.insert(*target);
+            if known.collapsed {
+                continue;
             }
+            if !self.object_matches_key(
+                *target,
+                probed.device.major,
+                probed.device.minor,
+                probed.inode,
+            ) {
+                continue;
+            }
+            if !self.exactly_matches(*target, self, owner) {
+                continue;
+            }
+            targets.insert(*target);
         }
         if targets.len() == 1 {
             return targets.into_iter().next();
@@ -14679,7 +14747,7 @@ mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, manifest_pin, mark_pre_copy_up,
         module, overlay, own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin,
-        reback, repath_single_pin, view_pin,
+        reback, repath_single_pin, split_prearm_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -20542,12 +20610,14 @@ mod tests {
         );
     }
 
-    /// Key-filter twin: identical opened-file identity (through
-    /// honestly-unknown mount ids) but a maps key that misses the
-    /// proved rendering — the key filter must refuse the join, so the
-    /// note keeps its own row.
+    /// Owner-ambiguity twin: two pins file the note key (the kept
+    /// fd pin plus a stray same-key pin), so no unique identity owner
+    /// exists and the note keeps its own row. (The stray's proved
+    /// rendering also misses every planned key; see
+    /// `split_note_with_unique_owner_but_key_miss` for the key filter
+    /// in isolation with a unique owner.)
     #[test]
-    fn split_note_with_identity_but_key_miss_resolves_to_nothing() {
+    fn split_note_with_two_same_key_pins_resolves_to_nothing() {
         use super::test_fixture::{SHA, backing_file, overlay, reback, split_prearm_pin};
         use p11scope_manifest::identity::MappingFileKey;
         let fd_key = overlay(41);
@@ -20579,7 +20649,7 @@ mod tests {
         assert_eq!(
             pins.resolve_split_note_target(fd_key, &[scan_id]),
             None,
-            "a proved rendering that misses the target key never resolves"
+            "two pins filing one note key never resolve"
         );
     }
 
@@ -20655,6 +20725,432 @@ mod tests {
             None,
             "a rejected key never resolves while entries live under it"
         );
+    }
+
+    /// The merged/re-keyed split shape: the pre-arm pin files first and
+    /// the scan pin merges into it, so one object files under the maps
+    /// key and retains the fd key as its pre-arm alias. Returns the pins
+    /// plus the merged object's id.
+    fn merged_split_pair(
+        fd_key: ObjectKey,
+        maps_key: ObjectKey,
+        file: &std::sync::Arc<std::fs::File>,
+    ) -> (PinnedObjects, PinnedObjectId) {
+        use super::test_fixture::{SHA, reback, split_prearm_pin, split_scan_pin};
+        let mut pins = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut pins, file);
+        let mut scan = split_scan_pin(maps_key, fd_key, SHA, 1);
+        reback(&mut scan, file);
+        assert!(pins.absorb(scan).is_empty());
+        assert_eq!(pins.pinned().count(), 1, "the split merges once");
+        let merged_id = pins.pinned().next().expect("the merged object").id;
+        assert_eq!(
+            pins.pinned().next().expect("the merged object").key,
+            maps_key,
+            "the merged entry re-keys maps-canonical"
+        );
+        (pins, merged_id)
+    }
+
+    /// The refiled split shape: the scan pin files first, the fd-keyed
+    /// pre-arm pin files beside it, then the live refile moves the fd
+    /// alias onto the scan object and retires the emptied fd entry.
+    /// Returns the pins plus the scan object's id.
+    fn refiled_split_pair(
+        fd_key: ObjectKey,
+        maps_key: ObjectKey,
+        file: &std::sync::Arc<std::fs::File>,
+    ) -> (PinnedObjects, PinnedObjectId) {
+        use super::test_fixture::PATH;
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, file, file);
+        pins.refile_split_prearm_alias(PATH);
+        assert_eq!(
+            pins.pinned().count(),
+            1,
+            "the refile joins and retires the fd entry"
+        );
+        let survivor = pins.pinned().next().expect("the joined object").id;
+        assert_eq!(survivor, scan_id, "the scan object keeps the alias");
+        assert_eq!(
+            pins.id_for_prearm(fd_key, PATH),
+            Some(scan_id),
+            "the fd alias routes to the scan object"
+        );
+        (pins, scan_id)
+    }
+
+    /// A learned note under the fd key joins its planned same-file
+    /// object after the absorb merged and re-keyed it: the join follows
+    /// the fd alias through the identity owner instead of requiring a
+    /// canonical fd pin.
+    #[test]
+    fn split_note_resolves_through_a_merged_rekeyed_object() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            Some(merged_id),
+            "the fd-keyed note resolves to the merged object"
+        );
+    }
+
+    /// A learned note under the fd key joins its planned same-file
+    /// object after the live refile moved the fd alias onto the scan
+    /// object and retired the fd entry: no fd pin remains, only the
+    /// alias record on the planned object.
+    #[test]
+    fn split_note_resolves_through_a_refiled_alias_after_retire() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, scan_id) = refiled_split_pair(fd_key, maps_key, &file);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            Some(scan_id),
+            "the fd-keyed note resolves through the retained alias"
+        );
+    }
+
+    /// Witness context never vetoes a same-file alias join: a merged
+    /// object the witness marked pre-copy-up still resolves its fd
+    /// note (the flag is proven context on the same open file, and
+    /// pre-marked twins fail closed through ambiguity instead).
+    #[test]
+    fn split_note_resolves_through_a_pre_marked_merged_object() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        pins.by_id
+            .get_mut(&merged_id)
+            .expect("merged entry")
+            .pre_copy_up = true;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            Some(merged_id),
+            "a pre mark never vetoes a same-file alias join"
+        );
+    }
+
+    /// A note key nothing files resolves to nothing (the empty-owner
+    /// arm): without an identity owner there is no join target.
+    #[test]
+    fn split_note_with_unfiled_key_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, scan_id) = unmerged_split_pair(overlay(41), maps_key, &file, &file);
+        assert_eq!(
+            pins.resolve_split_note_target(overlay(99), &[scan_id]),
+            None,
+            "an unfiled key never resolves"
+        );
+    }
+
+    /// Key-filter twin with a unique owner: same proved shape and full
+    /// identity, but the proof names a maps key no planned object
+    /// answers — the key filter must refuse the join.
+    #[test]
+    fn split_note_with_unique_owner_but_key_miss_resolves_to_nothing() {
+        use super::test_fixture::{SHA, backing_file, overlay, reback, split_prearm_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        for entry in pins.by_id.values_mut() {
+            entry.mapping.mount_id = 0;
+            entry.probed_maps_key = None;
+        }
+        let mut stray = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        reback(&mut stray, &file);
+        for entry in stray.by_id.values_mut() {
+            entry.mapping.mount_id = 0;
+            entry.probed_maps_key = Some(overlay(22));
+        }
+        let (_, entry) = stray.by_id.pop_first().unwrap();
+        let raw = entry.raw.clone();
+        let stray_id = PinnedObjectId(pins.next_id);
+        pins.next_id = pins.next_id.checked_add(1).expect("test id space");
+        pins.by_id.insert(stray_id, entry);
+        pins.raw_to_id.insert(raw, stray_id);
+        let orig_id = pins
+            .pinned()
+            .find(|pin| pin.key == fd_key && pin.id != stray_id)
+            .expect("the original fd entry")
+            .id;
+        pins.by_id.remove(&orig_id);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "a proved rendering that misses the target key never resolves"
+        );
+    }
+
+    /// A collapsed alias owner never routes a note: heuristic joins
+    /// prove no physical identity, so the note keeps its own record.
+    #[test]
+    fn split_note_through_a_collapsed_merged_object_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        pins.by_id
+            .get_mut(&merged_id)
+            .expect("merged entry")
+            .collapsed = true;
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[merged_id]),
+            None,
+            "a collapsed owner never routes"
+        );
+    }
+
+    /// A dangling alias filing (index corruption, impossible through
+    /// paired removals) never vetoes the live owner: the join follows
+    /// the live pin and ignores the dangling raw.
+    #[test]
+    fn split_note_ignores_a_dangling_alias_filing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        // A corrupt map entry: a distinct raw spelling (different path,
+        // same key — a hardlink-shaped second sighting) cross-linked at an
+        // id the entry table never minted. It keys separately from the live
+        // owner, so it must neither veto nor steal the healthy owner.
+        let mut other = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        repath_single_pin(&mut other, "/lib/x86_64-linux-gnu/relocated-provider.so");
+        let stray = other
+            .raw_to_id
+            .keys()
+            .find(|raw| raw.key == fd_key)
+            .expect("the forged raw")
+            .clone();
+        pins.raw_to_id.insert(stray, PinnedObjectId(424242));
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            Some(scan_id),
+            "a dangling filing never vetoes the live owner"
+        );
+    }
+
+    /// An alias owner outside the plan never resolves: the join needs
+    /// a planned target, so the note keeps its own record.
+    #[test]
+    fn split_note_through_an_unplanned_alias_owner_resolves_to_nothing() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, _) = refiled_split_pair(fd_key, maps_key, &file);
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[PinnedObjectId(424243)]),
+            None,
+            "an unplanned alias owner never resolves"
+        );
+    }
+
+    /// Witness-divergent twins under one note key refuse the join: the
+    /// plain and pre observations prove different files share the key,
+    /// so neither routes the note alone.
+    #[test]
+    fn split_note_with_divergent_twins_under_one_key_resolves_to_nothing() {
+        use super::test_fixture::{
+            backing_file, mark_pre_copy_up, overlay, reback, split_prearm_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let (mut pins, scan_id) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let mut twin = split_prearm_pin(fd_key, maps_key, "deadbeef", 1);
+        reback(&mut twin, &other);
+        mark_pre_copy_up(&mut twin);
+        assert!(pins.absorb(twin).is_empty());
+        assert_eq!(
+            pins.pinned().count(),
+            3,
+            "the divergent twin pair-files beside the plain pin"
+        );
+        assert_eq!(
+            pins.resolve_split_note_target(fd_key, &[scan_id]),
+            None,
+            "divergent twins never resolve alone"
+        );
+    }
+
+    /// Representation for a canonically filed note key: the pin's own
+    /// path, digest and build id render on the unjoined row.
+    #[test]
+    fn note_representation_for_a_canonical_pin_shows_its_details() {
+        use super::test_fixture::{PATH, SHA, backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        match pins.note_representation(fd_key) {
+            super::NoteRepresentation::Detailed(pin) => {
+                assert_eq!(pin.path, PATH, "the pin path renders");
+                assert_eq!(pin.sha256, SHA, "the pin digest renders");
+            }
+            other => panic!("canonical pin must render details, got {other:?}"),
+        }
+    }
+
+    /// Representation follows merges and re-keys through the retained
+    /// alias: a merged object with no canonical fd pin still shows its
+    /// details for the fd-keyed note.
+    #[test]
+    fn note_representation_for_a_merged_object_shows_its_details() {
+        use super::test_fixture::{PATH, SHA, backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, _) = merged_split_pair(fd_key, maps_key, &file);
+        match pins.note_representation(fd_key) {
+            super::NoteRepresentation::Detailed(pin) => {
+                assert_eq!(pin.path, PATH, "the merged path renders");
+                assert_eq!(pin.sha256, SHA, "the merged digest renders");
+            }
+            other => panic!("merged alias must render details, got {other:?}"),
+        }
+    }
+
+    /// Representation for witness-divergent twins under one note key:
+    /// ambiguous, details withheld — never the first twin's digest.
+    #[test]
+    fn note_representation_for_divergent_twins_is_ambiguous() {
+        use super::test_fixture::{
+            backing_file, mark_pre_copy_up, overlay, reback, split_prearm_pin,
+        };
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let other = backing_file(&dir, "other.so");
+        let (mut pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        let mut twin = split_prearm_pin(fd_key, maps_key, "deadbeef", 1);
+        reback(&mut twin, &other);
+        mark_pre_copy_up(&mut twin);
+        assert!(pins.absorb(twin).is_empty());
+        assert!(
+            matches!(
+                pins.note_representation(fd_key),
+                super::NoteRepresentation::Ambiguous
+            ),
+            "divergent twins stay ambiguous"
+        );
+    }
+
+    /// Representation for a key nothing files: unpinned, details
+    /// absent — never invented.
+    #[test]
+    fn note_representation_for_an_unfiled_key_is_unpinned() {
+        use super::test_fixture::{backing_file, overlay};
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (pins, _) = unmerged_split_pair(overlay(41), maps_key, &file, &file);
+        assert!(
+            matches!(
+                pins.note_representation(overlay(99)),
+                super::NoteRepresentation::Unpinned
+            ),
+            "an unfiled key is unpinned"
+        );
+    }
+
+    /// Representation for a collapsed alias owner: unpinned. Heuristic
+    /// joins prove no physical identity, so no digest renders.
+    #[test]
+    fn note_representation_for_a_collapsed_owner_is_unpinned() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, merged_id) = merged_split_pair(fd_key, maps_key, &file);
+        pins.by_id
+            .get_mut(&merged_id)
+            .expect("merged entry")
+            .collapsed = true;
+        assert!(
+            matches!(
+                pins.note_representation(fd_key),
+                super::NoteRepresentation::Unpinned
+            ),
+            "a collapsed owner stays unpinned"
+        );
+    }
+
+    /// Representation for a poisoned note key: ambiguous even with live
+    /// entries under it — a rejection proves same-key divergence.
+    #[test]
+    fn note_representation_for_a_rejected_key_is_ambiguous() {
+        use super::test_fixture::{backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        pins.rejected_keys.insert(fd_key);
+        assert!(
+            matches!(
+                pins.note_representation(fd_key),
+                super::NoteRepresentation::Ambiguous
+            ),
+            "a rejected key stays ambiguous"
+        );
+    }
+
+    /// Representation ignores dangling alias filings: the live owner's
+    /// details render, the corrupt index entry never vetoes them.
+    #[test]
+    fn note_representation_ignores_a_dangling_alias_filing() {
+        use super::test_fixture::{PATH, SHA, backing_file, overlay};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let (mut pins, _) = unmerged_split_pair(fd_key, maps_key, &file, &file);
+        // A corrupt map entry: a distinct raw spelling (different path,
+        // same key — a hardlink-shaped second sighting) cross-linked at an
+        // id the entry table never minted. It keys separately from the live
+        // owner, so it must neither veto nor steal the live details.
+        let mut other = split_prearm_pin(fd_key, fd_key, SHA, 1);
+        repath_single_pin(&mut other, "/lib/x86_64-linux-gnu/relocated-provider.so");
+        let stray = other
+            .raw_to_id
+            .keys()
+            .find(|raw| raw.key == fd_key)
+            .expect("the forged raw")
+            .clone();
+        pins.raw_to_id.insert(stray, PinnedObjectId(424242));
+        match pins.note_representation(fd_key) {
+            super::NoteRepresentation::Detailed(pin) => {
+                assert_eq!(pin.path, PATH, "the live path renders");
+                assert_eq!(pin.sha256, SHA, "the live digest renders");
+            }
+            other => panic!("dangling filings never veto details, got {other:?}"),
+        }
     }
 
     /// Divergence twin (B1): after the split merge, a later divergent

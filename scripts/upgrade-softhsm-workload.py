@@ -4,10 +4,13 @@
 """SoftHSM workload for the upgrade gates.
 
 The parent keeps one long-lived PKCS#11 session user alive, performs a known
-SHA-256 digest, and starts short-lived children that repeat the same known
-call sequence.  Children run under a copy of the interpreter at a stable
-path so old and new captures group them identically while keeping them a
-separate application group from the long-lived parent.  The workload uses
+SHA-256 digest, and starts exactly CHILD_COUNT short-lived children that
+repeat the same known call sequence.  Children run under a copy of the
+interpreter at a stable path so old and new captures group them identically
+while keeping them a separate application group from the long-lived parent.
+The fixed count (not cadence-until-deadline) makes admission accounting
+deterministic: every run spawns parent + CHILD_COUNT, so gate 6 compares
+exact caller/entries closure instead of timing jitter.  The workload uses
 only the public Cryptoki ABI through ctypes; no PIN, key material or
 payload bytes leave the process.
 """
@@ -21,6 +24,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+CHILD_COUNT = 10
+FIRST_CHILD_DELAY_S = 3.0
+CHILD_INTERVAL_S = 2.0
 
 CKF_SERIAL_SESSION = 1 << 1
 CKF_RW_SESSION = 1 << 2
@@ -152,13 +159,16 @@ def parent(module: str, interval: float, child_python: str) -> int:
         raise RuntimeError(f"churn child probe failed: {probe.stderr[:200]}")
     print("ready", flush=True)
     deadline = time.monotonic() + 60
-    next_child = 0.0
+    # First spawn waits out cgroup setup and observer attach so the child is
+    # inside the capture from birth; after CHILD_COUNT the parent idles.
+    next_child = time.monotonic() + FIRST_CHILD_DELAY_S
+    spawned = 0
     children: list[subprocess.Popen] = []
     try:
         while time.monotonic() < deadline:
             digest_once(library)
             now = time.monotonic()
-            if now >= next_child:
+            if spawned < CHILD_COUNT and now >= next_child:
                 children.append(
                     subprocess.Popen(
                         [child_python, __file__, "--module", module, "--child"],
@@ -167,7 +177,8 @@ def parent(module: str, interval: float, child_python: str) -> int:
                         env=child_env,
                     )
                 )
-                next_child = now + 2.0
+                spawned += 1
+                next_child = now + CHILD_INTERVAL_S
             children = [row for row in children if row.poll() is None]
             time.sleep(interval)
     finally:

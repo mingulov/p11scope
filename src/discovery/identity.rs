@@ -14602,8 +14602,8 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::test_fixture::{
         FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, manifest_pin, mark_pre_copy_up,
-        module, overlay, own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin,
-        reback, repath_single_pin, view_pin,
+        module, overlay, own_all_raws, own_all_raws_under, pin_set, pins, plain_prearm_pin, reback,
+        repath_single_pin, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -18046,8 +18046,7 @@ mod tests {
             "fixture assumes the fd's mount row is absent from the stale table"
         );
         let stale = "999999 1 8:1 / /other rw - ext4 /dev/other rw\n";
-        let first =
-            identity_of_in_mountinfo(&file, stale, &mut CaptureWorkBudget::default());
+        let first = identity_of_in_mountinfo(&file, stale, &mut CaptureWorkBudget::default());
         assert!(
             matches!(&first, Err(error) if is_missing_mount_id_error(error)),
             "premise: the first resolution misses the mount"
@@ -21816,7 +21815,11 @@ mod tests {
             view_a,
             view_b,
         } = custody;
-        let removed = acc.retire_view_except_proven(view_b, RetirementProof::Exited, &std::collections::BTreeSet::from([kept]));
+        let removed = acc.retire_view_except_proven(
+            view_b,
+            RetirementProof::Exited,
+            &std::collections::BTreeSet::from([kept]),
+        );
         assert!(removed.is_some(), "the newcomer view removal must execute");
         assert!(
             acc.by_id.contains_key(&kept),

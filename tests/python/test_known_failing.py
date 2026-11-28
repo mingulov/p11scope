@@ -3613,6 +3613,38 @@ class ProducerMutationSweepTests(unittest.TestCase):
                     mutant_ok = ok
         self.record(results, "python-outer-exit", original_ok, mutant_ok)
 
+        # Typed stream default: the merge labels the plain stream
+        # python-suite; a bogus default breaks the closed runner
+        # vocabulary at judgment.
+        runner_default_mutant = self.mutate_source(
+            ROOT / "scripts/run-python-suites.py",
+            'def merge_typed_fragments(fragment_specs, output, host, runner="python-suite"):',
+            'def merge_typed_fragments(fragment_specs, output, host, runner="bogus-runner"):')
+        for label, source in (("original", runner_source), ("mutant", runner_default_mutant)):
+            with tempfile.TemporaryDirectory() as temporary:
+                temp = Path(temporary)
+                script = temp / "run-python-suites.py"
+                script.write_text(source, encoding="utf-8")
+                shutil.copy2(ROOT / "scripts/check-known-failing.py", temp / "check-known-failing.py")
+                module = load_script(script, f"runner_default_{label}")
+                fragment = temp / "fragment.json"
+                write_json(fragment, {
+                    "schema": "p11scope/python-suite-fragment/v1",
+                    "path": "tests/python/test_sample.py", "invocation": [], "process_exit": 0,
+                    "complete": True,
+                    "selection": [{"test": "Sample.test_pass"}],
+                    "results": [{"test": "Sample.test_pass", "state": "passed", "signature": None}],
+                    "suite_events": [],
+                })
+                output = temp / "merged.json"
+                module.merge_typed_fragments([(fragment, "test_sample.py", [])], output, "github")
+                ok = json.loads(output.read_text())["runner"] == "python-suite"
+                if label == "original":
+                    original_ok = ok
+                else:
+                    mutant_ok = ok
+        self.record(results, "python-runner-default", original_ok, mutant_ok)
+
         # Fragment admission is exact-typed: a boolean process_exit must not
         # pass as the integer 1 via isinstance.
         bool_mutant = self.mutate_source(ROOT / "scripts/run-python-suites.py",
@@ -5267,7 +5299,7 @@ class ProducerMutationSweepTests(unittest.TestCase):
                 outcomes[label] = module.json_exact_equal(node, node) is False
         self.record(results, "equality-depth-limit", outcomes["original"], outcomes["mutant"])
 
-        total = 84
+        total = 85
         self.assertEqual(results["failures"], [],
                          f"surviving producer mutants: {results['failures']}; killed {results['killed']}/{total}")
         print(f"known-failing producer mutation sweep: {results['killed']}/{total} killed")

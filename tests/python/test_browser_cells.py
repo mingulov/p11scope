@@ -5303,6 +5303,181 @@ class BrowserReapTree(unittest.TestCase):
             "the grandchild must not outlive termination")
 
 
+class ClassifierMutationTests(unittest.TestCase):
+    """Every known_failure_signature clause is load-bearing.
+
+    Each mutant drops or flips one guard clause; the witness is a
+    report shape whose verdict must change. A surviving mutant is a
+    redundant clause and is explained, never silently kept.
+    """
+
+    maxDiff = 4096
+
+    def mutate(self, old, new):
+        source = inspect.getsource(known_failure_signature)
+        self.assertIn(old, source)
+        namespace = {
+            "FF_NOMOD_KNOWN_SIGNATURE": FF_NOMOD_KNOWN_SIGNATURE,
+            "CR_RUN_NODELAY_KNOWN_SIGNATURE": CR_RUN_NODELAY_KNOWN_SIGNATURE,
+            "FF_NOMOD_KNOWN_SKIPS": FF_NOMOD_KNOWN_SKIPS,
+            "CR_RUN_NODELAY_KNOWN_GAP": CR_RUN_NODELAY_KNOWN_GAP,
+            "CR_RUN_NODELAY_KNOWN_SCAN_REASON": CR_RUN_NODELAY_KNOWN_SCAN_REASON,
+            "oracle": oracle,
+        }
+        exec(source.replace(old, new, 1), namespace)
+        return namespace["known_failure_signature"]
+
+    def ff_report(self, probes=0, rows=(), skipped=()):
+        return {"functions": list(rows),
+                "evidence": {"attached_probes": probes, "skipped": list(skipped)}}
+
+    def ff_skip_failure(self, name, reason):
+        return (f"skipped record {name!r} reason {reason!r}: "
+                f"possible coverage gap, want structural only")
+
+    def nodelay_report(self, causes, detail):
+        return {"functions": [],
+                "evidence": {"attached_probes": 2,
+                             "gap_classes": {"observation": {"status": "lossy",
+                                                             "causes": list(causes)}},
+                             "scan_unavailable": detail}}
+
+    def nodelay_gap_failure(self):
+        allowed = sorted(set(_GAPS_ATTACHED_RUN))
+        return (f"observation gap cause 'scan_unavailable' not allowed for this cell "
+                f"(allowed: {allowed})")
+
+    def test_ff_probes_guard_kills(self):
+        mutant = self.mutate('if (oracle.evidence(report).get("attached_probes", 0) or 0) != 0:',
+                             "if False:")
+        report = self.ff_report(probes=1, skipped=[
+            {"name": "learned provider file", "reason": oracle.LEARNED_FIRST_USE_REASON}])
+        failures = [self.ff_skip_failure("learned provider file",
+                                         oracle.LEARNED_FIRST_USE_REASON)]
+        self.assertIsNone(known_failure_signature("FF-NOMOD", report, failures, ()))
+        self.assertEqual(mutant("FF-NOMOD", report, failures, ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_rows_guard_kills(self):
+        mutant = self.mutate('if len(report.get("functions") or []) != 0:', "if False:")
+        report = self.ff_report(rows=[{"names": ["C_GetInfo"]}], skipped=[
+            {"name": "discovery subject", "reason": oracle.MID_FLIGHT_REASON}])
+        failures = [self.ff_skip_failure("discovery subject", oracle.MID_FLIGHT_REASON)]
+        self.assertIsNone(known_failure_signature("FF-NOMOD", report, failures, ()))
+        self.assertEqual(mutant("FF-NOMOD", report, failures, ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_known_required_guard_kills(self):
+        mutant = self.mutate("if not known or len(known) + len(structural) != len(skipped):",
+                             "if False:")
+        report = self.ff_report(skipped=[
+            {"name": "discovery subject", "reason": "discovery unavailable"}])
+        self.assertIsNone(known_failure_signature("FF-NOMOD", report, [], ()))
+        self.assertEqual(mutant("FF-NOMOD", report, [], ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_partition_guard_kills(self):
+        mutant = self.mutate("if not known or len(known) + len(structural) != len(skipped):",
+                             "if not known:")
+        report = self.ff_report(skipped=[
+            {"name": "learned provider file", "reason": oracle.LEARNED_FIRST_USE_REASON},
+            {"name": "provider file", "reason": "a detach window hid calls"}])
+        failures = [self.ff_skip_failure("learned provider file",
+                                         oracle.LEARNED_FIRST_USE_REASON)]
+        self.assertIsNone(known_failure_signature("FF-NOMOD", report, failures, ()))
+        self.assertEqual(mutant("FF-NOMOD", report, failures, ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_failure_reconstruction_guard_kills(self):
+        mutant = self.mutate("if sorted(failures) != expected:", "if False:")
+        report = self.ff_report(skipped=[
+            {"name": "discovery subject", "reason": oracle.MID_FLIGHT_REASON}])
+        self.assertIsNone(
+            known_failure_signature("FF-NOMOD", report, ["unrelated failure"], ()))
+        self.assertEqual(mutant("FF-NOMOD", report, ["unrelated failure"], ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_ff_dispatch_guard_kills(self):
+        mutant = self.mutate('if cell == "FF-NOMOD":', "if True:")
+        report = self.ff_report(skipped=[
+            {"name": "discovery subject", "reason": oracle.MID_FLIGHT_REASON}])
+        failures = [self.ff_skip_failure("discovery subject", oracle.MID_FLIGHT_REASON)]
+        self.assertIsNone(known_failure_signature("CR-RUN-SIGN", report, failures, ()))
+        self.assertEqual(mutant("CR-RUN-SIGN", report, failures, ()),
+                         FF_NOMOD_KNOWN_SIGNATURE)
+
+    def test_nodelay_detail_guard_kills(self):
+        mutant = self.mutate("if oracle.evidence(report).get(\"scan_unavailable\") != CR_RUN_NODELAY_KNOWN_SCAN_REASON:",
+                             "if False:")
+        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                                     "ptrace")
+        failures = [self.nodelay_gap_failure()]
+        self.assertIsNone(
+            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+        self.assertEqual(
+            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
+            CR_RUN_NODELAY_KNOWN_SIGNATURE)
+
+    def test_nodelay_detail_direction_kills(self):
+        mutant = self.mutate("!= CR_RUN_NODELAY_KNOWN_SCAN_REASON:",
+                             "== CR_RUN_NODELAY_KNOWN_SCAN_REASON:")
+        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                                     "unreadable")
+        failures = [self.nodelay_gap_failure()]
+        self.assertEqual(
+            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
+            CR_RUN_NODELAY_KNOWN_SIGNATURE)
+        self.assertIsNone(
+            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+
+    def test_nodelay_causes_guard_kills(self):
+        mutant = self.mutate("if extra != [CR_RUN_NODELAY_KNOWN_GAP]:", "if False:")
+        report = self.nodelay_report(
+            sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable", "in_flight_at_end"],
+            "unreadable")
+        failures = [self.nodelay_gap_failure()]
+        self.assertIsNone(
+            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+        self.assertEqual(
+            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN),
+            CR_RUN_NODELAY_KNOWN_SIGNATURE)
+
+    def test_nodelay_failure_exactness_guard_kills(self):
+        mutant = self.mutate("if failures != [want]:", "if False:")
+        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                                     "unreadable")
+        self.assertIsNone(
+            known_failure_signature("CR-RUN-NODELAY", report, ["unrelated failure"],
+                                    _GAPS_ATTACHED_RUN))
+        self.assertEqual(
+            mutant("CR-RUN-NODELAY", report, ["unrelated failure"], _GAPS_ATTACHED_RUN),
+            CR_RUN_NODELAY_KNOWN_SIGNATURE)
+
+    def test_nodelay_classes_robustness_guard_kills(self):
+        mutant = self.mutate("if isinstance(classes, dict) else {}", "if True else {}")
+        report = {"functions": [],
+                  "evidence": {"attached_probes": 2, "gap_classes": "bogus",
+                               "scan_unavailable": "unreadable"}}
+        failures = [self.nodelay_gap_failure()]
+        self.assertIsNone(
+            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+        with self.assertRaises(AttributeError):
+            mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN)
+
+    def test_nodelay_length_gate_is_redundant(self):
+        # Equivalent survivor, kept as a cheap early-out: any failure list
+        # passing the exact [want] match below necessarily has length 1,
+        # so dropping the length gate changes no verdict. Pinned here so
+        # the redundancy is reviewed, not accidental.
+        mutant = self.mutate("if len(failures) != 1:", "if False:")
+        report = self.nodelay_report(sorted(_GAPS_ATTACHED_RUN) + ["scan_unavailable"],
+                                     "unreadable")
+        failures = [self.nodelay_gap_failure(), "second failure"]
+        self.assertIsNone(
+            known_failure_signature("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+        self.assertIsNone(mutant("CR-RUN-NODELAY", report, failures, _GAPS_ATTACHED_RUN))
+
+
 if __name__ == "__main__":
     # Expected-cell execution guard: in strict installed mode the suite
     # must actually run selected cells — an empty selection (a filter

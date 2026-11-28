@@ -36,6 +36,13 @@ CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_sc
 
 MUTATIONS = [
     {
+        "site": "admission parity comparison",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    ok = new_count * 2 >= old_count",
+        "new": "    ok = True",
+        "killer": "UpgradeGate6PureTests.test_admission_parity_fails_on_regression_counts",
+    },
+    {
         "site": "b1 removed-vocab membership check",
         "file": "scripts/upgrade-gate6.py",
         "old": "        if label in new_vocab.get(prefix, ()):",

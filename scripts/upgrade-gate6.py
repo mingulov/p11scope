@@ -380,6 +380,20 @@ def evaluate_b1_delta(old_keys, new_keys, vocabularies) -> dict:
     }
 
 
+def admission_parity(old_count: int, new_count: int) -> tuple:
+    """New build admitted at least half the old caller count.
+
+    The churn workload is deterministic (the official v0.7.1 binary admits
+    11-12 callers every round); a new side under half the old count is the
+    slow-host admission shortfall (product lane v072-slow-host-admission),
+    never timing noise: observed healthy ratios stay >= 1.0, the shortfall
+    sits at 0.18. Returns (ok, detail).
+    """
+    ok = new_count * 2 >= old_count
+    detail = f"old callers={old_count} new callers={new_count}"
+    return ok, detail
+
+
 def key_exists(value, wanted: str) -> bool:
     """True when typed JSON contains a key exactly named ``wanted``."""
     if isinstance(value, dict):
@@ -740,6 +754,11 @@ def run_gate(args, workdir: Path, result: dict) -> int:
         if inventory_errors
         else "old/new inventory reports carry typed root, observation, budget, row and gap content",
     )
+
+    # 1b. Admission parity runs before B1: comparing key shapes across an
+    # admission-divergent pair is noise; the shortfall gets one signature.
+    parity_ok, parity_detail = admission_parity(len(old["callers"]), len(new["callers"]))
+    check(result, "admission_parity", parity_ok, parity_detail)
 
     # 2. B1: departed_use delta is exactly B1+additive, nothing else, and
     # every pinned B1 key is present in the new typed report. Reason leaves

@@ -2473,6 +2473,18 @@ class UpgradeGate6PureTests(unittest.TestCase):
         for prefix, labels in committed["v072"].items():
             self.assertEqual(sorted(labels), sorted(committed["v071"][prefix]))
 
+    def test_admission_parity_fails_on_regression_counts(self):
+        ok, detail = self.gate6.admission_parity(11, 2)
+        self.assertFalse(ok)
+        self.assertIn("11", detail)
+        self.assertIn("2", detail)
+
+    def test_admission_parity_passes_on_healthy_counts(self):
+        for old_n, new_n in ((11, 11), (11, 12), (12, 11), (2, 2), (1, 1)):
+            with self.subTest(old_n=old_n, new_n=new_n):
+                ok, _ = self.gate6.admission_parity(old_n, new_n)
+                self.assertTrue(ok)
+
     def test_b1_vocabularies_loader_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "nope.json"
@@ -2672,6 +2684,7 @@ class UpgradeGate6ActivationTests(unittest.TestCase):
                 "inputs_present",
                 "reports_generated",
                 "inventory_reports_typed",
+                "admission_parity",
                 "cbom_reads_old",
                 "cbom_old_typed",
                 "diff_old_old_zero",

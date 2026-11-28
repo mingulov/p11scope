@@ -36,6 +36,160 @@ CBOM_SCHEMA_KILLER = f"{VALIDATOR_TEST}.test_cbom_inventory_validator_rejects_sc
 
 MUTATIONS = [
     {
+        "site": "jsonschema required keyword",
+        "file": "scripts/json_schema.py",
+        "old": "        required = schema.get(\"required\", [])",
+        "new": "        required = []",
+        "killer": "UpgradeJsonSchemaConformanceTests.test_conformance_matrix",
+    },
+    {
+        "site": "jsonschema strict additional default",
+        "file": "scripts/json_schema.py",
+        "old": "            \"additionalProperties\", False if (self.strict and declares) else True",
+        "new": "            \"additionalProperties\", True",
+        "killer": "UpgradeJsonSchemaConformanceTests.test_conformance_matrix",
+    },
+    {
+        "site": "jsonschema const comparison",
+        "file": "scripts/json_schema.py",
+        "old": "            if instance != value or type(instance) is not type(value):",
+        "new": "            if False:",
+        "killer": "UpgradeJsonSchemaConformanceTests.test_conformance_matrix",
+    },
+    {
+        "site": "jsonschema integer bool exclusion",
+        "file": "scripts/json_schema.py",
+        "old": "        return isinstance(instance, int) and not isinstance(instance, bool)",
+        "new": "        return isinstance(instance, int)",
+        "killer": "UpgradeJsonSchemaConformanceTests.test_conformance_matrix",
+    },
+    {
+        "site": "diff positive compared-field swapped for occurrences",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    compared = summary.get("application_groups_compared") if isinstance(summary, dict) else None""",
+        "new": """    _swapped = _snapshot_evidence(document, "before") or {}
+    compared = len(_swapped.get("caller_occurrences") or [])""",
+        "killer": "UpgradeArtifactValidationTests.test_diff_compared_group_positive_rule",
+    },
+    {
+        "site": "diff positive compared-count clause",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    if not is_int(compared) or compared < 1:
+        errors.append("diff positive payload: fewer than one compared application group")""",
+        "new": "    pass",
+        "killer": "UpgradeArtifactValidationTests.test_diff_compared_group_positive_rule",
+    },
+    {
+        "site": "diff positive backed-rows clause",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    if not backed:
+        errors.append("diff positive payload: no compared group backed by rows on both sides")""",
+        "new": "    pass",
+        "killer": "UpgradeArtifactValidationTests.test_diff_compared_group_positive_rule",
+    },
+    {
+        "site": "diff reference bounds check call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "        errors.extend(diff_reference_errors(document))",
+        "new": "        pass",
+        "killer": "UpgradeArtifactValidationTests.test_diff_references_must_resolve_inside_pools",
+    },
+    {
+        "site": "diff ordering check call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "        errors.extend(diff_ordering_errors(document))",
+        "new": "        pass",
+        "killer": "UpgradeArtifactValidationTests.test_diff_ordering_must_hold",
+    },
+    {
+        "site": "diff occurrence cardinality check",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    evidence = snapshot.get("evidence") if isinstance(snapshot.get("evidence"), dict) else {}
+    for pool, kind in (("caller_occurrences", "callers"),
+                       ("module_occurrences", "modules"),
+                       ("edge_occurrences", "edges")):""",
+        "new": "    evidence = {}\n    for pool, kind in ():",
+        "killer": "UpgradeArtifactValidationTests.test_diff_occurrence_cardinality_matches_sources",
+    },
+    {
+        "site": "inventory object-observations dispatch call",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "        errors.extend(object_observations_schema_errors(document.get(\"object_observations\")))",
+        "new": "        pass",
+        "killer": "UpgradeArtifactValidationTests.test_inventory_strict_mode_rejects_mistyped_nested_contract_fields",
+    },
+    {
+        "site": "inventory object-observations version guard",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": "    if not is_int(version) or version not in OBJECT_OBSERVATION_SCHEMA_FILES:",
+        "new": "    if False:",
+        "killer": "UpgradeArtifactValidationTests.test_object_observations_dispatch_refuses_unknown_version",
+    },
+    {
+        "site": "cbom inventory format-version gate",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    format_errors = cbom_format_errors(document)
+    if format_errors:
+        return format_errors
+    source_errors = inventory_errors(source)""",
+        "new": "    source_errors = inventory_errors(source)",
+        "killer": "UpgradeArtifactValidationTests.test_cbom_exact_format_and_version_refusals",
+    },
+    {
+        "site": "cbom profile format-version gate",
+        "file": "scripts/upgrade_artifact_validation.py",
+        "old": """    format_errors = cbom_format_errors(document)
+    if format_errors:
+        return format_errors
+    if not isinstance(profile, dict):""",
+        "new": "    if not isinstance(profile, dict):",
+        "killer": "UpgradeGate6ActivationTests.test_profile_fixture_flow_requires_substantive_typed_conversion",
+    },
+    {
+        "site": "gate6 old-binary pin call",
+        "file": "scripts/upgrade-gate6.py",
+        "old": '        verify_artifact_pin("v071-observer-binary", args.old_binary),',
+        "new": "",
+        "killer": "UpgradeGate6ActivationTests.test_inputs_present_refuses_unpinned_binary",
+    },
+    {
+        "site": "gate6 fixture pin call",
+        "file": "scripts/upgrade-gate6.py",
+        "old": '        verify_artifact_pin("v071-profile-fixture", PROFILE_FIXTURE),',
+        "new": "",
+        "killer": "UpgradeGate6ActivationTests.test_inputs_present_refuses_tampered_fixture",
+    },
+    {
+        "site": "gate6 pin comparison",
+        "file": "scripts/upgrade-gate6.py",
+        "old": "    if digest != want:",
+        "new": "    if digest == want:",
+        "killer": "UpgradeGate6ActivationTests.test_verify_artifact_pin_match_mismatch_missing",
+    },
+    {
+        "site": "gate5 old-package pin call",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": "  verify_old_package_pin",
+        "new": "  :",
+        "killer": "UpgradeGate5SimulationTests.test_simulated_negative_controls_fail_with_exact_typed_reasons",
+    },
+    {
+        "site": "gate5 owned-path normalization",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": """    case "$path" in
+      */.) path="${path%/.}"; [ -n "$path" ] || path="/";;
+    esac""",
+        "new": "    :",
+        "killer": "UpgradeGate5SimulationTests.test_simulated_negative_controls_fail_with_exact_typed_reasons",
+    },
+    {
+        "site": "gate5 wart pin upstream entry",
+        "file": "scripts/upgrade-gate5.sh",
+        "old": " /usr/share/doc/p11scope/notices/licenses/upstream\"",
+        "new": "\"",
+        "killer": "UpgradeGate5SimulationTests.test_simulated_rpm_uninstall_negatives_fail_with_exact_typed_reasons",
+    },
+    {
         "site": "gate5 old capture typed validation",
         "file": "scripts/upgrade-gate5.sh",
         "old": '  validation_detail="$(validate_inventory_report "$WORKDIR/pre-upgrade.json")" || fail "old capture report failed typed validation: $validation_detail"',
@@ -314,6 +468,7 @@ CONTROL_TESTS = [
     VALIDATOR_TEST,
     "UpgradeGate5SimulationTests",
     "UpgradeGate6ActivationTests",
+    "UpgradeJsonSchemaConformanceTests",
 ]
 
 
@@ -322,10 +477,12 @@ def copy_cell_tree(destination: Path) -> None:
         "scripts/upgrade-gate5.sh",
         "scripts/upgrade-gate6.py",
         "scripts/upgrade_artifact_validation.py",
+        "scripts/upgrade-artifact-pins.json",
         "scripts/json_schema.py",
         "scripts/upgrade-softhsm-workload.py",
         "tests/python/test_upgrade_cells.py",
         "tests/fixtures/upgrade/v071-observed-profile.json",
+        "tests/fixtures/upgrade/valid-inventory.json",
         "Cargo.toml",
     ):
         target = destination / relative
